@@ -99,6 +99,14 @@
       align-items: center;
     }
 
+    .photos-actions {
+      margin-top: 12px;
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      flex-wrap: wrap;
+    }
+
     .btn {
       border: none;
       border-radius: 10px;
@@ -166,6 +174,16 @@
       background: #f8fafc;
     }
 
+    .pill.photos-pill {
+      background: #f1f5f9;
+      border-color: #d6e0ec;
+      font-size: 12px;
+      max-width: 100%;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
     .status {
       white-space: pre-wrap;
       font-size: 14px;
@@ -219,9 +237,9 @@
         <label for="photosFilesInput">Pick Photo Files</label>
         <input id="photosFilesInput" type="file" accept="image/*" multiple />
       </div>
-      <div class="row" style="margin-top: 10px;">
-        <span class="pill" id="photosSummary">No photos selected</span>
-        <button class="btn" id="uploadZipDriveBtn" type="button" style="background:#7c3aed">Upload ZIP to Drive</button>
+      <div class="photos-actions">
+        <button class="btn" id="uploadZipDriveBtn" type="button">Update Photos</button>
+        <span class="pill photos-pill" id="photosSummary">No photos selected</span>
       </div>
     </div>
 
