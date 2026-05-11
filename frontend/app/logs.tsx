@@ -8,6 +8,7 @@ import {
   RefreshControl,
 } from 'react-native';
 import { Ionicons } from '@expo/vector-icons';
+import { SafeAreaView } from 'react-native-safe-area-context';
 import { getLocalAccessLogs, type AccessLogEntry } from '../src/services/storage';
 
 export default function LogsScreen() {
@@ -57,7 +58,9 @@ export default function LogsScreen() {
       </View>
       <View style={styles.logCenter}>
         <Text style={styles.logName}>{item.resident_name}</Text>
-        <Text style={styles.logUnit}>{item.unit}</Text>
+        <Text style={styles.logUnit}>
+          ID: {item.resident_id} • Flat: {item.unit}
+        </Text>
       </View>
       <View style={styles.logRight}>
         <Text style={styles.logTime}>{formatTime(item.timestamp)}</Text>
@@ -67,7 +70,7 @@ export default function LogsScreen() {
   );
 
   return (
-    <View testID="access-log-screen" style={styles.container}>
+    <SafeAreaView testID="access-log-screen" style={styles.container}>
       <View style={styles.titleBar}>
         <Text style={styles.titleText}>ESTANCIA ID CHECK</Text>
       </View>
@@ -96,7 +99,7 @@ export default function LogsScreen() {
           }
         />
       )}
-    </View>
+    </SafeAreaView>
   );
 }
 

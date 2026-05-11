@@ -183,8 +183,10 @@ function validatePayload_(payload) {
   if (!payload.sheetName) {
     throw new Error('sheetName is required');
   }
-  if (!Array.isArray(payload.rows) || payload.rows.length === 0) {
-    throw new Error('rows must be a non-empty array');
+  const hasRows = Array.isArray(payload.rows) && payload.rows.length > 0;
+  const hasZip = !!payload.zipBase64 && !!payload.driveZipFileId;
+  if (!hasRows && !hasZip) {
+    throw new Error('rows or zipBase64 must be provided');
   }
 }
 

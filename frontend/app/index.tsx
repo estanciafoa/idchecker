@@ -8,13 +8,14 @@ import {
   TextInput,
   Platform,
   ActivityIndicator,
-  SafeAreaView,
   KeyboardAvoidingView,
   AppState,
   Image,
 } from 'react-native';
 import { CameraView, useCameraPermissions } from 'expo-camera';
 import { Ionicons } from '@expo/vector-icons';
+import { useRouter } from 'expo-router';
+import { SafeAreaView } from 'react-native-safe-area-context';
 import {
   getResidentById,
   getLocalResidents,
@@ -26,6 +27,7 @@ import {
 import { postAccessLog } from '../src/services/api';
 
 export default function ScannerScreen() {
+  const router = useRouter();
   const [permission, requestPermission] = useCameraPermissions();
   const [scanned, setScanned] = useState(false);
   const [resident, setResident] = useState<Resident | null>(null);
@@ -179,6 +181,10 @@ export default function ScannerScreen() {
     loadResidentCount();
   };
 
+  const openSyncForPullRefresh = () => {
+    router.push('/sync');
+  };
+
   // RESULT SCREEN - full screen portrait photo
   if (showResult) {
     return (
@@ -320,6 +326,10 @@ export default function ScannerScreen() {
           <View style={styles.statusBar}>
             <View style={[styles.statusDot, residentCount > 0 ? styles.dotOnline : styles.dotOffline]} />
             <Text style={styles.statusText}>{residentCount} RESIDENTS IN LOCAL DB</Text>
+            <TouchableOpacity testID="pull-refresh-btn-no-camera" style={styles.pullRefreshBtn} onPress={openSyncForPullRefresh}>
+              <Ionicons name="cloud-download" size={14} color="#0055FF" />
+              <Text style={styles.pullRefreshText}>PULL & REFRESH</Text>
+            </TouchableOpacity>
           </View>
           <View style={styles.permissionBox}>
             <Ionicons name="camera-outline" size={56} color="#0F172A" />
@@ -368,6 +378,10 @@ export default function ScannerScreen() {
         <View style={styles.statusBar}>
           <View style={[styles.statusDot, residentCount > 0 ? styles.dotOnline : styles.dotOffline]} />
           <Text style={styles.statusText}>{residentCount} RESIDENTS IN LOCAL DB</Text>
+          <TouchableOpacity testID="pull-refresh-btn" style={styles.pullRefreshBtn} onPress={openSyncForPullRefresh}>
+            <Ionicons name="cloud-download" size={14} color="#0055FF" />
+            <Text style={styles.pullRefreshText}>PULL & REFRESH</Text>
+          </TouchableOpacity>
         </View>
         {!scanned && (
           <View style={styles.cameraContainer}>
@@ -434,6 +448,23 @@ const styles = StyleSheet.create({
   dotOnline: { backgroundColor: '#00C853' },
   dotOffline: { backgroundColor: '#FFB300' },
   statusText: { fontSize: 12, fontWeight: '700', color: '#475569', letterSpacing: 1 },
+  pullRefreshBtn: {
+    marginLeft: 'auto',
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 4,
+    paddingHorizontal: 10,
+    paddingVertical: 6,
+    borderWidth: 1,
+    borderColor: '#0055FF',
+    backgroundColor: '#FFFFFF',
+  },
+  pullRefreshText: {
+    fontSize: 10,
+    fontWeight: '900',
+    color: '#0055FF',
+    letterSpacing: 0.6,
+  },
   cameraContainer: { flex: 1, position: 'relative' },
   camera: { flex: 1 },
   overlay: { ...StyleSheet.absoluteFillObject, justifyContent: 'center', alignItems: 'center', backgroundColor: 'rgba(0,0,0,0.4)' },

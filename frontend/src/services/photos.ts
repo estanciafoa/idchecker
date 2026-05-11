@@ -70,6 +70,18 @@ function getFileStem(name: string): string {
   return name.replace(/\.[^.]+$/, '');
 }
 
+function normalizeToken(value: string): string {
+  return String(value || '').toLowerCase().replace(/[^a-z0-9]/g, '');
+}
+
+function stemMatchesResidentId(stem: string, residentId: string): boolean {
+  const stemToken = normalizeToken(stem);
+  const idToken = normalizeToken(residentId);
+  if (!stemToken || !idToken) return false;
+  // Exact match is ideal, but many real uploads include prefixes/suffixes.
+  return stemToken === idToken || stemToken.includes(idToken);
+}
+
 /**
  * Download a photo from URL and save to local file system.
  * Returns the local file URI or empty string if failed.
@@ -174,6 +186,9 @@ export async function importPhotosFromZip(
 export async function attachLocalPhotosById(residents: Resident[]): Promise<Resident[]> {
   const updated = [...residents];
   const photosDir = await getPhotosDir();
+  const legacyDir = await ensureLegacyPhotosDir();
+  const legacyNames = await readDirectoryAsync(legacyDir);
+  const legacyImageNames = legacyNames.filter((n) => isImageFile(n));
 
   for (let i = 0; i < updated.length; i++) {
     const r = updated[i];
@@ -197,10 +212,8 @@ export async function attachLocalPhotosById(residents: Resident[]): Promise<Resi
       continue;
     }
 
-    // Fallback: try matching any image whose stem equals resident id (case-insensitive)
-    const legacyDir = await ensureLegacyPhotosDir();
-    const names = await readDirectoryAsync(legacyDir);
-    const match = names.find((n) => isImageFile(n) && getFileStem(n).toLowerCase() === idLower);
+    // Fallback: match by normalized stem, allowing ids embedded in file names.
+    const match = legacyImageNames.find((n) => stemMatchesResidentId(getFileStem(n), r.id));
     if (match) {
       updated[i] = { ...r, local_photo: `${legacyDir}/${match}` };
     }

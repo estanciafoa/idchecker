@@ -1,17 +1,27 @@
 import React, { useState, useEffect, useCallback } from 'react';
 import {
   View, Text, StyleSheet, FlatList, TouchableOpacity,
-  Modal, ScrollView, RefreshControl, Platform, SafeAreaView, Image,
+  Modal, ScrollView, RefreshControl, Platform, Image, Alert,
 } from 'react-native';
 import { Ionicons } from '@expo/vector-icons';
-import { getLocalResidents, type Resident } from '../src/services/storage';
+import { useFocusEffect } from '@react-navigation/native';
+import { SafeAreaView } from 'react-native-safe-area-context';
+import { getLocalResidents, type Resident, clearAllData } from '../src/services/storage';
 
 export default function AdminScreen() {
   const [residents, setResidents] = useState<Resident[]>([]);
   const [refreshing, setRefreshing] = useState(false);
   const [selectedResident, setSelectedResident] = useState<Resident | null>(null);
+  const [showClearConfirm, setShowClearConfirm] = useState(false);
+  const [clearing, setClearing] = useState(false);
 
   useEffect(() => { loadResidents(); }, []);
+
+  useFocusEffect(
+    useCallback(() => {
+      void loadResidents();
+    }, [])
+  );
 
   const loadResidents = async () => {
     const data = await getLocalResidents();
@@ -20,9 +30,30 @@ export default function AdminScreen() {
 
   const onRefresh = useCallback(async () => {
     setRefreshing(true);
-    await loadResidents();
-    setRefreshing(false);
+    try {
+      await loadResidents();
+    } finally {
+      setRefreshing(false);
+    }
   }, []);
+
+  const handleClearData = () => {
+    setShowClearConfirm(true);
+  };
+
+  const confirmClearData = async () => {
+    setClearing(true);
+    try {
+      await clearAllData();
+      setShowClearConfirm(false);
+      setResidents([]);
+      Alert.alert('Success', 'All data cleared successfully');
+    } catch (error) {
+      Alert.alert('Error', 'Failed to clear data');
+    } finally {
+      setClearing(false);
+    }
+  };
 
   const renderResident = ({ item }: { item: Resident }) => (
     <TouchableOpacity testID={`admin-resident-${item.id}`} style={styles.residentItem} onPress={() => setSelectedResident(item)} activeOpacity={0.7}>
@@ -48,6 +79,9 @@ export default function AdminScreen() {
     <SafeAreaView testID="admin-screen" style={styles.container}>
       <View style={styles.titleBar}>
         <Text style={styles.titleText}>ESTANCIA ID CHECK</Text>
+        <TouchableOpacity onPress={handleClearData} disabled={clearing}>
+          <Ionicons name="trash" size={24} color="#FF3B30" />
+        </TouchableOpacity>
       </View>
       <View style={styles.header}>
         <View>
@@ -104,13 +138,42 @@ export default function AdminScreen() {
           </SafeAreaView>
         </Modal>
       )}
+
+      {/* Clear Data Confirmation Modal */}
+      <Modal visible={showClearConfirm} transparent={true} animationType="fade" onRequestClose={() => setShowClearConfirm(false)}>
+        <View style={styles.modalOverlay}>
+          <View style={styles.modalContent}>
+            <Ionicons name="warning" size={48} color="#FF3B30" style={{ marginBottom: 16 }} />
+            <Text style={styles.modalTitle}>DELETE ALL DATA?</Text>
+            <Text style={styles.modalMessage}>
+              This will permanently delete all residents, photos, and access logs from your device. This action cannot be undone.
+            </Text>
+            <View style={styles.modalButtonRow}>
+              <TouchableOpacity
+                style={[styles.modalButton, styles.cancelButton]}
+                onPress={() => setShowClearConfirm(false)}
+                disabled={clearing}
+              >
+                <Text style={styles.cancelButtonText}>CANCEL</Text>
+              </TouchableOpacity>
+              <TouchableOpacity
+                style={[styles.modalButton, styles.confirmButton]}
+                onPress={confirmClearData}
+                disabled={clearing}
+              >
+                <Text style={styles.confirmButtonText}>{clearing ? 'CLEARING...' : 'DELETE'}</Text>
+              </TouchableOpacity>
+            </View>
+          </View>
+        </View>
+      </Modal>
     </SafeAreaView>
   );
 }
 
 const styles = StyleSheet.create({
   container: { flex: 1, backgroundColor: '#FFFFFF' },
-  titleBar: { backgroundColor: '#0F172A', paddingVertical: 14, paddingHorizontal: 24, alignItems: 'center' },
+  titleBar: { backgroundColor: '#0F172A', paddingVertical: 14, paddingHorizontal: 24, flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center' },
   titleText: { fontSize: 20, fontWeight: '900', color: '#FFFFFF', letterSpacing: 2 },
   header: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', padding: 20, paddingHorizontal: 24, borderBottomWidth: 2, borderBottomColor: '#000000' },
   headerCount: { fontSize: 36, fontWeight: '900', color: '#000000' },
@@ -147,4 +210,15 @@ const styles = StyleSheet.create({
   detailLabel: { fontSize: 11, fontWeight: '700', color: '#64748B', letterSpacing: 2, marginBottom: 4 },
   detailValue: { fontSize: 18, fontWeight: '900', color: '#000000' },
   detailValueMono: { fontSize: 16, fontWeight: '800', color: '#0055FF', fontFamily: Platform.OS === 'ios' ? 'Menlo' : 'monospace' },
+  // Modal
+  modalOverlay: { flex: 1, backgroundColor: 'rgba(0,0,0,0.6)', justifyContent: 'center', alignItems: 'center' },
+  modalContent: { backgroundColor: '#FFFFFF', borderRadius: 16, padding: 24, width: '85%', alignItems: 'center', borderWidth: 2, borderColor: '#000000' },
+  modalTitle: { fontSize: 18, fontWeight: '900', color: '#0F172A', marginBottom: 8, textAlign: 'center' },
+  modalMessage: { fontSize: 14, color: '#475569', textAlign: 'center', marginBottom: 24, lineHeight: 20 },
+  modalButtonRow: { flexDirection: 'row', gap: 12, width: '100%' },
+  modalButton: { flex: 1, height: 48, borderRadius: 10, justifyContent: 'center', alignItems: 'center', borderWidth: 2 },
+  cancelButton: { borderColor: '#E2E8F0', backgroundColor: '#F8FAFC' },
+  cancelButtonText: { fontSize: 13, fontWeight: '900', color: '#475569' },
+  confirmButton: { borderColor: '#FF3B30', backgroundColor: '#FF3B30' },
+  confirmButtonText: { fontSize: 13, fontWeight: '900', color: '#FFFFFF' },
 });

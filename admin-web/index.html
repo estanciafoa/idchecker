@@ -164,7 +164,7 @@
   <div class="shell">
     <div class="card">
       <h1>ID Checker Admin Uploader</h1>
-      <p>Paste rows from Excel and select resident photos. Rows are pushed to Google Sheets. Photos are zipped and downloaded for you to manually upload to Google Drive.</p>
+      <p>Paste rows from Excel and select resident photos. Rows are pushed to Google Sheets. Photos can be zipped for download or uploaded directly to Google Drive.</p>
     </div>
 
     <div class="card">
@@ -186,6 +186,7 @@
       <div class="row" style="margin-top: 10px;">
         <span class="pill" id="photosSummary">No photos selected</span>
         <button class="btn" id="downloadZipBtn" type="button" style="background:#0f766e">Download Photos ZIP</button>
+        <button class="btn" id="uploadZipDriveBtn" type="button" style="background:#7c3aed">Upload ZIP to Drive</button>
       </div>
     </div>
 
@@ -210,7 +211,8 @@
       scriptUrl: "https://script.google.com/macros/s/AKfycbwNbXXqm1LzoSzElB_5OZ46fnHDYTFNvI405dkCfa8CbtTgEA41Bjhza1_bqmmYiuvzVg/exec",
       spreadsheetId: "1EDvYjDQVIpwib5PmQ5sbSchJI_B5HNHWNomXRLOxtk4",
       sheetName: "sheet1",
-      token: ""
+      token: "",
+      driveZipFileId: "1De7JzvhoEHfsrVJzKojcQu_QgHq4tRUE"
     };
 
     const els = {
@@ -218,6 +220,7 @@
       photosFilesInput: document.getElementById("photosFilesInput"),
       photosSummary: document.getElementById("photosSummary"),
       uploadBtn: document.getElementById("uploadBtn"),
+      uploadZipDriveBtn: document.getElementById("uploadZipDriveBtn"),
       status: document.getElementById("status")
     };
 
@@ -495,6 +498,121 @@
       return bestBlob;
     }
 
+    function blobToBase64(blob) {
+      return new Promise((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onloadend = () => {
+          const result = String(reader.result || "");
+          const commaIndex = result.indexOf(",");
+          resolve(commaIndex >= 0 ? result.slice(commaIndex + 1) : result);
+        };
+        reader.onerror = () => reject(new Error("Failed to read ZIP blob"));
+        reader.readAsDataURL(blob);
+      });
+    }
+
+    async function uploadZipToDrive() {
+      const photos = getSelectedPhotos();
+      if (!photos.length) {
+        setStatus("Select photos first before uploading ZIP.", "bad");
+        return;
+      }
+
+      const scriptUrl = HARDCODED_CONFIG.scriptUrl;
+      const spreadsheetId = HARDCODED_CONFIG.spreadsheetId;
+      const sheetName = HARDCODED_CONFIG.sheetName;
+      const token = HARDCODED_CONFIG.token;
+      const driveZipFileId = HARDCODED_CONFIG.driveZipFileId;
+
+      if (!scriptUrl || !spreadsheetId || !driveZipFileId) {
+        setStatus("Hardcoded Drive ZIP config is missing required values.", "bad");
+        return;
+      }
+
+      els.uploadZipDriveBtn.disabled = true;
+      try {
+        const requestId = Date.now().toString() + "-zip-" + Math.random().toString(36).slice(2, 8);
+        setStatus("Compressing " + photos.length + " photo(s) to ~50 KB each...", "warn");
+        const zip = new JSZip();
+
+        for (let i = 0; i < photos.length; i++) {
+          const file = photos[i];
+          setStatus("Compressing (" + (i + 1) + "/" + photos.length + "): " + file.name, "warn");
+          const compressed = await compressImage(file, 50);
+          const nameBase = file.name.replace(/\.[^.]+$/, "") + ".jpg";
+          zip.file(nameBase, compressed);
+        }
+
+        setStatus("Creating faces.zip...", "warn");
+        const zipBlob = await zip.generateAsync({ type: "blob", compression: "DEFLATE", compressionOptions: { level: 6 } });
+        const zipBase64 = await blobToBase64(zipBlob);
+
+        const payload = {
+          token,
+          spreadsheetId,
+          sheetName,
+          requestId,
+          rows: [],
+          zipBase64,
+          driveZipFileId,
+          zipFileName: "faces.zip"
+        };
+
+        const formBody = new URLSearchParams();
+        formBody.set("payload", JSON.stringify(payload));
+
+        await fetch(scriptUrl, {
+          method: "POST",
+          body: formBody.toString(),
+          headers: { "Content-Type": "application/x-www-form-urlencoded;charset=UTF-8" },
+          mode: "no-cors"
+        });
+
+        async function sleep(ms) {
+          return new Promise((resolve) => setTimeout(resolve, ms));
+        }
+
+        async function fetchStatus() {
+          return new Promise((resolve, reject) => {
+            const callbackName = "statusCb_" + requestId.replace(/[^a-zA-Z0-9_]/g, "_") + "_" + Date.now();
+            const statusUrl = scriptUrl + "?action=status&requestId=" + encodeURIComponent(requestId) + "&callback=" + encodeURIComponent(callbackName);
+            const script = document.createElement("script");
+            let done = false;
+            const cleanup = () => { if (script.parentNode) script.parentNode.removeChild(script); try { delete window[callbackName]; } catch (_) {} };
+            const timeout = setTimeout(() => { if (done) return; done = true; cleanup(); reject(new Error("timeout")); }, 8000);
+            window[callbackName] = (p) => { if (done) return; done = true; clearTimeout(timeout); cleanup(); resolve(p); };
+            script.onerror = () => { if (done) return; done = true; clearTimeout(timeout); cleanup(); reject(new Error("load failed")); };
+            script.src = statusUrl;
+            document.head.appendChild(script);
+          });
+        }
+
+        setStatus("Uploading faces.zip to Google Drive...", "warn");
+        let statusBody = null;
+        for (let attempt = 1; attempt <= 15; attempt++) {
+          await sleep(1000);
+          try {
+            const probe = await fetchStatus();
+            if (probe && probe.ok && probe.result && probe.result.found && probe.result.status) { statusBody = probe; break; }
+          } catch (_) {}
+        }
+
+        if (!statusBody || !statusBody.result || !statusBody.result.status) {
+          setStatus("faces.zip upload sent, but Drive status could not be confirmed. Check the Drive file manually.", "warn");
+          return;
+        }
+
+        const s = statusBody.result.status;
+        if (!s.ok) throw new Error(s.error || "ZIP upload failed");
+
+        setStatus("faces.zip uploaded to Google Drive successfully.", "ok");
+      } catch (err) {
+        setStatus("Drive ZIP upload failed: " + (err.message || err), "bad");
+      } finally {
+        els.uploadZipDriveBtn.disabled = false;
+      }
+    }
+
     async function downloadZip() {
       const photos = getSelectedPhotos();
       if (!photos.length) {
@@ -538,6 +656,7 @@
     els.uploadBtn.addEventListener("click", pushRows);
     els.downloadZipBtn = document.getElementById("downloadZipBtn");
     els.downloadZipBtn.addEventListener("click", downloadZip);
+    els.uploadZipDriveBtn.addEventListener("click", uploadZipToDrive);
     els.photosFilesInput.addEventListener("change", updatePhotoSummary);
   </script>
 </body>

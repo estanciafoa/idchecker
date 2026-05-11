@@ -1,9 +1,10 @@
 import React, { useState, useEffect } from 'react';
 import {
   View, Text, StyleSheet, TouchableOpacity, ActivityIndicator,
-  SafeAreaView, ScrollView,
+  ScrollView,
 } from 'react-native';
 import { Ionicons } from '@expo/vector-icons';
+import { SafeAreaView } from 'react-native-safe-area-context';
 import { Resident, getLocalResidents, saveLocalResidents, getLastSyncTime, setLastSyncTime } from '../src/services/storage';
 import {
   downloadAllPhotos,
