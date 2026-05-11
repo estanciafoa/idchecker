@@ -120,6 +120,41 @@
       transform: translateY(1px);
     }
 
+    .photos-card {
+      position: relative;
+      padding-top: 22px;
+    }
+
+    .icon-btn {
+      position: absolute;
+      top: 10px;
+      right: 10px;
+      width: 32px;
+      height: 32px;
+      border-radius: 8px;
+      border: 1px solid var(--border);
+      background: #f8fafc;
+      color: var(--muted);
+      cursor: pointer;
+      font-size: 16px;
+      line-height: 1;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      transition: background 0.15s ease, border-color 0.15s ease, color 0.15s ease;
+    }
+
+    .icon-btn:hover {
+      background: #eef2ff;
+      border-color: #cbd5e1;
+      color: #334155;
+    }
+
+    .icon-btn:disabled {
+      opacity: 0.6;
+      cursor: not-allowed;
+    }
+
     .pill {
       display: inline-flex;
       align-items: center;
@@ -178,14 +213,14 @@
       </div>
     </div>
 
-    <div class="card">
+    <div class="card photos-card">
+      <button class="icon-btn" id="downloadZipBtn" type="button" aria-label="Download Photos ZIP">⤓</button>
       <div class="field">
         <label for="photosFilesInput">Pick Photo Files</label>
         <input id="photosFilesInput" type="file" accept="image/*" multiple />
       </div>
       <div class="row" style="margin-top: 10px;">
         <span class="pill" id="photosSummary">No photos selected</span>
-        <button class="btn" id="downloadZipBtn" type="button" style="background:#0f766e">Download Photos ZIP</button>
         <button class="btn" id="uploadZipDriveBtn" type="button" style="background:#7c3aed">Upload ZIP to Drive</button>
       </div>
     </div>
