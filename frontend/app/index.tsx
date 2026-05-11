@@ -12,10 +12,15 @@ import {
   AppState,
   Image,
 } from 'react-native';
+import { Audio } from 'expo-av';
 import { CameraView, useCameraPermissions } from 'expo-camera';
 import { Ionicons } from '@expo/vector-icons';
 import { useRouter } from 'expo-router';
 import { SafeAreaView } from 'react-native-safe-area-context';
+
+const SUCCESS_SOUND = require('../assets/sounds/success.wav');
+const FAILURE_SOUND = require('../assets/sounds/failure.wav');
+
 import {
   getResidentById,
   getLocalResidents,
@@ -39,6 +44,13 @@ export default function ScannerScreen() {
   const cameraRef = useRef<any>(null);
 
   useEffect(() => {
+    // Configure audio so sounds play even in silent mode
+    Audio.setAudioModeAsync({
+      playsInSilentModeIOS: true,
+      allowsRecordingIOS: false,
+      staysActiveInBackground: false,
+      shouldDuckAndroid: true,
+    }).catch(() => {});
     // Pre-warm cache on mount for instant lookups
     preloadResidents().then(setResidentCount);
     const sub = AppState.addEventListener('change', (state) => {
@@ -145,6 +157,22 @@ export default function ScannerScreen() {
     return resident.validity.toUpperCase().includes('BLACK LISTED');
   };
 
+  const playSound = async (soundFile: any) => {
+    try {
+      const { sound } = await Audio.Sound.createAsync(soundFile, {
+        shouldPlay: true,
+        volume: 1.0,
+      });
+      sound.setOnPlaybackStatusUpdate((status) => {
+        if ('didJustFinish' in status && status.didJustFinish) {
+          sound.unloadAsync();
+        }
+      });
+    } catch (e) {
+      console.warn('Sound playback error:', e);
+    }
+  };
+
   const lookupResident = async (id: string) => {
     const found = await getResidentById(id);
     if (found) {
@@ -166,9 +194,13 @@ export default function ScannerScreen() {
         unit: found.unit,
         status: logEntry.status,
       }).catch(() => {});
+      // Play success or failure sound based on status
+      void playSound(denied ? FAILURE_SOUND : SUCCESS_SOUND);
     } else {
       setResident(null);
       setNotFound(true);
+      // Not found = failure sound
+      void playSound(FAILURE_SOUND);
     }
     setShowResult(true);
   };
