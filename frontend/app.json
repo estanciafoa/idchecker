@@ -1,7 +1,7 @@
 {
   "expo": {
-    "name": "frontend",
-    "slug": "frontend",
+    "name": "Estancia ID Check",
+    "slug": "estancia-id-check",
     "version": "1.0.0",
     "orientation": "portrait",
     "icon": "./assets/images/icon.png",
@@ -42,9 +42,8 @@
         "expo-splash-screen",
         {
           "image": "./assets/images/splash-image.png",
-          "imageWidth": 200,
-          "resizeMode": "contain",
-          "backgroundColor": "#FFFBEB"
+          "resizeMode": "cover",
+          "backgroundColor": "#0A234B"
         }
       ],
       "expo-web-browser",
