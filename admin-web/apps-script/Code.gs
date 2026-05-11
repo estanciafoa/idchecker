@@ -271,14 +271,26 @@ function appendRows_(spreadsheetId, sheetName, rows) {
 
 function replaceZipInDrive_(fileId, zipBase64, zipFileName) {
   const bytes = Utilities.base64Decode(zipBase64);
-  const blob = Utilities.newBlob(bytes, 'application/zip', zipFileName);
+  const token = ScriptApp.getOAuthToken();
 
-  // Use DriveApp to update the file with proper Drive API scope
-  try {
-    const file = DriveApp.getFileById(fileId);
-    file.setContent(blob);
-  } catch (err) {
-    throw new Error('Drive update failed: ' + err.message);
+  // Binary media upload replaces the existing file bytes in-place.
+  const url = 'https://www.googleapis.com/upload/drive/v3/files/' +
+    encodeURIComponent(fileId) + '?uploadType=media';
+
+  const response = UrlFetchApp.fetch(url, {
+    method: 'PATCH',
+    contentType: 'application/zip',
+    payload: bytes,
+    headers: { 'Authorization': 'Bearer ' + token },
+    muteHttpExceptions: true
+  });
+
+  const code = response.getResponseCode();
+  if (code < 200 || code >= 300) {
+    throw new Error(
+      'Drive update failed (' + code + '): ' +
+      response.getContentText().substring(0, 300)
+    );
   }
 }
 
