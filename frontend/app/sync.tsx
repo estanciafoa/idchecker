@@ -13,10 +13,10 @@ import {
   attachLocalPhotosById,
 } from '../src/services/photos';
 const SHEET_URL = 'https://docs.google.com/spreadsheets/d/e/2PACX-1vRWtCUWe5gmOUyvtZsSnApB5H0vMRRGXDnETCaUwcSRCCRdeX7J299QKq0p7cntCqeqRR4fxbRR1hgL/pub?output=csv';
-const PHOTOS_ZIP_URL = 'https://drive.google.com/uc?export=download&id=1qeYPI_zPqyKofP9_xx9iVOhHnd_DSW0S';
+const PHOTOS_ZIP_URL = 'https://drive.google.com/uc?export=download&id=1De7JzvhoEHfsrVJzKojcQu_QgHq4tRUE';
 // Optional fallback when photo_url column is empty.
 // Use {id} placeholder, e.g. 'https://example.com/photos/{id}.jpg'
-const PHOTO_URL_TEMPLATE = '';
+const PHOTO_URL_TEMPLATE: string = '';
 
 function parseCSV(text: string): Record<string, string>[] {
   const lines = text.split('\n');
@@ -181,20 +181,6 @@ export default function SyncScreen() {
     }
   };
 
-  const handleSyncLocal = async () => {
-    setSyncing(true);
-    setSyncResult(null);
-    setSyncError(null);
-    try {
-      await loadStatus();
-      setSyncResult(`Local database has ${localCount} residents`);
-    } catch (error: any) {
-      setSyncError(`SYNC FAILED: ${error?.message || 'Check connection'}`);
-    } finally {
-      setSyncing(false);
-    }
-  };
-
   const formatSyncTime = (iso: string) => {
     const d = new Date(iso);
     return d.toLocaleString('en-IN', { day: '2-digit', month: 'short', year: 'numeric', hour: '2-digit', minute: '2-digit' });
@@ -235,20 +221,9 @@ export default function SyncScreen() {
           {syncing ? <ActivityIndicator color="#FFFFFF" /> : (
             <>
               <Ionicons name="cloud-download" size={24} color="#FFFFFF" />
-              <Text style={styles.importBtnText}>PULL FROM SHEET</Text>
+              <Text style={styles.importBtnText}>UPDATE DATA</Text>
             </>
           )}
-        </TouchableOpacity>
-
-        {/* Sync from server (if data already imported) */}
-        <TouchableOpacity
-          testID="sync-button"
-          style={[styles.syncLocalBtn, syncing && styles.btnDisabled]}
-          onPress={handleSyncLocal}
-          disabled={syncing}
-        >
-          <Ionicons name="refresh" size={20} color="#0055FF" />
-          <Text style={styles.syncLocalText}>SYNC FROM SERVER</Text>
         </TouchableOpacity>
 
         {/* Messages */}
@@ -295,8 +270,6 @@ const styles = StyleSheet.create({
   saveUrlText: { color: '#FFFFFF', fontSize: 12, fontWeight: '900' },
   importBtn: { height: 64, backgroundColor: '#0055FF', justifyContent: 'center', alignItems: 'center', flexDirection: 'row', gap: 10, borderWidth: 2, borderColor: '#000000', marginBottom: 12 },
   importBtnText: { color: '#FFFFFF', fontSize: 16, fontWeight: '900', letterSpacing: 1 },
-  syncLocalBtn: { height: 48, backgroundColor: '#FFFFFF', justifyContent: 'center', alignItems: 'center', flexDirection: 'row', gap: 8, borderWidth: 2, borderColor: '#0055FF', marginBottom: 16 },
-  syncLocalText: { color: '#0055FF', fontSize: 13, fontWeight: '900' },
   btnDisabled: { opacity: 0.6 },
   successBox: { flexDirection: 'row', alignItems: 'center', gap: 8, padding: 12, backgroundColor: '#F0FFF4', borderWidth: 1, borderColor: '#00C853', marginBottom: 12 },
   successText: { fontSize: 13, fontWeight: '700', color: '#00C853', flex: 1 },

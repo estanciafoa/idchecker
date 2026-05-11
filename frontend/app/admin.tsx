@@ -55,8 +55,75 @@ export default function AdminScreen() {
     }
   };
 
-  const renderResident = ({ item }: { item: Resident }) => (
-    <TouchableOpacity testID={`admin-resident-${item.id}`} style={styles.residentItem} onPress={() => setSelectedResident(item)} activeOpacity={0.7}>
+  const parseValidityDate = (validity: string): Date | null => {
+    const text = validity.trim();
+
+    let match = text.match(/^(\d{1,2})[./-](\d{1,2})[./-](\d{4})$/);
+    if (match) {
+      const [, day, month, year] = match;
+      const parsed = new Date(Number(year), Number(month) - 1, Number(day));
+      return isNaN(parsed.getTime()) ? null : parsed;
+    }
+
+    const monthMap: Record<string, number> = {
+      january: 0,
+      february: 1,
+      march: 2,
+      april: 3,
+      may: 4,
+      june: 5,
+      july: 6,
+      august: 7,
+      september: 8,
+      october: 9,
+      november: 10,
+      december: 11,
+    };
+
+    match = text.match(/^(\d{1,2})(?:st|nd|rd|th)?\s+([A-Za-z]+)\s+(\d{4})$/i);
+    if (match) {
+      const [, day, monthName, year] = match;
+      const month = monthMap[monthName.toLowerCase()];
+      if (month === undefined) return null;
+      const parsed = new Date(Number(year), month, Number(day));
+      return isNaN(parsed.getTime()) ? null : parsed;
+    }
+
+    return null;
+  };
+
+  const isBlackMarked = (resident: Resident): boolean => {
+    const text = String(resident.validity || '').toUpperCase();
+    return text.includes('BLACK LISTED') || text.includes('BLACK MARKED') || text.includes('BLACKLISTED');
+  };
+
+  const isExpired = (resident: Resident): boolean => {
+    if (!resident.validity || isBlackMarked(resident)) return false;
+    const validityDate = parseValidityDate(resident.validity);
+    if (!validityDate) return false;
+    const today = new Date();
+    today.setHours(0, 0, 0, 0);
+    return validityDate < today;
+  };
+
+  const getStatusMeta = (resident: Resident): { label: string; style: any } => {
+    if (isBlackMarked(resident)) return { label: 'BLACK MARKED', style: styles.badgeBlackMarked };
+    if (isExpired(resident)) return { label: 'EXPIRED', style: styles.badgeExpired };
+    if (resident.status === 'active') return { label: 'ACTIVE', style: styles.badgeActive };
+    return { label: 'INACTIVE', style: styles.badgeInactive };
+  };
+
+  const renderResident = ({ item }: { item: Resident }) => {
+    const statusMeta = getStatusMeta(item);
+    const blackMarked = isBlackMarked(item);
+
+    return (
+    <TouchableOpacity
+      testID={`admin-resident-${item.id}`}
+      style={[styles.residentItem, blackMarked && styles.residentItemBlackMarked]}
+      onPress={() => setSelectedResident(item)}
+      activeOpacity={0.7}
+    >
       <View style={styles.residentAvatar}>
         {(item.local_photo || item.photo_url) ? (
           <Image source={{ uri: item.local_photo || item.photo_url }} style={styles.avatarImage} />
@@ -69,11 +136,12 @@ export default function AdminScreen() {
         <Text style={styles.residentId}>ID: {item.id}</Text>
         <Text style={styles.residentUnit}>{item.unit}{item.vehicle_plate ? ` • ${item.vehicle_plate}` : ''}</Text>
       </View>
-      <View style={[styles.statusBadge, item.status === 'active' ? styles.badgeActive : styles.badgeInactive]}>
-        <Text style={styles.statusBadgeText}>{item.status === 'active' ? 'ACTIVE' : 'INACTIVE'}</Text>
+      <View style={[styles.statusBadge, statusMeta.style]}>
+        <Text style={styles.statusBadgeText}>{statusMeta.label}</Text>
       </View>
     </TouchableOpacity>
-  );
+    );
+  };
 
   return (
     <SafeAreaView testID="admin-screen" style={styles.container}>
@@ -108,6 +176,9 @@ export default function AdminScreen() {
       {/* Resident Detail Modal */}
       {selectedResident && (
         <Modal visible={!!selectedResident} animationType="slide" transparent={false} onRequestClose={() => setSelectedResident(null)}>
+          {(() => {
+            const statusMeta = getStatusMeta(selectedResident);
+            return (
           <SafeAreaView style={styles.detailContainer}>
             <TouchableOpacity testID="close-detail-modal" onPress={() => setSelectedResident(null)} style={styles.backBtn} activeOpacity={0.6}>
               <Ionicons name="arrow-back" size={28} color="#FFFFFF" />
@@ -121,8 +192,8 @@ export default function AdminScreen() {
                   <Text style={styles.detailPhotoText}>{selectedResident.name.charAt(0).toUpperCase()}</Text>
                 )}
               </View>
-              <View style={[styles.detailStatusBadge, selectedResident.status === 'active' ? styles.badgeActive : styles.badgeInactive]}>
-                <Text style={styles.statusBadgeText}>{selectedResident.status === 'active' ? 'ACTIVE' : 'INACTIVE'}</Text>
+              <View style={[styles.detailStatusBadge, statusMeta.style]}>
+                <Text style={styles.statusBadgeText}>{statusMeta.label}</Text>
               </View>
               <View style={styles.detailCard}>
                 <View style={styles.detailRow}><Text style={styles.detailLabel}>RESIDENT ID</Text><Text style={styles.detailValueMono}>{selectedResident.id}</Text></View>
@@ -136,6 +207,8 @@ export default function AdminScreen() {
               </View>
             </ScrollView>
           </SafeAreaView>
+            );
+          })()}
         </Modal>
       )}
 
@@ -185,6 +258,7 @@ const styles = StyleSheet.create({
   emptySubtext: { fontSize: 14, color: '#94A3B8', marginTop: 8 },
   listContent: { padding: 12 },
   residentItem: { flexDirection: 'row', alignItems: 'center', padding: 14, marginBottom: 8, borderWidth: 2, borderColor: '#E2E8F0', backgroundColor: '#FFFFFF' },
+  residentItemBlackMarked: { borderColor: '#7F1D1D', backgroundColor: '#FEF2F2' },
   residentAvatar: { width: 48, height: 48, justifyContent: 'center', alignItems: 'center', backgroundColor: '#0055FF', marginRight: 12, overflow: 'hidden' },
   avatarImage: { width: 48, height: 48 },
   avatarText: { fontSize: 22, fontWeight: '900', color: '#FFFFFF' },
@@ -194,6 +268,8 @@ const styles = StyleSheet.create({
   residentUnit: { fontSize: 12, fontWeight: '600', color: '#64748B', marginTop: 2 },
   statusBadge: { paddingHorizontal: 8, paddingVertical: 4 },
   badgeActive: { backgroundColor: '#00C853' },
+  badgeExpired: { backgroundColor: '#B45309' },
+  badgeBlackMarked: { backgroundColor: '#7F1D1D' },
   badgeInactive: { backgroundColor: '#FF3B30' },
   statusBadgeText: { fontSize: 10, fontWeight: '900', color: '#FFFFFF', letterSpacing: 1 },
   // Detail
