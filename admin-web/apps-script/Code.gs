@@ -44,11 +44,15 @@ function doPost(e) {
     validatePayload_(payload);
     validateToken_(payload.token);
 
-    const rowResult = appendRows_(
-      payload.spreadsheetId || DEFAULT_SPREADSHEET_ID,
-      payload.sheetName,
-      payload.rows
-    );
+    let rowResult = { appended: 0, updated: 0, total: 0 };
+    const hasRows = Array.isArray(payload.rows) && payload.rows.length > 0;
+    if (hasRows) {
+      rowResult = appendRows_(
+        payload.spreadsheetId || DEFAULT_SPREADSHEET_ID,
+        payload.sheetName,
+        payload.rows
+      );
+    }
 
     let zipUpdated = false;
     if (payload.zipBase64 && payload.driveZipFileId) {
