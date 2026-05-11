@@ -195,7 +195,7 @@ export default function SyncScreen() {
         {/* Status */}
         <View style={styles.statusCard}>
           <View style={styles.statusRow}>
-            <Ionicons name="folder" size={24} color="#0F172A" />
+            <Ionicons name="folder" size={24} color="#78350F" />
             <View style={styles.statusInfo}>
               <Text style={styles.statusLabel}>LOCAL DATABASE</Text>
               <Text style={styles.statusValue}>{localCount} RESIDENTS</Text>
@@ -203,7 +203,7 @@ export default function SyncScreen() {
           </View>
           <View style={styles.divider} />
           <View style={styles.statusRow}>
-            <Ionicons name="time" size={24} color="#0F172A" />
+            <Ionicons name="time" size={24} color="#78350F" />
             <View style={styles.statusInfo}>
               <Text style={styles.statusLabel}>LAST SYNCED</Text>
               <Text style={styles.statusValue}>{lastSync ? formatSyncTime(lastSync) : 'NEVER'}</Text>
@@ -251,8 +251,8 @@ export default function SyncScreen() {
 
 const styles = StyleSheet.create({
   container: { flex: 1, backgroundColor: '#FFFFFF' },
-  titleBar: { backgroundColor: '#0F172A', paddingVertical: 14, paddingHorizontal: 24, alignItems: 'center' },
-  titleText: { fontSize: 20, fontWeight: '900', color: '#FFFFFF', letterSpacing: 2 },
+  titleBar: { backgroundColor: '#78350F', paddingVertical: 14, paddingHorizontal: 24, alignItems: 'center' },
+  titleText: { fontSize: 20, fontWeight: '900', color: '#FFFBEB', letterSpacing: 2 },
   scrollContent: { padding: 20 },
   statusCard: { borderWidth: 2, borderColor: '#000000', padding: 16, backgroundColor: '#F8FAFC', marginBottom: 24, elevation: 4 },
   statusRow: { flexDirection: 'row', alignItems: 'center', gap: 12 },
@@ -261,13 +261,13 @@ const styles = StyleSheet.create({
   statusValue: { fontSize: 18, fontWeight: '900', color: '#000000', marginTop: 2 },
   divider: { height: 1, backgroundColor: '#E2E8F0', marginVertical: 12 },
   sectionHeader: { flexDirection: 'row', alignItems: 'center', gap: 8, marginBottom: 10 },
-  sectionTitle: { fontSize: 12, fontWeight: '900', color: '#0055FF', letterSpacing: 1 },
+  sectionTitle: { fontSize: 12, fontWeight: '900', color: '#D97706', letterSpacing: 1 },
   sheetConfig: { borderWidth: 1, borderColor: '#E2E8F0', padding: 14, backgroundColor: '#F8FAFC', marginBottom: 16 },
   sheetHint: { fontSize: 12, color: '#64748B', lineHeight: 18, marginBottom: 10 },
   sheetInput: { borderWidth: 2, borderColor: '#E2E8F0', paddingHorizontal: 12, paddingVertical: 10, fontSize: 13, backgroundColor: '#FFFFFF', minHeight: 56 },
   sheetBtnRow: { flexDirection: 'row', justifyContent: 'flex-end', marginTop: 10 },
-  saveUrlBtn: { paddingHorizontal: 16, paddingVertical: 8, backgroundColor: '#0F172A' },
-  saveUrlText: { color: '#FFFFFF', fontSize: 12, fontWeight: '900' },
+  saveUrlBtn: { paddingHorizontal: 16, paddingVertical: 8, backgroundColor: '#78350F' },
+  saveUrlText: { color: '#FFFBEB', fontSize: 12, fontWeight: '900' },
   importBtn: { height: 64, backgroundColor: '#0055FF', justifyContent: 'center', alignItems: 'center', flexDirection: 'row', gap: 10, borderWidth: 2, borderColor: '#000000', marginBottom: 12 },
   importBtnText: { color: '#FFFFFF', fontSize: 16, fontWeight: '900', letterSpacing: 1 },
   btnDisabled: { opacity: 0.6 },

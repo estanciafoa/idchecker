@@ -23,8 +23,8 @@ export default function TabLayout() {
         sceneContainerStyle: {
           paddingBottom: insets.bottom,
         },
-        tabBarActiveTintColor: '#0055FF',
-        tabBarInactiveTintColor: '#475569',
+        tabBarActiveTintColor: '#D97706',
+        tabBarInactiveTintColor: '#B6A69B',
         tabBarLabelStyle: { fontSize: 11, fontWeight: '700', textTransform: 'uppercase' },
       }}
     >

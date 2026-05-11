@@ -327,12 +327,12 @@ export default function ScannerScreen() {
             <View style={[styles.statusDot, residentCount > 0 ? styles.dotOnline : styles.dotOffline]} />
             <Text style={styles.statusText}>{residentCount} RESIDENTS IN LOCAL DB</Text>
             <TouchableOpacity testID="pull-refresh-btn-no-camera" style={styles.pullRefreshBtn} onPress={openSyncForPullRefresh}>
-              <Ionicons name="cloud-download" size={14} color="#0055FF" />
+              <Ionicons name="cloud-download" size={14} color="#D97706" />
               <Text style={styles.pullRefreshText}>PULL & REFRESH</Text>
             </TouchableOpacity>
           </View>
           <View style={styles.permissionBox}>
-            <Ionicons name="camera-outline" size={56} color="#0F172A" />
+            <Ionicons name="camera-outline" size={56} color="#78350F" />
             <Text style={styles.permissionTitle}>CAMERA ACCESS</Text>
             <Text style={styles.permissionText}>Grant camera to scan barcodes</Text>
             <TouchableOpacity testID="grant-camera-permission-btn" style={styles.actionButton} onPress={requestPermission}>
@@ -441,8 +441,8 @@ export default function ScannerScreen() {
 
 const styles = StyleSheet.create({
   container: { flex: 1, backgroundColor: '#FFFFFF' },
-  titleBar: { backgroundColor: '#0F172A', paddingVertical: 14, paddingHorizontal: 24, alignItems: 'center' },
-  titleText: { fontSize: 20, fontWeight: '900', color: '#FFFFFF', letterSpacing: 2 },
+  titleBar: { backgroundColor: '#78350F', paddingVertical: 14, paddingHorizontal: 24, alignItems: 'center' },
+  titleText: { fontSize: 20, fontWeight: '900', color: '#FFFBEB', letterSpacing: 2 },
   statusBar: { flexDirection: 'row', alignItems: 'center', padding: 12, paddingHorizontal: 24, backgroundColor: '#F8FAFC', borderBottomWidth: 1, borderBottomColor: '#E2E8F0' },
   statusDot: { width: 10, height: 10, borderRadius: 5, marginRight: 8 },
   dotOnline: { backgroundColor: '#00C853' },
@@ -456,13 +456,13 @@ const styles = StyleSheet.create({
     paddingHorizontal: 10,
     paddingVertical: 6,
     borderWidth: 1,
-    borderColor: '#0055FF',
+    borderColor: '#D97706',
     backgroundColor: '#FFFFFF',
   },
   pullRefreshText: {
     fontSize: 10,
     fontWeight: '900',
-    color: '#0055FF',
+    color: '#D97706',
     letterSpacing: 0.6,
   },
   cameraContainer: { flex: 1, position: 'relative' },
@@ -475,7 +475,7 @@ const styles = StyleSheet.create({
   cornerBL: { bottom: 0, left: 0, borderBottomWidth: 4, borderLeftWidth: 4 },
   cornerBR: { bottom: 0, right: 0, borderBottomWidth: 4, borderRightWidth: 4 },
   scanHint: { marginTop: 24, color: '#FFFFFF', fontSize: 14, fontWeight: '700', letterSpacing: 2 },
-  captureBtn: { marginTop: 32, flexDirection: 'row', alignItems: 'center', gap: 8, backgroundColor: '#0055FF', paddingHorizontal: 24, paddingVertical: 16, borderWidth: 2, borderColor: '#FFFFFF' },
+  captureBtn: { marginTop: 32, flexDirection: 'row', alignItems: 'center', gap: 8, backgroundColor: '#D97706', paddingHorizontal: 24, paddingVertical: 16, borderWidth: 2, borderColor: '#FFFBEB' },
   captureBtnText: { color: '#FFFFFF', fontSize: 14, fontWeight: '900', letterSpacing: 1 },
   loadingContainer: { flex: 1, justifyContent: 'center', alignItems: 'center' },
   loadingText: { marginTop: 16, fontSize: 16, fontWeight: '700', color: '#475569' },

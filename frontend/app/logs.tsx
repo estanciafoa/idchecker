@@ -108,8 +108,8 @@ const styles = StyleSheet.create({
     flex: 1,
     backgroundColor: '#FFFFFF',
   },
-  titleBar: { backgroundColor: '#0F172A', paddingVertical: 14, paddingHorizontal: 24, alignItems: 'center' },
-  titleText: { fontSize: 20, fontWeight: '900', color: '#FFFFFF', letterSpacing: 2 },
+  titleBar: { backgroundColor: '#78350F', paddingVertical: 14, paddingHorizontal: 24, alignItems: 'center' },
+  titleText: { fontSize: 20, fontWeight: '900', color: '#FFFBEB', letterSpacing: 2 },
   header: {
     flexDirection: 'row',
     alignItems: 'baseline',
