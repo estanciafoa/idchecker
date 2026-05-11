@@ -12,7 +12,7 @@ import {
   attachLocalPhotosById,
 } from '../src/services/photos';
 const SHEET_URL = 'https://docs.google.com/spreadsheets/d/e/2PACX-1vRWtCUWe5gmOUyvtZsSnApB5H0vMRRGXDnETCaUwcSRCCRdeX7J299QKq0p7cntCqeqRR4fxbRR1hgL/pub?output=csv';
-const PHOTOS_ZIP_URL = 'https://drive.google.com/uc?export=download&id=15puDxEMC5RrvxHbDugZPn1XWNSLmwIH6';
+const PHOTOS_ZIP_URL = 'https://drive.google.com/uc?export=download&id=1qeYPI_zPqyKofP9_xx9iVOhHnd_DSW0S';
 // Optional fallback when photo_url column is empty.
 // Use {id} placeholder, e.g. 'https://example.com/photos/{id}.jpg'
 const PHOTO_URL_TEMPLATE = '';

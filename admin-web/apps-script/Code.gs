@@ -8,6 +8,8 @@ const REQUIRED_HEADERS = [
   'ID'
 ];
 
+const DEFAULT_SPREADSHEET_ID = '1EDvYjDQVIpwib5PmQ5sbSchJI_B5HNHWNomXRLOxtk4';
+
 function doGet(e) {
   try {
     if (e && e.parameter && e.parameter.action === 'status') {
@@ -43,7 +45,7 @@ function doPost(e) {
     validateToken_(payload.token);
 
     const rowResult = appendRows_(
-      payload.spreadsheetId,
+      payload.spreadsheetId || DEFAULT_SPREADSHEET_ID,
       payload.sheetName,
       payload.rows
     );
@@ -177,9 +179,6 @@ function parsePayload_(e) {
 function validatePayload_(payload) {
   if (!payload || typeof payload !== 'object') {
     throw new Error('Invalid JSON payload');
-  }
-  if (!payload.spreadsheetId) {
-    throw new Error('spreadsheetId is required');
   }
   if (!payload.sheetName) {
     throw new Error('sheetName is required');
