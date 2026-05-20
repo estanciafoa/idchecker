@@ -91,3 +91,47 @@ export async function saveSheetUrl(sheetUrl: string) {
   if (!res.ok) throw new Error('Failed to save sheet URL');
   return res.json();
 }
+
+// Push access logs to Google Drive via Apps Script
+const APPS_SCRIPT_URL = 'https://script.google.com/macros/s/AKfycby2yjp7UEvBdYIDzKjOyFInegp_9CA7LVhpmbHbqwnxdPYEI5WJE8BYki-3Dwrgfm7pkw/exec';
+const LOGS_FOLDER_ID = '1HYUCLO1VmuA20XgQKGqxuBofg0YwvDkZ';
+
+export async function pushLogsToGoogleDrive(logs: Array<{
+  id: string;
+  resident_id: string;
+  resident_name: string;
+  unit: string;
+  timestamp: string;
+  status: string;
+}>): Promise<{ fileName: string; rowCount: number }> {
+  const payload = {
+    action: 'upload_logs',
+    folderId: LOGS_FOLDER_ID,
+    logs: logs,
+  };
+
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), 30000);
+
+  try {
+    const res = await fetch(APPS_SCRIPT_URL, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+      signal: controller.signal,
+      redirect: 'follow',
+    });
+    clearTimeout(timeoutId);
+
+    if (!res.ok) throw new Error('Upload failed: ' + res.statusText);
+    const data = await res.json();
+    if (!data.ok) throw new Error(data.error || 'Upload failed');
+    return data.result;
+  } catch (error: any) {
+    clearTimeout(timeoutId);
+    if (error.name === 'AbortError') {
+      throw new Error('Upload timed out - check internet connection');
+    }
+    throw error;
+  }
+}

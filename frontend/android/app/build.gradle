@@ -97,6 +97,12 @@ android {
 
         buildConfigField "String", "REACT_NATIVE_RELEASE_LEVEL", "\"${findProperty('reactNativeReleaseLevel') ?: 'stable'}\""
     }
+
+    applicationVariants.all { variant ->
+        variant.outputs.all { output ->
+            outputFileName = "EstanciaIdCheck.apk"
+        }
+    }
     signingConfigs {
         debug {
             storeFile file('debug.keystore')

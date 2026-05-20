@@ -6,14 +6,20 @@ import {
   FlatList,
   TouchableOpacity,
   RefreshControl,
+  Alert,
+  ActivityIndicator,
 } from 'react-native';
 import { Ionicons } from '@expo/vector-icons';
 import { SafeAreaView } from 'react-native-safe-area-context';
+import HamburgerMenu from '../src/components/HamburgerMenu';
+import { fs } from '../src/utils/scale';
 import { getLocalAccessLogs, type AccessLogEntry } from '../src/services/storage';
+import { pushLogsToGoogleDrive } from '../src/services/api';
 
 export default function LogsScreen() {
   const [logs, setLogs] = useState<AccessLogEntry[]>([]);
   const [refreshing, setRefreshing] = useState(false);
+  const [pushing, setPushing] = useState(false);
 
   useEffect(() => {
     loadLogs();
@@ -29,6 +35,22 @@ export default function LogsScreen() {
     await loadLogs();
     setRefreshing(false);
   }, []);
+
+  const handlePushLogs = async () => {
+    if (logs.length === 0) {
+      Alert.alert('No Logs', 'There are no logs to push.');
+      return;
+    }
+    setPushing(true);
+    try {
+      const result = await pushLogsToGoogleDrive(logs);
+      Alert.alert('Success', `Uploaded ${result.rowCount} logs as ${result.fileName}`);
+    } catch (error: any) {
+      Alert.alert('Upload Failed', error.message || 'Something went wrong');
+    } finally {
+      setPushing(false);
+    }
+  };
 
   const formatTime = (iso: string) => {
     const d = new Date(iso);
@@ -72,7 +94,15 @@ export default function LogsScreen() {
   return (
     <SafeAreaView testID="access-log-screen" style={styles.container}>
       <View style={styles.titleBar}>
-        <Text style={styles.titleText}>ESTANCIA ID CHECK</Text>
+        <HamburgerMenu />
+        <Text style={styles.titleText}>LOGS</Text>
+        <TouchableOpacity onPress={handlePushLogs} disabled={pushing} style={styles.pushButton}>
+          {pushing ? (
+            <ActivityIndicator size="small" color="#FFFBEB" />
+          ) : (
+            <Ionicons name="cloud-upload-outline" size={28} color="#FFFBEB" />
+          )}
+        </TouchableOpacity>
       </View>
       <View style={styles.header}>
         <Text style={styles.headerCount}>{logs.length}</Text>
@@ -108,8 +138,9 @@ const styles = StyleSheet.create({
     flex: 1,
     backgroundColor: '#FFFFFF',
   },
-  titleBar: { backgroundColor: '#78350F', paddingVertical: 14, paddingHorizontal: 24, alignItems: 'center' },
-  titleText: { fontSize: 20, fontWeight: '900', color: '#FFFBEB', letterSpacing: 2 },
+  titleBar: { backgroundColor: '#78350F', paddingVertical: 14, paddingHorizontal: 16, flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between' },
+  titleText: { fontSize: fs(20), fontWeight: '900', color: '#FFFBEB', letterSpacing: 2 },
+  pushButton: { width: 36, height: 36, alignItems: 'center', justifyContent: 'center' },
   header: {
     flexDirection: 'row',
     alignItems: 'baseline',
@@ -119,13 +150,13 @@ const styles = StyleSheet.create({
     borderBottomColor: '#E2E8F0',
   },
   headerCount: {
-    fontSize: 36,
+    fontSize: fs(36),
     fontWeight: '900',
     color: '#000000',
     marginRight: 8,
   },
   headerLabel: {
-    fontSize: 14,
+    fontSize: fs(14),
     fontWeight: '700',
     color: '#64748B',
     letterSpacing: 2,
@@ -137,13 +168,13 @@ const styles = StyleSheet.create({
     padding: 24,
   },
   emptyText: {
-    fontSize: 18,
+    fontSize: fs(18),
     fontWeight: '900',
     color: '#475569',
     marginTop: 16,
   },
   emptySubtext: {
-    fontSize: 14,
+    fontSize: fs(14),
     color: '#94A3B8',
     marginTop: 8,
   },
@@ -180,12 +211,12 @@ const styles = StyleSheet.create({
     flex: 1,
   },
   logName: {
-    fontSize: 16,
+    fontSize: fs(16),
     fontWeight: '800',
     color: '#000000',
   },
   logUnit: {
-    fontSize: 13,
+    fontSize: fs(13),
     fontWeight: '600',
     color: '#64748B',
     marginTop: 2,
@@ -194,12 +225,12 @@ const styles = StyleSheet.create({
     alignItems: 'flex-end',
   },
   logTime: {
-    fontSize: 16,
+    fontSize: fs(16),
     fontWeight: '900',
     color: '#000000',
   },
   logDate: {
-    fontSize: 11,
+    fontSize: fs(11),
     fontWeight: '600',
     color: '#94A3B8',
     marginTop: 2,

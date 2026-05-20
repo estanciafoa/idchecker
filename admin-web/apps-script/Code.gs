@@ -20,6 +20,21 @@ function doGet(e) {
       return jsonResponse_(statusResponse.ok, statusResponse.result, statusResponse.error);
     }
 
+    if (e && e.parameter && e.parameter.action === 'list_photos') {
+      var folderId = e.parameter.folderId;
+      var source = e.parameter.source || 'folder'; // 'folder' or 'zip'
+      if (source === 'zip') {
+        var fileId = e.parameter.fileId;
+        if (!fileId) return jsonResponse_(false, null, 'Missing fileId parameter for zip source');
+        var zipPhotos = listPhotosInZip_(fileId);
+        return jsonResponse_(true, zipPhotos, null);
+      } else {
+        if (!folderId) return jsonResponse_(false, null, 'Missing folderId parameter');
+        var photoList = listPhotosInFolder_(folderId);
+        return jsonResponse_(true, photoList, null);
+      }
+    }
+
     return jsonResponse_(true, {
       service: 'idchecker-admin-uploader',
       status: 'ok',
@@ -41,6 +56,13 @@ function doPost(e) {
 
     const payload = parsePayload_(e);
     requestId = String(payload.requestId || '').trim() || null;
+
+    // Handle log upload action (no token/sheetName validation needed for logs)
+    if (payload.action === 'upload_logs') {
+      var logResult = uploadLogsToDrive_(payload);
+      return jsonResponse_(true, logResult, null);
+    }
+
     validatePayload_(payload);
     validateToken_(payload.token);
 
@@ -58,8 +80,7 @@ function doPost(e) {
     if (payload.zipBase64 && payload.driveZipFileId) {
       replaceZipInDrive_(
         payload.driveZipFileId,
-        payload.zipBase64,
-        payload.zipFileName || 'resident_photos.zip'
+        payload.zipBase64
       );
       zipUpdated = true;
     }
@@ -92,6 +113,52 @@ function doPost(e) {
     }
     return jsonResponse_(false, null, err && err.message ? err.message : String(err));
   }
+}
+
+/**
+ * List image files in a Google Drive folder.
+ * Returns { files: [ { name: "2627.jpg", id: "FILE_ID" }, ... ] }
+ */
+function listPhotosInFolder_(folderId) {
+  var folder = DriveApp.getFolderById(folderId);
+  var files = folder.getFiles();
+  var result = [];
+  var imageExts = /\.(jpg|jpeg|png|webp|gif)$/i;
+  while (files.hasNext()) {
+    var f = files.next();
+    var name = f.getName();
+    if (imageExts.test(name)) {
+      result.push({ name: name, id: f.getId() });
+    }
+  }
+  return { files: result, source: 'folder' };
+}
+
+/**
+ * List image files inside a ZIP stored in Google Drive.
+ * Returns { files: [ { name: "2627.jpg" }, ... ], zipFileId: "..." }
+ * Also returns zipDownloadUrl for direct download of the full ZIP.
+ */
+function listPhotosInZip_(fileId) {
+  var file = DriveApp.getFileById(fileId);
+  var blob = file.getBlob();
+  var zip = Utilities.unzip(blob);
+  var result = [];
+  var imageExts = /\.(jpg|jpeg|png|webp|gif)$/i;
+  for (var i = 0; i < zip.length; i++) {
+    var name = zip[i].getName();
+    // Strip folder prefix if any (e.g. "photos/2627.jpg" → "2627.jpg")
+    var baseName = name.split('/').pop() || name;
+    if (imageExts.test(baseName)) {
+      result.push({ name: baseName });
+    }
+  }
+  return {
+    files: result,
+    source: 'zip',
+    zipFileId: fileId,
+    zipDownloadUrl: 'https://drive.google.com/uc?export=download&id=' + fileId
+  };
 }
 
 function getRequestStatusResponseObject_(requestId) {
@@ -269,15 +336,16 @@ function appendRows_(spreadsheetId, sheetName, rows) {
   return { updated: updated, appended: appended, total: values.length };
 }
 
-function replaceZipInDrive_(fileId, zipBase64, zipFileName) {
-  const bytes = Utilities.base64Decode(zipBase64);
-  const token = ScriptApp.getOAuthToken();
-
-  // Binary media upload replaces the existing file bytes in-place.
-  const url = 'https://www.googleapis.com/upload/drive/v3/files/' +
+/**
+ * Replace the ZIP file on Google Drive with new ZIP bytes.
+ */
+function replaceZipInDrive_(fileId, zipBase64) {
+  var bytes = Utilities.base64Decode(zipBase64);
+  var token = ScriptApp.getOAuthToken();
+  var url = 'https://www.googleapis.com/upload/drive/v3/files/' +
     encodeURIComponent(fileId) + '?uploadType=media';
 
-  const response = UrlFetchApp.fetch(url, {
+  var response = UrlFetchApp.fetch(url, {
     method: 'PATCH',
     contentType: 'application/zip',
     payload: bytes,
@@ -285,7 +353,7 @@ function replaceZipInDrive_(fileId, zipBase64, zipFileName) {
     muteHttpExceptions: true
   });
 
-  const code = response.getResponseCode();
+  var code = response.getResponseCode();
   if (code < 200 || code >= 300) {
     throw new Error(
       'Drive update failed (' + code + '): ' +
@@ -305,6 +373,39 @@ function jsonResponse_(ok, result, error) {
   return ContentService
     .createTextOutput(JSON.stringify(body))
     .setMimeType(ContentService.MimeType.JSON);
+}
+
+// ---- LOG UPLOAD ----
+function uploadLogsToDrive_(payload) {
+  if (!payload.logs || !Array.isArray(payload.logs) || payload.logs.length === 0) {
+    throw new Error('logs array is required and must not be empty');
+  }
+
+  var folderId = payload.folderId || '1HYUCLO1VmuA20XgQKGqxuBofg0YwvDkZ';
+  var folder = DriveApp.getFolderById(folderId);
+
+  // Build CSV
+  var headers = ['timestamp', 'resident_id', 'resident_name', 'unit', 'status'];
+  var csvRows = [headers.join(',')];
+  payload.logs.forEach(function (log) {
+    var row = headers.map(function (h) {
+      var val = String(log[h] || '').replace(/"/g, '""');
+      return '"' + val + '"';
+    });
+    csvRows.push(row.join(','));
+  });
+  var csvContent = csvRows.join('\n');
+
+  // File name: access_logs_YYYY-MM-DD_HH-MM.csv
+  var now = new Date();
+  var pad = function (n) { return n < 10 ? '0' + n : String(n); };
+  var fileName = 'access_logs_' +
+    now.getFullYear() + '-' + pad(now.getMonth() + 1) + '-' + pad(now.getDate()) +
+    '_' + pad(now.getHours()) + '-' + pad(now.getMinutes()) + '.csv';
+
+  folder.createFile(fileName, csvContent, 'text/csv');
+
+  return { fileName: fileName, rowCount: payload.logs.length };
 }
 
 function jsonpResponse_(callbackName, bodyObject) {

@@ -17,9 +17,11 @@ import { CameraView, useCameraPermissions } from 'expo-camera';
 import { Ionicons } from '@expo/vector-icons';
 import { useRouter } from 'expo-router';
 import { SafeAreaView } from 'react-native-safe-area-context';
+import HamburgerMenu from '../src/components/HamburgerMenu';
+import { fs } from '../src/utils/scale';
 
-const SUCCESS_SOUND = require('../assets/sounds/success.wav');
-const FAILURE_SOUND = require('../assets/sounds/failure.wav');
+const SUCCESS_SOUND = require('../assets/sounds/success.mp3');
+const FAILURE_SOUND = require('../assets/sounds/failure.mp3');
 
 import {
   getResidentById,
@@ -42,6 +44,8 @@ export default function ScannerScreen() {
   const [loading, setLoading] = useState(false);
   const [residentCount, setResidentCount] = useState(0);
   const cameraRef = useRef<any>(null);
+  const successSoundRef = useRef<Audio.Sound | null>(null);
+  const failureSoundRef = useRef<Audio.Sound | null>(null);
 
   useEffect(() => {
     // Configure audio so sounds play even in silent mode
@@ -51,12 +55,19 @@ export default function ScannerScreen() {
       staysActiveInBackground: false,
       shouldDuckAndroid: true,
     }).catch(() => {});
+    // Preload sounds for instant playback
+    Audio.Sound.createAsync(SUCCESS_SOUND).then(({ sound }) => { successSoundRef.current = sound; }).catch(() => {});
+    Audio.Sound.createAsync(FAILURE_SOUND).then(({ sound }) => { failureSoundRef.current = sound; }).catch(() => {});
     // Pre-warm cache on mount for instant lookups
     preloadResidents().then(setResidentCount);
     const sub = AppState.addEventListener('change', (state) => {
       if (state === 'active') preloadResidents().then(setResidentCount);
     });
-    return () => sub.remove();
+    return () => {
+      sub.remove();
+      successSoundRef.current?.unloadAsync();
+      failureSoundRef.current?.unloadAsync();
+    };
   }, []);
 
   useEffect(() => {
@@ -159,15 +170,17 @@ export default function ScannerScreen() {
 
   const playSound = async (soundFile: any) => {
     try {
-      const { sound } = await Audio.Sound.createAsync(soundFile, {
-        shouldPlay: true,
-        volume: 1.0,
-      });
-      sound.setOnPlaybackStatusUpdate((status) => {
-        if ('didJustFinish' in status && status.didJustFinish) {
-          sound.unloadAsync();
-        }
-      });
+      const ref = soundFile === SUCCESS_SOUND ? successSoundRef : failureSoundRef;
+      if (ref.current) {
+        await ref.current.setPositionAsync(0);
+        await ref.current.playAsync();
+      } else {
+        // Fallback: create and play if preload failed
+        const { sound } = await Audio.Sound.createAsync(soundFile, { shouldPlay: true, volume: 1.0 });
+        sound.setOnPlaybackStatusUpdate((status) => {
+          if ('didJustFinish' in status && status.didJustFinish) sound.unloadAsync();
+        });
+      }
     } catch (e) {
       console.warn('Sound playback error:', e);
     }
@@ -225,12 +238,12 @@ export default function ScannerScreen() {
           <View style={styles.resultFull}>
             <View style={[styles.statusBanner, styles.deniedBanner]}>
               <Ionicons name="close-circle" size={48} color="#FFFFFF" />
-              <Text style={styles.bannerText}>NOT FOUND</Text>
+              <Text style={styles.bannerText}>DENIED</Text>
             </View>
-            <View style={{flex: 1, justifyContent: 'center', alignItems: 'center', padding: 24}}>
-              <Text style={styles.notFoundText}>
-                No resident found with this ID.{'\n'}Verify the barcode or contact admin.
-              </Text>
+            <View style={{flex: 1, justifyContent: 'center', alignItems: 'center', padding: 24, backgroundColor: '#7F1D1D'}}>
+              <Ionicons name="warning" size={80} color="#FFFFFF" />
+              <Text style={styles.invalidIdText}>INVALID{"\n"}or FAKE ID</Text>
+              <Text style={styles.invalidIdSubtext}>This ID does not exist in the system.</Text>
             </View>
             <TouchableOpacity testID="close-result-btn" style={styles.scanNextBtn} onPress={resetScan}>
               <Text style={styles.scanNextText}>SCAN NEXT</Text>
@@ -313,8 +326,8 @@ export default function ScannerScreen() {
               </View>
               <View style={styles.infoSep} />
               <View style={styles.infoItem}>
-                <Text style={styles.infoLabel}>AADHAR</Text>
-                <Text testID="resident-aadhar" style={styles.infoValue}>{resident.aadhar_masked || 'N/A'}</Text>
+                <Text style={styles.infoLabel}>PHONE</Text>
+                <Text testID="resident-aadhar" style={styles.infoValue}>{resident.phone_last4 ? `••••${resident.phone_last4}` : 'N/A'}</Text>
               </View>
             </View>
             {resident.vehicle_plate ? (
@@ -353,7 +366,9 @@ export default function ScannerScreen() {
           keyboardVerticalOffset={Platform.OS === 'ios' ? 12 : 0}
         >
           <View style={styles.titleBar}>
-            <Text style={styles.titleText}>ESTANCIA ID CHECK</Text>
+            <HamburgerMenu />
+            <Text style={styles.titleText}>STUDENTS</Text>
+            <View style={{ width: 36 }} />
           </View>
           <View style={styles.statusBar}>
             <View style={[styles.statusDot, residentCount > 0 ? styles.dotOnline : styles.dotOffline]} />
@@ -405,7 +420,9 @@ export default function ScannerScreen() {
         keyboardVerticalOffset={Platform.OS === 'ios' ? 12 : 0}
       >
         <View style={styles.titleBar}>
-          <Text style={styles.titleText}>ESTANCIA ID CHECK</Text>
+          <HamburgerMenu />
+          <Text style={styles.titleText}>STUDENTS</Text>
+          <View style={{ width: 36 }} />
         </View>
         <View style={styles.statusBar}>
           <View style={[styles.statusDot, residentCount > 0 ? styles.dotOnline : styles.dotOffline]} />
@@ -473,13 +490,13 @@ export default function ScannerScreen() {
 
 const styles = StyleSheet.create({
   container: { flex: 1, backgroundColor: '#FFFFFF' },
-  titleBar: { backgroundColor: '#78350F', paddingVertical: 14, paddingHorizontal: 24, alignItems: 'center' },
-  titleText: { fontSize: 20, fontWeight: '900', color: '#FFFBEB', letterSpacing: 2 },
+  titleBar: { backgroundColor: '#78350F', paddingVertical: 14, paddingHorizontal: 16, flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between' },
+  titleText: { fontSize: fs(20), fontWeight: '900', color: '#FFFBEB', letterSpacing: 2 },
   statusBar: { flexDirection: 'row', alignItems: 'center', padding: 12, paddingHorizontal: 24, backgroundColor: '#F8FAFC', borderBottomWidth: 1, borderBottomColor: '#E2E8F0' },
   statusDot: { width: 10, height: 10, borderRadius: 5, marginRight: 8 },
   dotOnline: { backgroundColor: '#00C853' },
   dotOffline: { backgroundColor: '#FFB300' },
-  statusText: { fontSize: 12, fontWeight: '700', color: '#475569', letterSpacing: 1 },
+  statusText: { fontSize: fs(12), fontWeight: '700', color: '#475569', letterSpacing: 1 },
   pullRefreshBtn: {
     marginLeft: 'auto',
     flexDirection: 'row',
@@ -492,7 +509,7 @@ const styles = StyleSheet.create({
     backgroundColor: '#FFFFFF',
   },
   pullRefreshText: {
-    fontSize: 10,
+    fontSize: fs(10),
     fontWeight: '900',
     color: '#D97706',
     letterSpacing: 0.6,
@@ -506,45 +523,47 @@ const styles = StyleSheet.create({
   cornerTR: { top: 0, right: 0, borderTopWidth: 4, borderRightWidth: 4 },
   cornerBL: { bottom: 0, left: 0, borderBottomWidth: 4, borderLeftWidth: 4 },
   cornerBR: { bottom: 0, right: 0, borderBottomWidth: 4, borderRightWidth: 4 },
-  scanHint: { marginTop: 24, color: '#FFFFFF', fontSize: 14, fontWeight: '700', letterSpacing: 2 },
+  scanHint: { marginTop: 24, color: '#FFFFFF', fontSize: fs(14), fontWeight: '700', letterSpacing: 2 },
   captureBtn: { marginTop: 32, flexDirection: 'row', alignItems: 'center', gap: 8, backgroundColor: '#D97706', paddingHorizontal: 24, paddingVertical: 16, borderWidth: 2, borderColor: '#FFFBEB' },
-  captureBtnText: { color: '#FFFFFF', fontSize: 14, fontWeight: '900', letterSpacing: 1 },
+  captureBtnText: { color: '#FFFFFF', fontSize: fs(14), fontWeight: '900', letterSpacing: 1 },
   loadingContainer: { flex: 1, justifyContent: 'center', alignItems: 'center' },
-  loadingText: { marginTop: 16, fontSize: 16, fontWeight: '700', color: '#475569' },
+  loadingText: { marginTop: 16, fontSize: fs(16), fontWeight: '700', color: '#475569' },
   manualSection: { padding: 16, paddingHorizontal: 24, backgroundColor: '#F8FAFC', borderTopWidth: 2, borderTopColor: '#000000' },
-  manualLabel: { fontSize: 12, fontWeight: '700', color: '#64748B', letterSpacing: 2, marginBottom: 8 },
+  manualLabel: { fontSize: fs(12), fontWeight: '700', color: '#64748B', letterSpacing: 2, marginBottom: 8 },
   manualRow: { flexDirection: 'row', gap: 8 },
-  manualInput: { flex: 1, height: 56, borderWidth: 2, borderColor: '#E2E8F0', paddingHorizontal: 16, fontSize: 18, fontWeight: '700', backgroundColor: '#FFFFFF' },
+  manualInput: { flex: 1, height: 56, borderWidth: 2, borderColor: '#E2E8F0', paddingHorizontal: 16, fontSize: fs(18), fontWeight: '700', backgroundColor: '#FFFFFF' },
   lookupBtn: { width: 80, height: 56, backgroundColor: '#0055FF', justifyContent: 'center', alignItems: 'center', borderWidth: 2, borderColor: '#000000' },
-  lookupBtnText: { color: '#FFFFFF', fontWeight: '900', fontSize: 13 },
+  lookupBtnText: { color: '#FFFFFF', fontWeight: '900', fontSize: fs(13) },
   permissionBox: { flex: 1, justifyContent: 'center', alignItems: 'center', padding: 24 },
-  permissionTitle: { fontSize: 22, fontWeight: '900', color: '#0F172A', marginTop: 16 },
-  permissionText: { fontSize: 15, color: '#475569', marginTop: 6 },
+  permissionTitle: { fontSize: fs(22), fontWeight: '900', color: '#0F172A', marginTop: 16 },
+  permissionText: { fontSize: fs(15), color: '#475569', marginTop: 6 },
   actionButton: { marginTop: 20, height: 56, paddingHorizontal: 28, backgroundColor: '#0055FF', justifyContent: 'center', alignItems: 'center', borderWidth: 2, borderColor: '#000000' },
-  actionButtonText: { color: '#FFFFFF', fontSize: 15, fontWeight: '900', letterSpacing: 1 },
+  actionButtonText: { color: '#FFFFFF', fontSize: fs(15), fontWeight: '900', letterSpacing: 1 },
   // Result screen
   resultFull: { flex: 1 },
   statusBanner: { height: 52, justifyContent: 'center', alignItems: 'center', flexDirection: 'row', gap: 10 },
   verifiedBanner: { backgroundColor: '#00C853' },
   deniedBanner: { backgroundColor: '#FF3B30' },
-  bannerText: { fontSize: 24, fontWeight: '900', color: '#FFFFFF' },
-  notFoundText: { fontSize: 16, color: '#475569', textAlign: 'center', lineHeight: 24 },
+  bannerText: { fontSize: fs(24), fontWeight: '900', color: '#FFFFFF' },
+  notFoundText: { fontSize: fs(16), color: '#475569', textAlign: 'center', lineHeight: 24 },
+  invalidIdText: { fontSize: fs(48), fontWeight: '900', color: '#FFFFFF', textAlign: 'center', marginTop: 16, letterSpacing: 2 },
+  invalidIdSubtext: { fontSize: fs(16), fontWeight: '700', color: '#FECACA', textAlign: 'center', marginTop: 12 },
   photoFull: { flex: 1, width: '100%', backgroundColor: '#0055FF', justifyContent: 'center', alignItems: 'center' },
   photoImage: { width: '100%', height: '100%' },
   photoOverlay: { ...StyleSheet.absoluteFillObject, justifyContent: 'center', alignItems: 'center', backgroundColor: 'transparent', transform: [{ rotate: '-35deg' }] },
-  overlayText: { fontSize: 72, fontWeight: '900', color: '#FF3B30', textAlign: 'center', lineHeight: 80, textShadowColor: '#000000', textShadowOffset: { width: 2, height: 2 }, textShadowRadius: 6, letterSpacing: 4 },
-  photoFullInitial: { fontSize: 200, fontWeight: '900', color: '#FFFFFF', opacity: 0.9 },
-  photoName: { fontSize: 28, fontWeight: '900', color: '#FFFFFF', marginTop: -10 },
-  nameBar: { backgroundColor: '#FFFFFF', paddingVertical: 8, paddingHorizontal: 16, borderBottomWidth: 1, borderBottomColor: '#E2E8F0', flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between' },
-  nameText: { fontSize: 22, fontWeight: '900', color: '#000000' },
-  validityText: { fontSize: 13, fontWeight: '700', color: '#475569' },
-  infoBar: { flexDirection: 'row', backgroundColor: '#0F172A', paddingVertical: 10, paddingHorizontal: 12 },
+  overlayText: { fontSize: fs(72), fontWeight: '900', color: '#FF3B30', textAlign: 'center', lineHeight: fs(80), textShadowColor: '#000000', textShadowOffset: { width: 2, height: 2 }, textShadowRadius: 6, letterSpacing: 4 },
+  photoFullInitial: { fontSize: fs(200), fontWeight: '900', color: '#FFFFFF', opacity: 0.9 },
+  photoName: { fontSize: fs(28), fontWeight: '900', color: '#FFFFFF', marginTop: -10 },
+  nameBar: { backgroundColor: '#FFFFFF', paddingVertical: 12, paddingHorizontal: 20, borderBottomWidth: 1, borderBottomColor: '#E2E8F0', flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between' },
+  nameText: { fontSize: fs(22), fontWeight: '900', color: '#000000' },
+  validityText: { fontSize: fs(13), fontWeight: '700', color: '#475569' },
+  infoBar: { flexDirection: 'row', backgroundColor: '#0F172A', paddingVertical: 14, paddingHorizontal: 16 },
   infoItem: { flex: 1, alignItems: 'center' },
-  infoLabel: { fontSize: 9, fontWeight: '700', color: '#94A3B8', letterSpacing: 1 },
-  infoValue: { fontSize: 13, fontWeight: '900', color: '#FFFFFF', marginTop: 2 },
+  infoLabel: { fontSize: fs(10), fontWeight: '700', color: '#94A3B8', letterSpacing: 1 },
+  infoValue: { fontSize: fs(16), fontWeight: '900', color: '#FFFFFF', marginTop: 4 },
   infoSep: { width: 1, backgroundColor: '#334155' },
   vehicleBar: { flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 6, paddingVertical: 6, backgroundColor: '#F8FAFC', borderBottomWidth: 1, borderBottomColor: '#E2E8F0' },
-  vehicleText: { fontSize: 13, fontWeight: '700', color: '#475569' },
-  scanNextBtn: { height: 52, backgroundColor: '#0F172A', justifyContent: 'center', alignItems: 'center', flexDirection: 'row', gap: 8 },
-  scanNextText: { color: '#FFFFFF', fontSize: 15, fontWeight: '900', letterSpacing: 1 },
+  vehicleText: { fontSize: fs(13), fontWeight: '700', color: '#475569' },
+  scanNextBtn: { height: 100, backgroundColor: '#00C853', justifyContent: 'center', alignItems: 'center', flexDirection: 'row', gap: 10, borderWidth: 3, borderColor: '#00A844', elevation: 6 },
+  scanNextText: { color: '#FFFFFF', fontSize: fs(20), fontWeight: '900', letterSpacing: 2 },
 });

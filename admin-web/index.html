@@ -24,34 +24,38 @@
       font-family: "Segoe UI", Tahoma, Geneva, Verdana, sans-serif;
       background: radial-gradient(circle at top right, #F5E6D3 0%, #FFFBEB 40%, #FFF8F0 100%);
       color: var(--text);
-      min-height: 100vh;
-      padding: 20px;
+      height: 100vh;
+      overflow: hidden;
+      padding: 10px;
     }
 
     .shell {
-      max-width: 1100px;
+      max-width: 100%;
+      height: 100%;
       margin: 0 auto;
-      display: grid;
-      gap: 16px;
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
     }
 
     .card {
       background: var(--card);
       border: 1px solid var(--border);
-      border-radius: 14px;
-      padding: 16px;
+      border-radius: 10px;
+      padding: 10px;
       box-shadow: 0 10px 24px rgba(15, 23, 42, 0.06);
     }
 
     h1 {
-      margin: 0 0 8px;
-      font-size: 26px;
+      margin: 0;
+      font-size: 18px;
       letter-spacing: 0.2px;
     }
 
     p {
       margin: 0;
       color: var(--muted);
+      font-size: 13px;
     }
 
     .grid {
@@ -126,6 +130,12 @@
 
     .btn:active {
       transform: translateY(1px);
+    }
+
+    .btn-sm {
+      padding: 5px 10px;
+      font-size: 12px;
+      border-radius: 6px;
     }
 
     .photos-card {
@@ -216,30 +226,33 @@
 <body>
   <div class="shell">
     <div class="card">
-      <h1>ID Checker Admin Uploader</h1>
-      <p>Paste rows from Excel and select resident photos. Rows are pushed to Google Sheets. Photos can be zipped for download or uploaded directly to Google Drive.</p>
+      <h1>ID Checker Admin</h1>
     </div>
 
-    <div class="card">
-      <div class="field">
-        <label for="rowsInput">Paste Rows From Excel</label>
-        <textarea id="rowsInput" placeholder="Paste copied rows here. Header row is optional. Expected columns: Name, flat number, Valid From, ValidTill, Aadhar/SRMID, Moblie, ID"></textarea>
-      </div>
-      <div class="row" style="margin-top: 10px;">
-        <button class="btn" id="uploadBtn" type="button">Update Data</button>
-        <span class="pill">Sheet columns: <code>Name</code>, <code>flat number</code>, <code>Valid From</code>, <code>ValidTill</code>, <code>Aadhar/SRMID</code>, <code>Moblie</code>, <code>ID</code></span>
+    <div class="card" style="flex:1;min-height:0;display:flex;flex-direction:column">
+      <div class="field" style="flex:1;min-height:0;display:flex;flex-direction:column">
+        <div class="row" style="gap:10px;align-items:center;margin-bottom:6px">
+          <label style="margin:0">Google Sheet — <code>student id</code></label>
+          <button class="btn btn-sm" type="button" onclick="document.getElementById('sheetEmbed').src = document.getElementById('sheetEmbed').src">Refresh</button>
+          <button class="btn btn-sm" type="button" onclick="window.open('https://docs.google.com/spreadsheets/d/1EDvYjDQVIpwib5PmQ5sbSchJI_B5HNHWNomXRLOxtk4/edit#gid=0','sheetEditor','width=1200,height=800,menubar=no,toolbar=no')">Open Editor ↗</button>
+        </div>
+        <iframe id="sheetEmbed"
+          src="https://docs.google.com/spreadsheets/d/1EDvYjDQVIpwib5PmQ5sbSchJI_B5HNHWNomXRLOxtk4/edit?rm=minimal&gid=0"
+          style="width:100%;flex:1;border:1px solid var(--border);border-radius:8px;background:#fff"
+          loading="lazy" allow="clipboard-read; clipboard-write"></iframe>
       </div>
     </div>
 
     <div class="card photos-card">
       <button class="icon-btn" id="downloadZipBtn" type="button" aria-label="Download Photos ZIP">⤓</button>
-      <div class="field">
-        <label for="photosFilesInput">Pick Photo Files</label>
-        <input id="photosFilesInput" type="file" accept="image/*" multiple />
+      <div class="field" style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
+        <label style="margin:0">Photos Folder:</label>
+        <span id="folderName" class="pill" style="font-weight:600;word-break:break-all">No folder selected</span>
+        <button class="btn btn-sm" id="selectFolderBtn" type="button">Select Folder</button>
       </div>
       <div class="photos-actions">
         <button class="btn" id="uploadZipDriveBtn" type="button">Update Photos</button>
-        <span class="pill photos-pill" id="photosSummary">No photos selected</span>
+        <span class="pill photos-pill" id="photosSummary">No folder selected</span>
       </div>
     </div>
 
@@ -263,19 +276,96 @@
     const HARDCODED_CONFIG = {
       scriptUrl: "https://script.google.com/macros/s/AKfycby2yjp7UEvBdYIDzKjOyFInegp_9CA7LVhpmbHbqwnxdPYEI5WJE8BYki-3Dwrgfm7pkw/exec",
       spreadsheetId: "1EDvYjDQVIpwib5PmQ5sbSchJI_B5HNHWNomXRLOxtk4",
-      sheetName: "sheet1",
+      sheetName: "student id",
       token: "",
       driveZipFileId: "1De7JzvhoEHfsrVJzKojcQu_QgHq4tRUE"
     };
 
     const els = {
       rowsInput: document.getElementById("rowsInput"),
-      photosFilesInput: document.getElementById("photosFilesInput"),
+      selectFolderBtn: document.getElementById("selectFolderBtn"),
+      folderName: document.getElementById("folderName"),
       photosSummary: document.getElementById("photosSummary"),
       uploadBtn: document.getElementById("uploadBtn"),
       uploadZipDriveBtn: document.getElementById("uploadZipDriveBtn"),
       status: document.getElementById("status")
     };
+
+    // ---- Directory handle persistence via IndexedDB ----
+    const DB_NAME = "idchecker-admin";
+    const STORE_NAME = "handles";
+    const HANDLE_KEY = "photosFolder";
+    let selectedDirHandle = null;
+    let selectedPhotosFiles = [];
+
+    function openHandleDB() {
+      return new Promise((resolve, reject) => {
+        const req = indexedDB.open(DB_NAME, 1);
+        req.onupgradeneeded = () => req.result.createObjectStore(STORE_NAME);
+        req.onsuccess = () => resolve(req.result);
+        req.onerror = () => reject(req.error);
+      });
+    }
+
+    async function saveDirHandle(handle) {
+      const db = await openHandleDB();
+      return new Promise((resolve, reject) => {
+        const tx = db.transaction(STORE_NAME, "readwrite");
+        tx.objectStore(STORE_NAME).put(handle, HANDLE_KEY);
+        tx.oncomplete = () => resolve();
+        tx.onerror = () => reject(tx.error);
+      });
+    }
+
+    async function loadDirHandle() {
+      const db = await openHandleDB();
+      return new Promise((resolve, reject) => {
+        const tx = db.transaction(STORE_NAME, "readonly");
+        const req = tx.objectStore(STORE_NAME).get(HANDLE_KEY);
+        req.onsuccess = () => resolve(req.result || null);
+        req.onerror = () => reject(req.error);
+      });
+    }
+
+    async function readImagesFromHandle(dirHandle) {
+      const files = [];
+      for await (const entry of dirHandle.values()) {
+        if (entry.kind === "file") {
+          const file = await entry.getFile();
+          if (file.type.startsWith("image/")) files.push(file);
+        }
+      }
+      return files;
+    }
+
+    async function pickFolder() {
+      try {
+        const handle = await window.showDirectoryPicker({ mode: "read" });
+        selectedDirHandle = handle;
+        await saveDirHandle(handle);
+        selectedPhotosFiles = await readImagesFromHandle(handle);
+        els.folderName.textContent = handle.name;
+        updatePhotoSummary();
+      } catch (err) {
+        if (err.name !== "AbortError") setStatus("Folder pick failed: " + err.message, "bad");
+      }
+    }
+
+    async function restoreSavedFolder() {
+      try {
+        const handle = await loadDirHandle();
+        if (!handle) return;
+        const perm = await handle.requestPermission({ mode: "read" });
+        if (perm !== "granted") {
+          els.folderName.textContent = handle.name + " (click Select Folder to re-grant)";
+          return;
+        }
+        selectedDirHandle = handle;
+        selectedPhotosFiles = await readImagesFromHandle(handle);
+        els.folderName.textContent = handle.name;
+        updatePhotoSummary();
+      } catch (_) { /* first visit or denied */ }
+    }
 
     let parsedRows = [];
 
@@ -374,7 +464,7 @@
     }
 
     function getSelectedPhotos() {
-      return Array.from(els.photosFilesInput.files || []).filter((f) => f.type.startsWith("image/"));
+      return selectedPhotosFiles;
     }
 
     function getFileNameOnly(file) {
@@ -402,11 +492,11 @@
     function updatePhotoSummary() {
       const files = getSelectedPhotos();
       if (!files.length) {
-        els.photosSummary.textContent = "No photos selected";
+        els.photosSummary.textContent = "No folder selected";
         return;
       }
       const sampleNames = files.slice(0, 3).map((f) => getFileNameOnly(f)).join(", ");
-      els.photosSummary.textContent = files.length + " image(s) selected" + (sampleNames ? " | " + sampleNames + (files.length > 3 ? " ..." : "") : "");
+      els.photosSummary.textContent = files.length + " image(s) in folder" + (sampleNames ? " | " + sampleNames + (files.length > 3 ? " ..." : "") : "");
     }
 
     async function pushRows() {
@@ -567,7 +657,7 @@
     async function uploadZipToDrive() {
       const photos = getSelectedPhotos();
       if (!photos.length) {
-        setStatus("Select photos first before uploading ZIP.", "bad");
+        setStatus("Select a photos folder first.", "bad");
         return;
       }
 
@@ -585,19 +675,26 @@
       els.uploadZipDriveBtn.disabled = true;
       try {
         const requestId = Date.now().toString() + "-zip-" + Math.random().toString(36).slice(2, 8);
-        setStatus("Compressing " + photos.length + " photo(s) to ~50 KB each...", "warn");
         const zip = new JSZip();
 
+        // Step 1: Compress photos
         for (let i = 0; i < photos.length; i++) {
           const file = photos[i];
-          setStatus("Compressing (" + (i + 1) + "/" + photos.length + "): " + file.name, "warn");
+          setStatus("Step 1/4 — Compressing photo " + (i + 1) + "/" + photos.length + ": " + file.name, "warn");
           const compressed = await compressImage(file, 50);
           const nameBase = file.name.replace(/\.[^.]+$/, "") + ".jpg";
           zip.file(nameBase, compressed);
         }
 
-        setStatus("Creating faces.zip...", "warn");
-        const zipBlob = await zip.generateAsync({ type: "blob", compression: "DEFLATE", compressionOptions: { level: 6 } });
+        // Step 2: Create ZIP
+        setStatus("Step 2/4 — Zipping " + photos.length + " photos...", "warn");
+        const zipBlob = await zip.generateAsync(
+          { type: "blob", compression: "DEFLATE", compressionOptions: { level: 6 } },
+          function(meta) { setStatus("Step 2/4 — Zipping: " + meta.percent.toFixed(0) + "%", "warn"); }
+        );
+
+        // Step 3: Encode to base64
+        setStatus("Step 3/4 — Encoding ZIP (" + (zipBlob.size / 1024).toFixed(0) + " KB) to base64...", "warn");
         const zipBase64 = await blobToBase64(zipBlob);
 
         const payload = {
@@ -640,10 +737,12 @@
           });
         }
 
-        setStatus("Uploading faces.zip to Google Drive...", "warn");
+        // Step 3: Upload to Drive
+        setStatus("Step 3/3 \u2014 Uploading faces.zip (" + (zipBlob.size / 1024).toFixed(0) + " KB, " + photos.length + " photos) to Google Drive...\nDrive file: " + driveZipFileId, "warn");
         let statusBody = null;
         for (let attempt = 1; attempt <= 15; attempt++) {
           await sleep(1000);
+          setStatus("Step 3/3 \u2014 Waiting for Drive confirmation... (" + attempt + "/15)\nZIP: " + (zipBlob.size / 1024).toFixed(0) + " KB | Photos: " + photos.length, "warn");
           try {
             const probe = await fetchStatus();
             if (probe && probe.ok && probe.result && probe.result.found && probe.result.status) { statusBody = probe; break; }
@@ -651,14 +750,14 @@
         }
 
         if (!statusBody || !statusBody.result || !statusBody.result.status) {
-          setStatus("faces.zip upload sent, but Drive status could not be confirmed. Check the Drive file manually.", "warn");
+          setStatus("faces.zip upload sent, but Drive status could not be confirmed after 15 attempts.\nCheck the Drive file manually: " + driveZipFileId, "warn");
           return;
         }
 
         const s = statusBody.result.status;
         if (!s.ok) throw new Error(s.error || "ZIP upload failed");
 
-        setStatus("faces.zip uploaded to Google Drive successfully.", "ok");
+        setStatus("Done! ZIP replaced on Google Drive.\n" + photos.length + " photos | " + (zipBlob.size / 1024).toFixed(0) + " KB\nDrive file: " + driveZipFileId, "ok");
       } catch (err) {
         setStatus("Drive ZIP upload failed: " + (err.message || err), "bad");
       } finally {
@@ -669,25 +768,25 @@
     async function downloadZip() {
       const photos = getSelectedPhotos();
       if (!photos.length) {
-        setStatus("Select photos first before downloading ZIP.", "bad");
+        setStatus("Select a photos folder first.", "bad");
         return;
       }
 
       els.downloadZipBtn.disabled = true;
       try {
-        setStatus("Compressing " + photos.length + " photo(s) to ~50 KB each...", "warn");
         const zip = new JSZip();
 
         for (let i = 0; i < photos.length; i++) {
           const file = photos[i];
-          setStatus("Compressing (" + (i + 1) + "/" + photos.length + "): " + file.name, "warn");
-          const compressed = await compressImage(file, 50);
-          const nameBase = file.name.replace(/\.[^.]+$/, "") + ".jpg";
-          zip.file(nameBase, compressed);
+          setStatus("Adding photo " + (i + 1) + "/" + photos.length + ": " + file.name, "warn");
+          zip.file(getFileNameOnly(file), file);
         }
 
-        setStatus("Creating ZIP...", "warn");
-        const blob = await zip.generateAsync({ type: "blob", compression: "DEFLATE", compressionOptions: { level: 6 } });
+        setStatus("Zipping " + photos.length + " photos...", "warn");
+        const blob = await zip.generateAsync(
+          { type: "blob", compression: "DEFLATE", compressionOptions: { level: 6 } },
+          function(meta) { setStatus("Zipping: " + meta.percent.toFixed(0) + "%", "warn"); }
+        );
 
         const url = URL.createObjectURL(blob);
         const a = document.createElement("a");
@@ -698,7 +797,7 @@
         document.body.removeChild(a);
         URL.revokeObjectURL(url);
 
-        setStatus("ZIP downloaded (" + photos.length + " photos, " + (blob.size / 1024).toFixed(0) + " KB total).\nEach image compressed to ~50 KB.\nManually upload faces.zip to Google Drive to replace the existing ZIP.", "ok");
+        setStatus("ZIP downloaded (" + photos.length + " photos, " + (blob.size / 1024).toFixed(0) + " KB total).\nManually upload faces.zip to Google Drive to replace the existing ZIP.", "ok");
       } catch (err) {
         setStatus("ZIP creation failed: " + (err.message || err), "bad");
       } finally {
@@ -710,7 +809,8 @@
     els.downloadZipBtn = document.getElementById("downloadZipBtn");
     els.downloadZipBtn.addEventListener("click", downloadZip);
     els.uploadZipDriveBtn.addEventListener("click", uploadZipToDrive);
-    els.photosFilesInput.addEventListener("change", updatePhotoSummary);
+    els.selectFolderBtn.addEventListener("click", pickFolder);
+    restoreSavedFolder();
   </script>
 </body>
 </html>

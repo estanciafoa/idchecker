@@ -181,6 +181,77 @@ export async function importPhotosFromZip(
 }
 
 /**
+ * List files in a Google Drive folder via Apps Script proxy.
+ * Returns a map of file stem (without extension, lowercased) → direct download URL.
+ */
+const APPS_SCRIPT_URL = 'https://script.google.com/macros/s/AKfycby2yjp7UEvBdYIDzKjOyFInegp_9CA7LVhpmbHbqwnxdPYEI5WJE8BYki-3Dwrgfm7pkw/exec';
+
+async function listDriveFolderFiles(folderId: string): Promise<Map<string, string>> {
+  const map = new Map<string, string>();
+  const url = `${APPS_SCRIPT_URL}?action=list_photos&folderId=${encodeURIComponent(folderId)}`;
+  const res = await fetch(url, { redirect: 'follow' });
+  if (!res.ok) throw new Error(`Apps Script error: ${res.status}`);
+  const data = await res.json();
+  if (!data.ok) throw new Error(data.error || 'Failed to list photos');
+  for (const f of data.result?.files || []) {
+    if (isImageFile(f.name)) {
+      const stem = getFileStem(f.name).toLowerCase();
+      map.set(stem, `https://drive.google.com/uc?export=download&id=${f.id}`);
+    }
+  }
+  return map;
+}
+
+/**
+ * Download only the photos needed for the given IDs from a Google Drive folder.
+ * Skips photos that already exist locally.
+ */
+export async function downloadPhotosFromDriveFolder(
+  folderId: string,
+  ids: string[],
+  onProgress?: (done: number, total: number, status: string) => void
+): Promise<number> {
+  if (!folderId || ids.length === 0) return 0;
+
+  if (onProgress) onProgress(0, ids.length, 'Listing photos in Drive folder...');
+  const driveFiles = await listDriveFolderFiles(folderId);
+  if (onProgress) onProgress(0, ids.length, `Found ${driveFiles.size} photos in folder`);
+
+  const photosDir = await ensureLegacyPhotosDir();
+  const total = ids.length;
+  let done = 0;
+  let downloaded = 0;
+  let skipped = 0;
+  let failed = 0;
+  let notFound = 0;
+
+  for (const id of ids) {
+    const driveUrl = driveFiles.get(id.toLowerCase());
+    if (driveUrl) {
+      const localPath = `${photosDir}/${id}.jpg`;
+      const info = await getInfoAsync(localPath);
+      if (!info.exists) {
+        try {
+          await downloadAsync(driveUrl, localPath);
+          downloaded++;
+        } catch (e) {
+          console.warn(`Photo download failed for ${id}:`, e);
+          failed++;
+        }
+      } else {
+        skipped++;
+      }
+    } else {
+      notFound++;
+    }
+    done++;
+    if (onProgress) onProgress(done, total, `Photos: ${done}/${total} | ↓${downloaded} ✓${skipped} ✗${failed} ?${notFound}`);
+  }
+
+  return downloaded;
+}
+
+/**
  * Populate local_photo using extracted local files with name = resident id.
  */
 export async function attachLocalPhotosById(residents: Resident[]): Promise<Resident[]> {
@@ -236,6 +307,21 @@ export async function deleteLocalPhoto(residentId: string): Promise<void> {
         break;
       }
     }
+  } catch (_) {}
+}
+
+/**
+ * Delete ALL photos from local file system (new + legacy directories).
+ */
+export async function clearAllPhotos(): Promise<void> {
+  try {
+    const dir = new Directory(Paths.document, PHOTOS_DIR_NAME);
+    if (dir.exists) dir.delete();
+  } catch (_) {}
+  try {
+    const legacyDir = getLegacyPhotosDirPath();
+    const info = await getInfoAsync(legacyDir);
+    if (info.exists) await deleteAsync(legacyDir, { idempotent: true });
   } catch (_) {}
 }
 

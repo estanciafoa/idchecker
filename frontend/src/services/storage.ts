@@ -3,12 +3,15 @@ import AsyncStorage from '@react-native-async-storage/async-storage';
 const RESIDENTS_KEY = '@gate_check_residents';
 const ACCESS_LOGS_KEY = '@gate_check_logs';
 const LAST_SYNC_KEY = '@gate_check_last_sync';
+const MAIDS_COOKS_KEY = '@gate_check_maids_cooks';
+const MAIDS_COOKS_SYNC_KEY = '@gate_check_maids_cooks_last_sync';
 
 export interface Resident {
   id: string;
   name: string;
   unit: string;
   aadhar_masked: string;
+  phone_last4: string;
   vehicle_plate: string;
   photo_url: string;
   photo_base64: string;
@@ -26,6 +29,22 @@ export interface AccessLogEntry {
   unit: string;
   timestamp: string;
   status: string;
+}
+
+export interface MaidCook {
+  id: string;
+  name: string;
+  flats: string; // comma-separated flat numbers
+  aadhar_masked: string;
+  phone_last4: string;
+  vehicle_plate: string;
+  photo_url: string;
+  photo_base64: string;
+  local_photo: string;
+  validity: string;
+  status: string;
+  created_at: string;
+  updated_at: string;
 }
 
 // In-memory cache for O(1) lookups
@@ -109,5 +128,66 @@ export async function setLastSyncTime(time: string): Promise<void> {
 }
 
 export async function clearAllData(): Promise<void> {
-  await AsyncStorage.multiRemove([RESIDENTS_KEY, ACCESS_LOGS_KEY, LAST_SYNC_KEY]);
+  await AsyncStorage.multiRemove([RESIDENTS_KEY, ACCESS_LOGS_KEY, LAST_SYNC_KEY, MAIDS_COOKS_KEY, MAIDS_COOKS_SYNC_KEY]);
+  invalidateMaidCookCache();
+}
+
+export async function clearSyncData(): Promise<void> {
+  await AsyncStorage.multiRemove([RESIDENTS_KEY, LAST_SYNC_KEY, MAIDS_COOKS_KEY, MAIDS_COOKS_SYNC_KEY]);
+  _cache = null;
+  _lookupMap = null;
+  invalidateMaidCookCache();
+}
+
+// ---- Maids & Cooks ----
+
+let _maidCookCache: MaidCook[] | null = null;
+let _maidCookLookupMap: Map<string, MaidCook> | null = null;
+
+function buildMaidCookLookupMap(items: MaidCook[]): Map<string, MaidCook> {
+  const map = new Map<string, MaidCook>();
+  for (const m of items) {
+    map.set(m.id.toLowerCase(), m);
+  }
+  return map;
+}
+
+function invalidateMaidCookCache() {
+  _maidCookCache = null;
+  _maidCookLookupMap = null;
+}
+
+export async function getLocalMaidsCooks(): Promise<MaidCook[]> {
+  if (_maidCookCache) return _maidCookCache;
+  const data = await AsyncStorage.getItem(MAIDS_COOKS_KEY);
+  _maidCookCache = data ? JSON.parse(data) : [];
+  _maidCookLookupMap = buildMaidCookLookupMap(_maidCookCache!);
+  return _maidCookCache!;
+}
+
+export async function saveLocalMaidsCooks(items: MaidCook[]): Promise<void> {
+  const map = new Map<string, MaidCook>();
+  for (const m of items) map.set(m.id, m);
+  const deduped = Array.from(map.values());
+  await AsyncStorage.setItem(MAIDS_COOKS_KEY, JSON.stringify(deduped));
+  _maidCookCache = deduped;
+  _maidCookLookupMap = buildMaidCookLookupMap(deduped);
+}
+
+export async function getMaidCookById(id: string): Promise<MaidCook | null> {
+  if (!_maidCookLookupMap) await getLocalMaidsCooks();
+  return _maidCookLookupMap!.get(id.toLowerCase()) || null;
+}
+
+export async function preloadMaidsCooks(): Promise<number> {
+  const items = await getLocalMaidsCooks();
+  return items.length;
+}
+
+export async function getMaidCookLastSyncTime(): Promise<string | null> {
+  return await AsyncStorage.getItem(MAIDS_COOKS_SYNC_KEY);
+}
+
+export async function setMaidCookLastSyncTime(time: string): Promise<void> {
+  await AsyncStorage.setItem(MAIDS_COOKS_SYNC_KEY, time);
 }

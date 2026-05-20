@@ -5,7 +5,7 @@ import {
 } from 'react-native';
 import { Ionicons } from '@expo/vector-icons';
 
-const ADMIN_PASSWORD = 'EstGateAdmin@2026';
+const ADMIN_PASSWORD = 'Admin2026';
 
 interface Props {
   onUnlock: () => void;
