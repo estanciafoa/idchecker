@@ -282,11 +282,9 @@
     };
 
     const els = {
-      rowsInput: document.getElementById("rowsInput"),
       selectFolderBtn: document.getElementById("selectFolderBtn"),
       folderName: document.getElementById("folderName"),
       photosSummary: document.getElementById("photosSummary"),
-      uploadBtn: document.getElementById("uploadBtn"),
       uploadZipDriveBtn: document.getElementById("uploadZipDriveBtn"),
       status: document.getElementById("status")
     };
@@ -499,103 +497,6 @@
       els.photosSummary.textContent = files.length + " image(s) in folder" + (sampleNames ? " | " + sampleNames + (files.length > 3 ? " ..." : "") : "");
     }
 
-    async function pushRows() {
-      const scriptUrl = HARDCODED_CONFIG.scriptUrl;
-      const spreadsheetId = HARDCODED_CONFIG.spreadsheetId;
-      const sheetName = HARDCODED_CONFIG.sheetName;
-      const token = HARDCODED_CONFIG.token;
-
-      if (!scriptUrl || !spreadsheetId) {
-        setStatus("Hardcoded uploader config is missing required values.", "bad");
-        return;
-      }
-
-      parsedRows = parseRows(els.rowsInput.value);
-      if (!parsedRows.length) {
-        setStatus("Paste row data first. Nothing to upload.", "bad");
-        return;
-      }
-
-      const validationErrors = validateRows(parsedRows);
-      if (validationErrors.length) {
-        setStatus("Fix row issues before upload:\n" + validationErrors.slice(0, 12).join("\n"), "bad");
-        return;
-      }
-
-      els.uploadBtn.disabled = true;
-
-      try {
-        const requestId = Date.now().toString() + "-" + Math.random().toString(36).slice(2, 8);
-        setStatus("Pushing rows to Google Sheet...", "warn");
-
-        const payload = {
-          token,
-          spreadsheetId,
-          sheetName,
-          requestId,
-          rows: parsedRows
-        };
-
-        const formBody = new URLSearchParams();
-        formBody.set("payload", JSON.stringify(payload));
-
-        await fetch(scriptUrl, {
-          method: "POST",
-          body: formBody.toString(),
-          headers: { "Content-Type": "application/x-www-form-urlencoded;charset=UTF-8" },
-          mode: "no-cors"
-        });
-
-        // Poll status via JSONP
-        async function sleep(ms) {
-          return new Promise((resolve) => setTimeout(resolve, ms));
-        }
-
-        async function fetchStatus() {
-          return new Promise((resolve, reject) => {
-            const callbackName = "statusCb_" + requestId.replace(/[^a-zA-Z0-9_]/g, "_") + "_" + Date.now();
-            const statusUrl = scriptUrl + "?action=status&requestId=" + encodeURIComponent(requestId) + "&callback=" + encodeURIComponent(callbackName);
-            const script = document.createElement("script");
-            let done = false;
-            const cleanup = () => { if (script.parentNode) script.parentNode.removeChild(script); try { delete window[callbackName]; } catch (_) {} };
-            const timeout = setTimeout(() => { if (done) return; done = true; cleanup(); reject(new Error("timeout")); }, 8000);
-            window[callbackName] = (p) => { if (done) return; done = true; clearTimeout(timeout); cleanup(); resolve(p); };
-            script.onerror = () => { if (done) return; done = true; clearTimeout(timeout); cleanup(); reject(new Error("load failed")); };
-            script.src = statusUrl;
-            document.head.appendChild(script);
-          });
-        }
-
-        setStatus("Rows submitted. Checking result...", "warn");
-        let statusBody = null;
-        for (let attempt = 1; attempt <= 15; attempt++) {
-          await sleep(1000);
-          try {
-            const probe = await fetchStatus();
-            if (probe && probe.ok && probe.result && probe.result.found && probe.result.status) { statusBody = probe; break; }
-          } catch (_) {}
-        }
-
-        if (!statusBody || !statusBody.result || !statusBody.result.status) {
-          setStatus("Rows submitted but status could not be confirmed. Check the sheet manually.", "warn");
-          return;
-        }
-
-        const s = statusBody.result.status;
-        if (!s.ok) throw new Error(s.error || "Row upload failed");
-
-        const parts = ["Done."];
-        if (s.rowsUpdated) parts.push("Updated: " + s.rowsUpdated + " existing row(s)");
-        if (s.rowsAppended) parts.push("Appended: " + s.rowsAppended + " new row(s)");
-        parts.push("Sheet: " + sheetName);
-        setStatus(parts.join("\n"), "ok");
-      } catch (err) {
-        setStatus("Row upload failed: " + (err.message || err), "bad");
-      } finally {
-        els.uploadBtn.disabled = false;
-      }
-    }
-
     async function compressImage(file, targetSizeKB) {
       const TARGET_BYTES = targetSizeKB * 1024;
       const img = await createImageBitmap(file);
@@ -805,7 +706,6 @@
       }
     }
 
-    els.uploadBtn.addEventListener("click", pushRows);
     els.downloadZipBtn = document.getElementById("downloadZipBtn");
     els.downloadZipBtn.addEventListener("click", downloadZip);
     els.uploadZipDriveBtn.addEventListener("click", uploadZipToDrive);
