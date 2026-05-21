@@ -697,11 +697,9 @@
       }
 
       const scriptUrl = HARDCODED_CONFIG.scriptUrl;
-      const spreadsheetId = HARDCODED_CONFIG.spreadsheetId;
-      const sheetName = HARDCODED_CONFIG.sheetName;
       const driveZipFileId = HARDCODED_CONFIG.driveZipFileId;
 
-      if (!scriptUrl || !spreadsheetId || !driveZipFileId) {
+      if (!scriptUrl || !driveZipFileId) {
         setStatus("Hardcoded Drive ZIP config is missing required values.", "bad");
         return;
       }
@@ -710,88 +708,63 @@
 
       els.uploadZipDriveBtn.disabled = true;
       try {
-        const requestId = Date.now().toString() + "-zip-" + Math.random().toString(36).slice(2, 8);
         const zip = new JSZip();
 
         // Step 1: Compress photos
         for (let i = 0; i < photos.length; i++) {
           const file = photos[i];
-          setStatus("Step 1/4 — Compressing photo " + (i + 1) + "/" + photos.length + ": " + file.name, "warn");
+          setStatus("Step 1/3 — Compressing photo " + (i + 1) + "/" + photos.length + ": " + file.name, "warn");
           const compressed = await compressImage(file, 50);
           const nameBase = file.name.replace(/\.[^.]+$/, "") + ".jpg";
           zip.file(nameBase, compressed);
         }
 
-        // Step 2: Create ZIP
-        setStatus("Step 2/4 — Zipping " + photos.length + " photos...", "warn");
+        // Step 2: Create ZIP blob
+        setStatus("Step 2/3 — Zipping " + photos.length + " photos...", "warn");
         const zipBlob = await zip.generateAsync(
           { type: "blob", compression: "DEFLATE", compressionOptions: { level: 6 } },
-          function(meta) { setStatus("Step 2/4 — Zipping: " + meta.percent.toFixed(0) + "%", "warn"); }
+          function(meta) { setStatus("Step 2/3 — Zipping: " + meta.percent.toFixed(0) + "%", "warn"); }
         );
 
-        // Step 3: Encode to base64
-        setStatus("Step 3/4 — Encoding ZIP (" + (zipBlob.size / 1024).toFixed(0) + " KB) to base64...", "warn");
-        const zipBase64 = await blobToBase64(zipBlob);
+        // Step 3: Get resumable upload URL from Apps Script, then upload directly to Drive
+        setStatus("Step 3/3 — Getting upload URL...", "warn");
 
-        const payload = {
-          token,
-          spreadsheetId,
-          sheetName,
-          requestId,
-          rows: [],
-          zipBase64,
-          driveZipFileId,
-          zipFileName: "faces.zip"
-        };
-
-        const formBody = new URLSearchParams();
-        formBody.set("payload", JSON.stringify(payload));
-
-        await fetch(scriptUrl, {
-          method: "POST",
-          body: formBody.toString(),
-          headers: { "Content-Type": "application/x-www-form-urlencoded;charset=UTF-8" },
-          mode: "no-cors"
+        // Fetch resumable upload URL via JSONP (avoids CORS issues with Apps Script GET)
+        const uploadUrl = await new Promise((resolve, reject) => {
+          const cbName = "_uploadUrlCb_" + Date.now();
+          const url = scriptUrl + "?action=get_upload_url&token=" + encodeURIComponent(token) +
+            "&fileId=" + encodeURIComponent(driveZipFileId) +
+            "&callback=" + encodeURIComponent(cbName);
+          const script = document.createElement("script");
+          let done = false;
+          const cleanup = () => { if (script.parentNode) script.parentNode.removeChild(script); try { delete window[cbName]; } catch (_) {} };
+          const timeout = setTimeout(() => { if (done) return; done = true; cleanup(); reject(new Error("Timed out getting upload URL")); }, 15000);
+          window[cbName] = (resp) => {
+            if (done) return; done = true; clearTimeout(timeout); cleanup();
+            if (resp && resp.ok && resp.result && resp.result.uploadUrl) {
+              resolve(resp.result.uploadUrl);
+            } else {
+              reject(new Error((resp && resp.error) || "Failed to get upload URL"));
+            }
+          };
+          script.onerror = () => { if (done) return; done = true; clearTimeout(timeout); cleanup(); reject(new Error("Script load failed")); };
+          script.src = url;
+          document.head.appendChild(script);
         });
 
-        async function sleep(ms) {
-          return new Promise((resolve) => setTimeout(resolve, ms));
-        }
+        setStatus("Step 3/3 — Uploading faces.zip (" + (zipBlob.size / 1024).toFixed(0) + " KB, " + photos.length + " photos) directly to Google Drive...", "warn");
 
-        async function fetchStatus() {
-          return new Promise((resolve, reject) => {
-            const callbackName = "statusCb_" + requestId.replace(/[^a-zA-Z0-9_]/g, "_") + "_" + Date.now();
-            const statusUrl = scriptUrl + "?action=status&requestId=" + encodeURIComponent(requestId) + "&callback=" + encodeURIComponent(callbackName);
-            const script = document.createElement("script");
-            let done = false;
-            const cleanup = () => { if (script.parentNode) script.parentNode.removeChild(script); try { delete window[callbackName]; } catch (_) {} };
-            const timeout = setTimeout(() => { if (done) return; done = true; cleanup(); reject(new Error("timeout")); }, 8000);
-            window[callbackName] = (p) => { if (done) return; done = true; clearTimeout(timeout); cleanup(); resolve(p); };
-            script.onerror = () => { if (done) return; done = true; clearTimeout(timeout); cleanup(); reject(new Error("load failed")); };
-            script.src = statusUrl;
-            document.head.appendChild(script);
-          });
-        }
+        // Upload raw ZIP blob directly to Drive resumable URL
+        const uploadResp = await fetch(uploadUrl, {
+          method: "PUT",
+          body: zipBlob,
+          headers: { "Content-Type": "application/zip" }
+        });
 
-        // Step 3: Upload to Drive
-        setStatus("Step 3/3 \u2014 Uploading faces.zip (" + (zipBlob.size / 1024).toFixed(0) + " KB, " + photos.length + " photos) to Google Drive...\nDrive file: " + driveZipFileId, "warn");
-        let statusBody = null;
-        for (let attempt = 1; attempt <= 15; attempt++) {
-          await sleep(1000);
-          setStatus("Step 3/3 \u2014 Waiting for Drive confirmation... (" + attempt + "/15)\nZIP: " + (zipBlob.size / 1024).toFixed(0) + " KB | Photos: " + photos.length, "warn");
-          try {
-            const probe = await fetchStatus();
-            if (probe && probe.ok && probe.result && probe.result.found && probe.result.status) { statusBody = probe; break; }
-          } catch (_) {}
+        if (!uploadResp.ok) {
+          const errText = await uploadResp.text();
+          throw new Error("Drive upload failed (" + uploadResp.status + "): " + errText.substring(0, 300));
         }
-
-        if (!statusBody || !statusBody.result || !statusBody.result.status) {
-          setStatus("faces.zip upload sent, but Drive status could not be confirmed after 15 attempts.\nCheck the Drive file manually: " + driveZipFileId, "warn");
-          return;
-        }
-
-        const s = statusBody.result.status;
-        if (!s.ok) throw new Error(s.error || "ZIP upload failed");
 
         setStatus("Done! ZIP replaced on Google Drive.\n" + photos.length + " photos | " + (zipBlob.size / 1024).toFixed(0) + " KB\nDrive file: " + driveZipFileId, "ok");
       } catch (err) {
