@@ -53,35 +53,21 @@ function doGet(e) {
       return ContentService.createTextOutput(base64).setMimeType(ContentService.MimeType.TEXT);
     }
 
-    // Generate a resumable upload URL for direct browser→Drive upload
+    // Return a short-lived OAuth token so the browser can initiate
+    // a resumable Drive upload directly (CORS works for browser-initiated uploads).
     if (e && e.parameter && e.parameter.action === 'get_upload_url') {
       validateToken_(e.parameter.token);
       var fileId = e.parameter.fileId || DEFAULT_ZIP_FILE_ID;
       var oauthToken = ScriptApp.getOAuthToken();
-      var url = 'https://www.googleapis.com/upload/drive/v3/files/' +
-        encodeURIComponent(fileId) + '?uploadType=resumable';
-      var resp = UrlFetchApp.fetch(url, {
-        method: 'PATCH',
-        contentType: 'application/json',
-        headers: {
-          'Authorization': 'Bearer ' + oauthToken,
-          'X-Upload-Content-Type': 'application/zip'
-        },
-        payload: JSON.stringify({}),
-        muteHttpExceptions: true
-      });
-      var code = resp.getResponseCode();
-      if (code < 200 || code >= 300) {
-        throw new Error('Failed to create upload session (' + code + '): ' + resp.getContentText().substring(0, 300));
-      }
-      var headers = resp.getAllHeaders();
-      var location = headers['Location'] || headers['location'];
-      if (!location) throw new Error('No upload URL returned from Drive API');
-      var uploadResult = { ok: true, result: { uploadUrl: location }, error: null };
+      var uploadResult = {
+        ok: true,
+        result: { accessToken: oauthToken, fileId: fileId },
+        error: null
+      };
       if (e.parameter.callback) {
         return jsonpResponse_(e.parameter.callback, uploadResult);
       }
-      return jsonResponse_(true, { uploadUrl: location }, null);
+      return jsonResponse_(true, uploadResult.result, null);
     }
 
     if (e && e.parameter && e.parameter.action === 'list_photos') {

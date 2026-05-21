@@ -726,11 +726,11 @@
           function(meta) { setStatus("Step 2/3 — Zipping: " + meta.percent.toFixed(0) + "%", "warn"); }
         );
 
-        // Step 3: Get resumable upload URL from Apps Script, then upload directly to Drive
-        setStatus("Step 3/3 — Getting upload URL...", "warn");
+        // Step 3: Get OAuth token from Apps Script, then upload directly to Drive
+        setStatus("Step 3/3 — Getting upload credentials...", "warn");
 
-        // Fetch resumable upload URL via JSONP (avoids CORS issues with Apps Script GET)
-        const uploadUrl = await new Promise((resolve, reject) => {
+        // Fetch access token via JSONP (avoids CORS issues with Apps Script GET)
+        const accessToken = await new Promise((resolve, reject) => {
           const cbName = "_uploadUrlCb_" + Date.now();
           const url = scriptUrl + "?action=get_upload_url&token=" + encodeURIComponent(token) +
             "&fileId=" + encodeURIComponent(driveZipFileId) +
@@ -738,13 +738,13 @@
           const script = document.createElement("script");
           let done = false;
           const cleanup = () => { if (script.parentNode) script.parentNode.removeChild(script); try { delete window[cbName]; } catch (_) {} };
-          const timeout = setTimeout(() => { if (done) return; done = true; cleanup(); reject(new Error("Timed out getting upload URL")); }, 15000);
+          const timeout = setTimeout(() => { if (done) return; done = true; cleanup(); reject(new Error("Timed out getting upload credentials")); }, 15000);
           window[cbName] = (resp) => {
             if (done) return; done = true; clearTimeout(timeout); cleanup();
-            if (resp && resp.ok && resp.result && resp.result.uploadUrl) {
-              resolve(resp.result.uploadUrl);
+            if (resp && resp.ok && resp.result && resp.result.accessToken) {
+              resolve(resp.result.accessToken);
             } else {
-              reject(new Error((resp && resp.error) || "Failed to get upload URL"));
+              reject(new Error((resp && resp.error) || "Failed to get upload credentials"));
             }
           };
           script.onerror = () => { if (done) return; done = true; clearTimeout(timeout); cleanup(); reject(new Error("Script load failed")); };
@@ -754,11 +754,16 @@
 
         setStatus("Step 3/3 — Uploading faces.zip (" + (zipBlob.size / 1024).toFixed(0) + " KB, " + photos.length + " photos) directly to Google Drive...", "warn");
 
-        // Upload raw ZIP blob directly to Drive resumable URL
-        const uploadResp = await fetch(uploadUrl, {
-          method: "PUT",
+        // Upload raw ZIP blob directly to Drive (simple media upload, browser-initiated → CORS OK)
+        const driveUrl = "https://www.googleapis.com/upload/drive/v3/files/" +
+          encodeURIComponent(driveZipFileId) + "?uploadType=media";
+        const uploadResp = await fetch(driveUrl, {
+          method: "PATCH",
           body: zipBlob,
-          headers: { "Content-Type": "application/zip" }
+          headers: {
+            "Authorization": "Bearer " + accessToken,
+            "Content-Type": "application/zip"
+          }
         });
 
         if (!uploadResp.ok) {
