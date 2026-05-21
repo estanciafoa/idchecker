@@ -9,6 +9,7 @@ const REQUIRED_HEADERS = [
 ];
 
 const DEFAULT_SPREADSHEET_ID = '1EDvYjDQVIpwib5PmQ5sbSchJI_B5HNHWNomXRLOxtk4';
+const DEFAULT_ZIP_FILE_ID = '1De7JzvhoEHfsrVJzKojcQu_QgHq4tRUE';
 
 function doGet(e) {
   try {
@@ -18,6 +19,38 @@ function doGet(e) {
         return jsonpResponse_(e.parameter.callback, statusResponse);
       }
       return jsonResponse_(statusResponse.ok, statusResponse.result, statusResponse.error);
+    }
+
+    // Serve sheet CSV (proxy for private sheet)
+    if (e && e.parameter && e.parameter.action === 'get_csv') {
+      validateToken_(e.parameter.token);
+      var ssId = e.parameter.ssId || DEFAULT_SPREADSHEET_ID;
+      var ss = SpreadsheetApp.openById(ssId);
+      var targetSheet;
+      if (e.parameter.gid) {
+        var gid = Number(e.parameter.gid);
+        var sheets = ss.getSheets();
+        for (var i = 0; i < sheets.length; i++) {
+          if (sheets[i].getSheetId() === gid) { targetSheet = sheets[i]; break; }
+        }
+        if (!targetSheet) return jsonResponse_(false, null, 'Sheet with gid ' + gid + ' not found');
+      } else {
+        var sheetName = e.parameter.sheet || 'student id';
+        targetSheet = ss.getSheetByName(sheetName);
+        if (!targetSheet) return jsonResponse_(false, null, 'Sheet "' + sheetName + '" not found');
+      }
+      var csvText = sheetToCsv_(targetSheet);
+      return ContentService.createTextOutput(csvText).setMimeType(ContentService.MimeType.CSV);
+    }
+
+    // Serve ZIP file content as base64 (proxy for private Drive file)
+    if (e && e.parameter && e.parameter.action === 'get_zip') {
+      validateToken_(e.parameter.token);
+      var fileId = e.parameter.fileId || DEFAULT_ZIP_FILE_ID;
+      var file = DriveApp.getFileById(fileId);
+      var blob = file.getBlob();
+      var base64 = Utilities.base64Encode(blob.getBytes());
+      return ContentService.createTextOutput(base64).setMimeType(ContentService.MimeType.TEXT);
     }
 
     if (e && e.parameter && e.parameter.action === 'list_photos') {
@@ -262,13 +295,29 @@ function validatePayload_(payload) {
 }
 
 function validateToken_(providedToken) {
-  const expectedToken = PropertiesService.getScriptProperties().getProperty('ADMIN_UPLOAD_TOKEN');
-  if (!expectedToken) {
-    return;
-  }
+  var expectedToken = 'Admin2026';
   if (!providedToken || providedToken !== expectedToken) {
     throw new Error('Invalid upload token');
   }
+}
+
+/**
+ * Convert a sheet tab to CSV text.
+ */
+function sheetToCsv_(sheet) {
+  var data = sheet.getDataRange().getValues();
+  var csv = data.map(function(row) {
+    return row.map(function(cell) {
+      var val = cell instanceof Date
+        ? Utilities.formatDate(cell, Session.getScriptTimeZone(), 'yyyy-MM-dd')
+        : String(cell);
+      if (val.indexOf(',') >= 0 || val.indexOf('"') >= 0 || val.indexOf('\n') >= 0) {
+        return '"' + val.replace(/"/g, '""') + '"';
+      }
+      return val;
+    }).join(',');
+  }).join('\n');
+  return csv;
 }
 
 function appendRows_(spreadsheetId, sheetName, rows) {

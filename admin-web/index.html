@@ -209,6 +209,69 @@
     .status.warn { border-color: #fed7aa; background: #fff7ed; color: var(--warn); }
     .status.bad { border-color: #fecaca; background: #fef2f2; color: var(--bad); }
 
+    /* Modal overlay */
+    .modal-overlay {
+      display: none;
+      position: fixed;
+      inset: 0;
+      background: rgba(0,0,0,0.45);
+      z-index: 1000;
+      align-items: center;
+      justify-content: center;
+    }
+    .modal-overlay.visible { display: flex; }
+    .modal-box {
+      background: var(--card);
+      border-radius: 14px;
+      box-shadow: 0 20px 60px rgba(0,0,0,0.25);
+      padding: 28px 32px;
+      max-width: 480px;
+      width: 90%;
+      text-align: center;
+    }
+    .modal-box .modal-warning {
+      font-size: 13px;
+      font-weight: 700;
+      color: var(--bad);
+      background: #fef2f2;
+      border: 1px solid #fecaca;
+      border-radius: 8px;
+      padding: 8px 12px;
+      margin-bottom: 16px;
+    }
+    .modal-box .modal-spinner {
+      display: inline-block;
+      width: 28px; height: 28px;
+      border: 3px solid var(--border);
+      border-top-color: var(--brand);
+      border-radius: 50%;
+      animation: spin 0.8s linear infinite;
+      margin-bottom: 12px;
+    }
+    @keyframes spin { to { transform: rotate(360deg); } }
+    .modal-box .modal-status {
+      font-size: 14px;
+      white-space: pre-wrap;
+      line-height: 1.5;
+      color: var(--text);
+      min-height: 40px;
+    }
+    .modal-box .modal-status.ok { color: var(--ok); }
+    .modal-box .modal-status.bad { color: var(--bad); }
+    .modal-box .modal-close-btn {
+      display: none;
+      margin-top: 16px;
+      border: none;
+      border-radius: 10px;
+      background: var(--brand);
+      color: #fff;
+      padding: 10px 28px;
+      font-size: 14px;
+      font-weight: 700;
+      cursor: pointer;
+    }
+    .modal-box .modal-close-btn.visible { display: inline-block; }
+
     code {
       font-family: Consolas, "Courier New", monospace;
       font-size: 12px;
@@ -224,6 +287,40 @@
   </style>
 </head>
 <body>
+  <!-- Password gate -->
+  <div id="passwordGate" style="position:fixed;inset:0;z-index:9999;background:radial-gradient(circle at top right,#F5E6D3 0%,#FFFBEB 40%,#FFF8F0 100%);display:flex;align-items:center;justify-content:center">
+    <div style="background:#fff;border:2px solid #78350F;border-radius:12px;padding:40px;text-align:center;max-width:360px;width:90%;box-shadow:0 8px 32px rgba(0,0,0,0.12)">
+      <div style="font-size:48px;margin-bottom:12px">🔒</div>
+      <h2 style="margin:0 0 8px;color:#78350F;font-size:20px;letter-spacing:1px">ADMIN ACCESS</h2>
+      <p style="margin:0 0 20px;color:#A89080;font-size:14px">Enter password to continue</p>
+      <input id="gatePassword" type="password" placeholder="Password" autocomplete="off"
+        style="width:100%;padding:12px;border:2px solid #E5D4C8;border-radius:8px;font-size:16px;text-align:center;outline:none"
+        onkeydown="if(event.key==='Enter')document.getElementById('gateSubmit').click()" />
+      <p id="gateError" style="color:#b91c1c;font-size:13px;margin:8px 0 0;display:none">INCORRECT PASSWORD</p>
+      <button id="gateSubmit" type="button" onclick="checkGatePassword()"
+        style="margin-top:16px;width:100%;padding:12px;background:#78350F;color:#fff;border:none;border-radius:8px;font-size:16px;font-weight:700;cursor:pointer;letter-spacing:1px">
+        UNLOCK
+      </button>
+    </div>
+  </div>
+  <script>
+    var _adminToken = '';
+    function checkGatePassword() {
+      var pw = document.getElementById('gatePassword').value;
+      if (pw === 'Admin2026') {
+        _adminToken = pw;
+        document.getElementById('passwordGate').style.display = 'none';
+      } else {
+        document.getElementById('gateError').style.display = 'block';
+        document.getElementById('gatePassword').value = '';
+        document.getElementById('gatePassword').focus();
+      }
+    }
+    document.addEventListener('DOMContentLoaded', function() {
+      document.getElementById('gatePassword').focus();
+    });
+  </script>
+
   <div class="shell">
     <div class="card">
       <h1>ID Checker Admin</h1>
@@ -256,8 +353,15 @@
       </div>
     </div>
 
-    <div class="card">
-      <div id="status" class="status">Ready.</div>
+  </div>
+
+  <!-- Status Modal -->
+  <div class="modal-overlay" id="statusModal">
+    <div class="modal-box">
+      <div class="modal-warning" id="modalWarning">⚠ Do not close this window until the operation is finished.</div>
+      <div class="modal-spinner" id="modalSpinner"></div>
+      <div class="modal-status" id="modalStatus"></div>
+      <button class="modal-close-btn" id="modalCloseBtn" type="button">Close</button>
     </div>
   </div>
 
@@ -277,7 +381,6 @@
       scriptUrl: "https://script.google.com/macros/s/AKfycby2yjp7UEvBdYIDzKjOyFInegp_9CA7LVhpmbHbqwnxdPYEI5WJE8BYki-3Dwrgfm7pkw/exec",
       spreadsheetId: "1EDvYjDQVIpwib5PmQ5sbSchJI_B5HNHWNomXRLOxtk4",
       sheetName: "student id",
-      token: "",
       driveZipFileId: "1De7JzvhoEHfsrVJzKojcQu_QgHq4tRUE"
     };
 
@@ -285,8 +388,7 @@
       selectFolderBtn: document.getElementById("selectFolderBtn"),
       folderName: document.getElementById("folderName"),
       photosSummary: document.getElementById("photosSummary"),
-      uploadZipDriveBtn: document.getElementById("uploadZipDriveBtn"),
-      status: document.getElementById("status")
+      uploadZipDriveBtn: document.getElementById("uploadZipDriveBtn")
     };
 
     // ---- Directory handle persistence via IndexedDB ----
@@ -367,9 +469,41 @@
 
     let parsedRows = [];
 
+    const modalEls = {
+      overlay: document.getElementById("statusModal"),
+      warning: document.getElementById("modalWarning"),
+      spinner: document.getElementById("modalSpinner"),
+      status: document.getElementById("modalStatus"),
+      closeBtn: document.getElementById("modalCloseBtn")
+    };
+    modalEls.closeBtn.addEventListener("click", () => {
+      modalEls.overlay.classList.remove("visible");
+    });
+
+    let operationInProgress = false;
+    window.addEventListener("beforeunload", (e) => {
+      if (operationInProgress) { e.preventDefault(); e.returnValue = ""; }
+    });
+
+    function showModal(message, tone) {
+      modalEls.overlay.classList.add("visible");
+      modalEls.status.textContent = message;
+      modalEls.status.className = "modal-status" + (tone === "ok" ? " ok" : tone === "bad" ? " bad" : "");
+      const inProgress = tone === "warn";
+      operationInProgress = inProgress;
+      modalEls.spinner.style.display = inProgress ? "inline-block" : "none";
+      modalEls.warning.style.display = inProgress ? "block" : "none";
+      modalEls.closeBtn.className = "modal-close-btn" + (inProgress ? "" : " visible");
+    }
+
+    function hideModal() {
+      modalEls.overlay.classList.remove("visible");
+    }
+
     function setStatus(message, tone) {
-      els.status.textContent = message;
-      els.status.className = "status" + (tone ? " " + tone : "");
+      if (tone === "warn" || tone === "ok" || tone === "bad") {
+        showModal(message, tone);
+      }
     }
 
     function normalizeHeader(value) {
@@ -565,13 +699,14 @@
       const scriptUrl = HARDCODED_CONFIG.scriptUrl;
       const spreadsheetId = HARDCODED_CONFIG.spreadsheetId;
       const sheetName = HARDCODED_CONFIG.sheetName;
-      const token = HARDCODED_CONFIG.token;
       const driveZipFileId = HARDCODED_CONFIG.driveZipFileId;
 
       if (!scriptUrl || !spreadsheetId || !driveZipFileId) {
         setStatus("Hardcoded Drive ZIP config is missing required values.", "bad");
         return;
       }
+
+      const token = _adminToken;
 
       els.uploadZipDriveBtn.disabled = true;
       try {

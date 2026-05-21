@@ -1,7 +1,7 @@
 import React, { useState, useEffect } from 'react';
 import {
   View, Text, StyleSheet, TouchableOpacity, ActivityIndicator,
-  ScrollView, Alert,
+  ScrollView, Alert, TextInput,
 } from 'react-native';
 import { Ionicons } from '@expo/vector-icons';
 import { SafeAreaView } from 'react-native-safe-area-context';
@@ -11,13 +11,14 @@ import { Resident, MaidCook, getLocalResidents, saveLocalResidents, getLastSyncT
 import {
   downloadAllPhotos,
   cleanupExpiredPhotos,
-  importPhotosFromZip,
+  importPhotosFromBase64,
   attachLocalPhotosById,
   clearAllPhotos,
 } from '../src/services/photos';
-const SHEET_URL = 'https://docs.google.com/spreadsheets/d/e/2PACX-1vRWtCUWe5gmOUyvtZsSnApB5H0vMRRGXDnETCaUwcSRCCRdeX7J299QKq0p7cntCqeqRR4fxbRR1hgL/pub?output=csv';
-const MAIDS_COOKS_SHEET_URL = 'https://docs.google.com/spreadsheets/d/e/2PACX-1vRWtCUWe5gmOUyvtZsSnApB5H0vMRRGXDnETCaUwcSRCCRdeX7J299QKq0p7cntCqeqRR4fxbRR1hgL/pub?output=csv&gid=1522969277';
-const PHOTOS_ZIP_URL = 'https://drive.google.com/uc?export=download&id=1De7JzvhoEHfsrVJzKojcQu_QgHq4tRUE';
+const APPS_SCRIPT_URL = 'https://script.google.com/macros/s/AKfycby2yjp7UEvBdYIDzKjOyFInegp_9CA7LVhpmbHbqwnxdPYEI5WJE8BYki-3Dwrgfm7pkw/exec';
+const sheetUrl = (token: string) => APPS_SCRIPT_URL + '?action=get_csv&sheet=student%20id&token=' + encodeURIComponent(token);
+const maidsCooksSheetUrl = (token: string) => APPS_SCRIPT_URL + '?action=get_csv&gid=1522969277&token=' + encodeURIComponent(token);
+const zipUrl = (token: string) => APPS_SCRIPT_URL + '?action=get_zip&token=' + encodeURIComponent(token);
 // Optional fallback when photo_url column is empty.
 // Use {id} placeholder, e.g. 'https://example.com/photos/{id}.jpg'
 const PHOTO_URL_TEMPLATE: string = '';
@@ -77,6 +78,9 @@ export default function SyncScreen() {
   const [syncErrorMC, setSyncErrorMC] = useState<string | null>(null);
   const [clearing, setClearing] = useState(false);
 
+  const [syncToken, setSyncToken] = useState('');
+  const [showPassword, setShowPassword] = useState(false);
+
   useEffect(() => { loadStatus(); }, []);
 
   const loadStatus = async () => {
@@ -92,14 +96,21 @@ export default function SyncScreen() {
   };
 
   const handleImportFromSheet = async () => {
+    if (!syncToken.trim()) { setSyncError('Enter password first'); return; }
     setSyncing(true);
     setSyncResult(null);
     setSyncError(null);
     try {
       setSyncResult('Fetching sheet...');
-      const response = await fetch(SHEET_URL);
+      const response = await fetch(sheetUrl(syncToken));
       if (!response.ok) throw new Error('Failed to fetch sheet: ' + response.status);
-      const csvText = await response.text();
+      const rawText = await response.text();
+      // Apps Script returns JSON error for invalid token
+      if (rawText.trimStart().startsWith('{')) {
+        const errObj = JSON.parse(rawText);
+        if (!errObj.ok) throw new Error(errObj.error || 'Access denied');
+      }
+      const csvText = rawText;
       const rows = parseCSV(csvText);
       if (rows.length === 0) throw new Error('No data found in sheet');
 
@@ -209,8 +220,16 @@ export default function SyncScreen() {
       const needsPhoto = added > 0 || updated > 0 || photoOnly > 0;
 
       if (needsPhoto) {
-        setSyncResult(`N:${added} U:${updated} UP:${photoOnly} UD:${dataOnly} D:${deleted}. Downloading photos ZIP...`);
-        await importPhotosFromZip(PHOTOS_ZIP_URL, (done, total) => {
+        setSyncResult(`N:${added} U:${updated} UP:${photoOnly} UD:${dataOnly} D:${deleted}. Downloading ZIP...`);
+        const zipRes = await fetch(zipUrl(syncToken), { redirect: 'follow' });
+        if (!zipRes.ok) throw new Error('Failed to download ZIP: ' + zipRes.status);
+        const zipBase64 = await zipRes.text();
+        if (zipBase64.trimStart().startsWith('{')) {
+          const errObj = JSON.parse(zipBase64);
+          if (!errObj.ok) throw new Error(errObj.error || 'ZIP access denied');
+        }
+        setSyncResult(`Extracting photos...`);
+        await importPhotosFromBase64(zipBase64, (done, total) => {
           setSyncResult(`Extracting photos: ${done}/${total}`);
         });
       }
@@ -248,14 +267,20 @@ export default function SyncScreen() {
   };
 
   const handleImportMaidsCooks = async () => {
+    if (!syncToken.trim()) { setSyncErrorMC('Enter password first'); return; }
     setSyncingMC(true);
     setSyncResultMC(null);
     setSyncErrorMC(null);
     try {
       setSyncResultMC('Fetching cooks & maids sheet...');
-      const response = await fetch(MAIDS_COOKS_SHEET_URL);
+      const response = await fetch(maidsCooksSheetUrl(syncToken));
       if (!response.ok) throw new Error('Failed to fetch sheet: ' + response.status);
-      const csvText = await response.text();
+      const rawText = await response.text();
+      if (rawText.trimStart().startsWith('{')) {
+        const errObj = JSON.parse(rawText);
+        if (!errObj.ok) throw new Error(errObj.error || 'Access denied');
+      }
+      const csvText = rawText;
       const rows = parseCSV(csvText);
       if (rows.length === 0) throw new Error('No data found in sheet');
 
@@ -376,6 +401,24 @@ export default function SyncScreen() {
         <View style={{ width: 36 }} />
       </View>
       <ScrollView contentContainerStyle={styles.scrollContent}>
+        {/* ── Password ── */}
+        <View style={styles.passwordRow}>
+          <Ionicons name="lock-closed" size={20} color="#78350F" />
+          <TextInput
+            style={styles.passwordInput}
+            value={syncToken}
+            onChangeText={setSyncToken}
+            placeholder="Enter sync password"
+            placeholderTextColor="#94A3B8"
+            secureTextEntry={!showPassword}
+            autoCapitalize="none"
+            autoCorrect={false}
+          />
+          <TouchableOpacity onPress={() => setShowPassword(!showPassword)} style={{ padding: 6 }}>
+            <Ionicons name={showPassword ? 'eye-off' : 'eye'} size={20} color="#475569" />
+          </TouchableOpacity>
+        </View>
+
         {/* ── Students Sync Section ── */}
         <View style={styles.sectionHeader}>
           <Ionicons name="school" size={18} color="#D97706" />
@@ -541,6 +584,8 @@ const styles = StyleSheet.create({
   titleBar: { backgroundColor: '#78350F', paddingVertical: 14, paddingHorizontal: 16, flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between' },
   titleText: { fontSize: fs(20), fontWeight: '900', color: '#FFFBEB', letterSpacing: 2 },
   scrollContent: { padding: 20 },
+  passwordRow: { flexDirection: 'row', alignItems: 'center', borderWidth: 2, borderColor: '#78350F', backgroundColor: '#FFFBEB', paddingHorizontal: 12, paddingVertical: 4, marginBottom: 20, gap: 8 },
+  passwordInput: { flex: 1, fontSize: fs(14), color: '#0F172A', paddingVertical: 10 },
   statusCard: { borderWidth: 2, borderColor: '#000000', padding: 16, backgroundColor: '#F8FAFC', marginBottom: 24, elevation: 4 },
   statusRow: { flexDirection: 'row', alignItems: 'center', gap: 12 },
   statusInfo: { flex: 1 },

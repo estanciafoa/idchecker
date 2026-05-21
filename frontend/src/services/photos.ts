@@ -38,6 +38,8 @@ function getFileExtension(url: string): string {
  */
 function toDirectUrl(url: string): string {
   if (!url) return url;
+  // googleapis.com URLs with access_token are already direct — don't transform
+  if (url.includes('googleapis.com/')) return url;
   // Already a direct download URL
   if (url.includes('drive.google.com/uc')) return url;
   // /file/d/FILE_ID/...
@@ -178,6 +180,35 @@ export async function importPhotosFromZip(
       await deleteAsync(zipPath, { idempotent: true });
     }
   }
+}
+
+/**
+ * Import photos from a base64-encoded ZIP string (no download needed).
+ * Used when the ZIP is served inline by the Apps Script proxy.
+ */
+export async function importPhotosFromBase64(
+  zipBase64: string,
+  onProgress?: (done: number, total: number) => void
+): Promise<number> {
+  if (!zipBase64) return 0;
+
+  const photosDir = await ensureLegacyPhotosDir();
+  const zip = await JSZip.loadAsync(zipBase64, { base64: true });
+  const files = Object.values(zip.files).filter((f) => !f.dir && isImageFile(f.name));
+  const total = files.length;
+  let done = 0;
+
+  for (const f of files) {
+    const fileName = f.name.split('/').pop() || f.name;
+    const dataBase64 = await f.async('base64');
+    await writeAsStringAsync(`${photosDir}/${fileName}`, dataBase64, {
+      encoding: EncodingType.Base64,
+    });
+    done++;
+    if (onProgress) onProgress(done, total);
+  }
+
+  return total;
 }
 
 /**
