@@ -77,6 +77,10 @@ function doGet(e) {
       var headers = resp.getAllHeaders();
       var location = headers['Location'] || headers['location'];
       if (!location) throw new Error('No upload URL returned from Drive API');
+      var uploadResult = { ok: true, result: { uploadUrl: location }, error: null };
+      if (e.parameter.callback) {
+        return jsonpResponse_(e.parameter.callback, uploadResult);
+      }
       return jsonResponse_(true, { uploadUrl: location }, null);
     }
 
