@@ -13,8 +13,8 @@ import { Ionicons } from '@expo/vector-icons';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import HamburgerMenu from '../src/components/HamburgerMenu';
 import { fs } from '../src/utils/scale';
-import { getLocalAccessLogs, type AccessLogEntry } from '../src/services/storage';
-import { pushLogsToGoogleDrive } from '../src/services/api';
+import { getLocalAccessLogs, getPendingVisitorCheckins, removePendingVisitorCheckin, type AccessLogEntry } from '../src/services/storage';
+import { pushLogsToGoogleDrive, uploadVisitorCheckin } from '../src/services/api';
 
 export default function LogsScreen() {
   const [logs, setLogs] = useState<AccessLogEntry[]>([]);
@@ -37,14 +37,39 @@ export default function LogsScreen() {
   }, []);
 
   const handlePushLogs = async () => {
-    if (logs.length === 0) {
-      Alert.alert('No Logs', 'There are no logs to push.');
+    const pendingCheckins = await getPendingVisitorCheckins();
+    if (logs.length === 0 && pendingCheckins.length === 0) {
+      Alert.alert('Nothing to Push', 'There are no logs or visitor check-ins to push.');
       return;
     }
     setPushing(true);
+    const results: string[] = [];
     try {
-      const result = await pushLogsToGoogleDrive(logs);
-      Alert.alert('Success', `Uploaded ${result.rowCount} logs as ${result.fileName}`);
+      // Push access logs
+      if (logs.length > 0) {
+        const result = await pushLogsToGoogleDrive(logs);
+        results.push(`${result.rowCount} logs uploaded`);
+      }
+
+      // Push pending visitor check-ins
+      let checkinOk = 0, checkinFail = 0;
+      for (const checkin of pendingCheckins) {
+        try {
+          await uploadVisitorCheckin({
+            visitor: checkin.visitor,
+            photoBase64: checkin.compositeBase64,
+            timestamp: checkin.timestamp,
+          });
+          await removePendingVisitorCheckin(checkin.id);
+          checkinOk++;
+        } catch {
+          checkinFail++;
+        }
+      }
+      if (checkinOk > 0) results.push(`${checkinOk} visitor check-in(s) uploaded`);
+      if (checkinFail > 0) results.push(`${checkinFail} check-in(s) failed`);
+
+      Alert.alert('Done', results.join('\n'));
     } catch (error: any) {
       Alert.alert('Upload Failed', error.message || 'Something went wrong');
     } finally {

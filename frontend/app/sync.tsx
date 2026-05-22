@@ -7,20 +7,25 @@ import { Ionicons } from '@expo/vector-icons';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import HamburgerMenu from '../src/components/HamburgerMenu';
 import { fs } from '../src/utils/scale';
-import { Resident, MaidCook, getLocalResidents, saveLocalResidents, getLastSyncTime, setLastSyncTime, getLocalMaidsCooks, saveLocalMaidsCooks, getMaidCookLastSyncTime, setMaidCookLastSyncTime, clearSyncData } from '../src/services/storage';
+import {
+  Resident, MaidCook, Visitor,
+  getLocalResidents, saveLocalResidents, getLastSyncTime, setLastSyncTime,
+  getLocalMaidsCooks, saveLocalMaidsCooks, setMaidCookLastSyncTime,
+  getLocalVisitors, saveLocalVisitors, setVisitorLastSyncTime,
+  clearSyncData,
+} from '../src/services/storage';
 import {
   downloadAllPhotos,
   cleanupExpiredPhotos,
   importPhotosFromBase64,
   attachLocalPhotosById,
   clearAllPhotos,
+  MAIDCOOK_PHOTOS_DIR_NAME,
 } from '../src/services/photos';
 const APPS_SCRIPT_URL = 'https://script.google.com/macros/s/AKfycby2yjp7UEvBdYIDzKjOyFInegp_9CA7LVhpmbHbqwnxdPYEI5WJE8BYki-3Dwrgfm7pkw/exec';
-const sheetUrl = (token: string) => APPS_SCRIPT_URL + '?action=get_csv&sheet=student%20id&token=' + encodeURIComponent(token);
-const maidsCooksSheetUrl = (token: string) => APPS_SCRIPT_URL + '?action=get_csv&gid=1522969277&token=' + encodeURIComponent(token);
+// Sheet GIDs: student_id=0, cooks_and_maids=1522969277, visitors=2129598920, visitor_log=63905656
+const sheetGids = { students: '0', maidsCooks: '1522969277', visitors: '2129598920' };
 const zipUrl = (token: string) => APPS_SCRIPT_URL + '?action=get_zip&token=' + encodeURIComponent(token);
-// Optional fallback when photo_url column is empty.
-// Use {id} placeholder, e.g. 'https://example.com/photos/{id}.jpg'
 const PHOTO_URL_TEMPLATE: string = '';
 
 function parseCSV(text: string): Record<string, string>[] {
@@ -68,14 +73,10 @@ export default function SyncScreen() {
   const [syncing, setSyncing] = useState(false);
   const [lastSync, setLastSync] = useState<string | null>(null);
   const [localCount, setLocalCount] = useState(0);
+  const [localCountMC, setLocalCountMC] = useState(0);
+  const [localCountV, setLocalCountV] = useState(0);
   const [syncResult, setSyncResult] = useState<string | null>(null);
   const [syncError, setSyncError] = useState<string | null>(null);
-
-  const [syncingMC, setSyncingMC] = useState(false);
-  const [lastSyncMC, setLastSyncMC] = useState<string | null>(null);
-  const [localCountMC, setLocalCountMC] = useState(0);
-  const [syncResultMC, setSyncResultMC] = useState<string | null>(null);
-  const [syncErrorMC, setSyncErrorMC] = useState<string | null>(null);
   const [clearing, setClearing] = useState(false);
 
   const [syncToken, setSyncToken] = useState('');
@@ -86,179 +87,12 @@ export default function SyncScreen() {
   const loadStatus = async () => {
     const residents = await getLocalResidents();
     setLocalCount(residents.length);
-    const syncTime = await getLastSyncTime();
-    setLastSync(syncTime);
-
     const maidsCooks = await getLocalMaidsCooks();
     setLocalCountMC(maidsCooks.length);
-    const syncTimeMC = await getMaidCookLastSyncTime();
-    setLastSyncMC(syncTimeMC);
-  };
-
-  const handleImportFromSheet = async () => {
-    if (!syncToken.trim()) { setSyncError('Enter password first'); return; }
-    setSyncing(true);
-    setSyncResult(null);
-    setSyncError(null);
-    try {
-      setSyncResult('Fetching sheet...');
-      const response = await fetch(sheetUrl(syncToken));
-      if (!response.ok) throw new Error('Failed to fetch sheet: ' + response.status);
-      const rawText = await response.text();
-      // Apps Script returns JSON error for invalid token
-      if (rawText.trimStart().startsWith('{')) {
-        const errObj = JSON.parse(rawText);
-        if (!errObj.ok) throw new Error(errObj.error || 'Access denied');
-      }
-      const csvText = rawText;
-      const rows = parseCSV(csvText);
-      if (rows.length === 0) throw new Error('No data found in sheet');
-
-      setSyncResult(`Parsing ${rows.length} rows...`);
-      const existingResidents = await getLocalResidents();
-      const existingMap = new Map<string, Resident>();
-      for (const r of existingResidents) existingMap.set(r.id.toLowerCase(), r);
-
-      let added = 0, updated = 0, photoOnly = 0, dataOnly = 0, deleted = 0, skipped = 0;
-      const allResidents = new Map<string, Resident>();
-      for (const r of existingResidents) allResidents.set(r.id.toLowerCase(), r);
-
-      const photoOnlyIds: string[] = [];
-
-      for (const row of rows) {
-        const id = getCol(row, 'ID', 'Id', 'id');
-        if (!id) continue;
-
-        const updateFlag = getCol(row, 'update', 'Update', 'UPDATE').toLowerCase();
-        if (!updateFlag) { skipped++; continue; }
-
-        // Delete only needs ID
-        if (updateFlag === 'd') {
-          allResidents.delete(id.toLowerCase());
-          deleted++;
-          continue;
-        }
-
-        const name = getCol(row, 'Name', 'name', 'NAME');
-        if (!name) { skipped++; continue; }
-
-        const mobile = getCol(row, 'Mobile', 'mobile', 'MOBILE', 'Phone', 'phone');
-        const incoming = {
-          name,
-          unit: getCol(row, 'flat number', 'Flat', 'flat', 'FLAT', 'Unit', 'unit'),
-          aadhar_masked: getCol(row, 'Aadhar/SRMID', 'Aadhar', 'aadhar', 'AADHAR'),
-          phone_last4: mobile ? mobile.replace(/\D/g, '').slice(-4) : '',
-          photo_url: resolvePhotoUrl(id, row),
-          validity: getCol(row, 'ValidTill', 'Validity', 'validity', 'VALIDITY'),
-          vehicle_plate: getCol(row, 'Vehicle', 'vehicle', 'Vehicle Plate', 'vehicle_plate'),
-        };
-
-        const existing = existingMap.get(id.toLowerCase());
-
-        if (updateFlag === 'n') {
-          // New entry — add with full data + photo
-          allResidents.set(id.toLowerCase(), {
-            id,
-            ...incoming,
-            photo_base64: '',
-            local_photo: '',
-            status: 'active',
-            created_at: new Date().toISOString(),
-            updated_at: new Date().toISOString(),
-          });
-          added++;
-        } else if (updateFlag === 'u') {
-          // Full update — data + photo
-          const base = existing || { id, photo_base64: '', status: 'active', created_at: new Date().toISOString() };
-          allResidents.set(id.toLowerCase(), {
-            ...base,
-            ...incoming,
-            local_photo: '', // clear to re-download photo
-            updated_at: new Date().toISOString(),
-          });
-          updated++;
-        } else if (updateFlag === 'up') {
-          // Photo only — keep existing data, just refresh photo
-          if (existing) {
-            allResidents.set(id.toLowerCase(), {
-              ...existing,
-              photo_url: incoming.photo_url,
-              local_photo: '', // clear to re-download
-              updated_at: new Date().toISOString(),
-            });
-          }
-          photoOnlyIds.push(id);
-          photoOnly++;
-        } else if (updateFlag === 'ud') {
-          // Data only — update all fields except photo
-          if (existing) {
-            allResidents.set(id.toLowerCase(), {
-              ...existing,
-              ...incoming,
-              photo_url: existing.photo_url, // keep existing photo_url
-              local_photo: existing.local_photo, // keep existing local photo
-              updated_at: new Date().toISOString(),
-            });
-          } else {
-            allResidents.set(id.toLowerCase(), {
-              id,
-              ...incoming,
-              photo_base64: '',
-              local_photo: '',
-              status: 'active',
-              created_at: new Date().toISOString(),
-              updated_at: new Date().toISOString(),
-            });
-          }
-          dataOnly++;
-        } else {
-          skipped++;
-        }
-      }
-
-      const finalList = Array.from(allResidents.values());
-      const needsPhoto = added > 0 || updated > 0 || photoOnly > 0;
-
-      if (needsPhoto) {
-        setSyncResult(`N:${added} U:${updated} UP:${photoOnly} UD:${dataOnly} D:${deleted}. Downloading ZIP...`);
-        const zipRes = await fetch(zipUrl(syncToken), { redirect: 'follow' });
-        if (!zipRes.ok) throw new Error('Failed to download ZIP: ' + zipRes.status);
-        const zipBase64 = await zipRes.text();
-        if (zipBase64.trimStart().startsWith('{')) {
-          const errObj = JSON.parse(zipBase64);
-          if (!errObj.ok) throw new Error(errObj.error || 'ZIP access denied');
-        }
-        setSyncResult(`Extracting photos...`);
-        await importPhotosFromBase64(zipBase64, (done, total) => {
-          setSyncResult(`Extracting photos: ${done}/${total}`);
-        });
-      }
-
-      const withLocalById = await attachLocalPhotosById(finalList);
-
-      if (needsPhoto) {
-        setSyncResult(`Downloading fallback URL photos...`);
-        const withPhotos = await downloadAllPhotos(withLocalById, (done, total) => {
-          setSyncResult(`Photos: ${done}/${total}`);
-        });
-        setSyncResult(`Cleaning up expired photos...`);
-        const cleaned = await cleanupExpiredPhotos(withPhotos);
-        await saveLocalResidents(cleaned);
-        setLocalCount(cleaned.length);
-      } else {
-        await saveLocalResidents(withLocalById);
-        setLocalCount(withLocalById.length);
-      }
-
-      const now = new Date().toISOString();
-      await setLastSyncTime(now);
-      setLastSync(now);
-      setSyncResult(`Done! N:${added} U:${updated} UP:${photoOnly} UD:${dataOnly} D:${deleted} Skipped:${skipped}`);
-    } catch (error: any) {
-      setSyncError(`IMPORT FAILED: ${error?.message || 'Check connection & sheet URL'}`);
-    } finally {
-      setSyncing(false);
-    }
+    const visitors = await getLocalVisitors();
+    setLocalCountV(visitors.length);
+    const syncTime = await getLastSyncTime();
+    setLastSync(syncTime);
   };
 
   const formatSyncTime = (iso: string) => {
@@ -266,53 +100,110 @@ export default function SyncScreen() {
     return d.toLocaleString('en-IN', { day: '2-digit', month: 'short', year: 'numeric', hour: '2-digit', minute: '2-digit' });
   };
 
-  const handleImportMaidsCooks = async () => {
-    if (!syncToken.trim()) { setSyncErrorMC('Enter password first'); return; }
-    setSyncingMC(true);
-    setSyncResultMC(null);
-    setSyncErrorMC(null);
-    try {
-      setSyncResultMC('Fetching cooks & maids sheet...');
-      const response = await fetch(maidsCooksSheetUrl(syncToken));
-      if (!response.ok) throw new Error('Failed to fetch sheet: ' + response.status);
-      const rawText = await response.text();
-      if (rawText.trimStart().startsWith('{')) {
-        const errObj = JSON.parse(rawText);
-        if (!errObj.ok) throw new Error(errObj.error || 'Access denied');
-      }
-      const csvText = rawText;
-      const rows = parseCSV(csvText);
-      if (rows.length === 0) throw new Error('No data found in sheet');
+  const fetchCsv = async (opts: { gid?: string; sheet?: string }): Promise<Record<string, string>[]> => {
+    const res = await fetch(APPS_SCRIPT_URL, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ action: 'get_csv', ...opts, token: syncToken.trim() }),
+      redirect: 'follow',
+    });
+    if (!res.ok) throw new Error('Fetch failed: ' + res.status);
+    const raw = await res.text();
+    if (raw.trimStart().startsWith('{')) {
+      const err = JSON.parse(raw);
+      if (!err.ok) throw new Error(err.error || 'Access denied');
+    }
+    return parseCSV(raw);
+  };
 
-      setSyncResultMC(`Parsing ${rows.length} rows...`);
-      const existing = await getLocalMaidsCooks();
-      const existingMap = new Map<string, MaidCook>();
-      for (const m of existing) existingMap.set(m.id.toLowerCase(), m);
+  const processRows = <T extends { id: string }>(
+    rows: Record<string, string>[],
+    existing: T[],
+    buildEntry: (id: string, row: Record<string, string>, ex: T | undefined) => T,
+  ) => {
+    const existingMap = new Map<string, T>();
+    for (const e of existing) existingMap.set(e.id.toLowerCase(), e);
+    const all = new Map<string, T>();
+    for (const e of existing) all.set(e.id.toLowerCase(), e);
 
-      let added = 0, updated = 0, photoOnly = 0, dataOnly = 0, deleted = 0, skipped = 0;
-      const allMC = new Map<string, MaidCook>();
-      for (const m of existing) allMC.set(m.id.toLowerCase(), m);
+    let added = 0, updated = 0, photoOnly = 0, dataOnly = 0, deleted = 0, skipped = 0;
 
-      for (const row of rows) {
-        const id = getCol(row, 'ID', 'Id', 'id');
-        if (!id) continue;
+    for (const row of rows) {
+      const id = getCol(row, 'ID', 'Id', 'id');
+      if (!id) continue;
+      const flag = getCol(row, 'update', 'Update', 'UPDATE').toLowerCase() || 'n';
+      if (flag === 'd') { all.delete(id.toLowerCase()); deleted++; continue; }
+      const name = getCol(row, 'Name', 'name', 'NAME');
+      if (!name) { skipped++; continue; }
 
-        const updateFlag = getCol(row, 'update', 'Update', 'UPDATE').toLowerCase();
-        if (!updateFlag) { skipped++; continue; }
-
-        // Delete only needs ID
-        if (updateFlag === 'd') {
-          allMC.delete(id.toLowerCase());
-          deleted++;
-          continue;
+      const ex = existingMap.get(id.toLowerCase());
+      if (flag === 'n') { all.set(id.toLowerCase(), buildEntry(id, row, undefined)); added++; }
+      else if (flag === 'u') { all.set(id.toLowerCase(), buildEntry(id, row, ex)); updated++; }
+      else if (flag === 'up') {
+        if (ex) {
+          const mobile = getCol(row, 'Mobile', 'mobile', 'MOBILE', 'Phone', 'phone');
+          all.set(id.toLowerCase(), { ...ex, photo_url: resolvePhotoUrl(id, row), local_photo: '', updated_at: new Date().toISOString() } as any);
         }
+        photoOnly++;
+      } else if (flag === 'ud') {
+        all.set(id.toLowerCase(), buildEntry(id, row, ex));
+        dataOnly++;
+      } else { skipped++; }
+    }
 
-        const name = getCol(row, 'Name', 'name', 'NAME');
-        if (!name) { skipped++; continue; }
+    return { items: Array.from(all.values()), added, updated, photoOnly, dataOnly, deleted, skipped };
+  };
 
+  const handleSync = async () => {
+    if (!syncToken.trim()) { setSyncError('Enter password first'); return; }
+    setSyncing(true);
+    setSyncResult(null);
+    setSyncError(null);
+    try {
+      // ── 1. Fetch students ──
+      setSyncResult('Fetching students...');
+      const studentRows = await fetchCsv({ gid: sheetGids.students });
+
+      // ── 2. Fetch maids/cooks ──
+      setSyncResult('Fetching maids & cooks...');
+      const maidRows = await fetchCsv({ gid: sheetGids.maidsCooks });
+
+      // ── 3. Fetch visitors (optional – sheet may not exist yet) ──
+      let visitorRows: Record<string, string>[] = [];
+      try {
+        setSyncResult('Fetching visitors...');
+        visitorRows = await fetchCsv({ gid: sheetGids.visitors });
+      } catch (_) { /* visitors sheet may not exist yet */ }
+
+      // ── 4. Process students ──
+      setSyncResult(`Processing ${studentRows.length} students...`);
+      const existingResidents = await getLocalResidents();
+      const sResult = processRows<Resident>(studentRows, existingResidents, (id, row, ex) => {
         const mobile = getCol(row, 'Mobile', 'mobile', 'MOBILE', 'Phone', 'phone');
-        const incoming: Partial<MaidCook> = {
-          name,
+        const incoming = {
+          name: getCol(row, 'Name', 'name', 'NAME'),
+          unit: getCol(row, 'flat number', 'Flat', 'flat', 'FLAT', 'Unit', 'unit'),
+          aadhar_masked: getCol(row, 'Aadhar/SRMID', 'Aadhar', 'aadhar', 'AADHAR'),
+          phone_last4: mobile ? mobile.replace(/\D/g, '').slice(-4) : '',
+          photo_url: resolvePhotoUrl(id, row),
+          validity: getCol(row, 'ValidTill', 'Validity', 'validity', 'VALIDITY'),
+          vehicle_plate: getCol(row, 'Vehicle', 'vehicle', 'Vehicle Plate', 'vehicle_plate'),
+        };
+        const flag = getCol(row, 'update', 'Update', 'UPDATE').toLowerCase();
+        if (flag === 'ud' && ex) {
+          return { ...ex, ...incoming, photo_url: ex.photo_url, local_photo: ex.local_photo, updated_at: new Date().toISOString() };
+        }
+        const base = ex || { id, photo_base64: '', status: 'active', created_at: new Date().toISOString() } as any;
+        return { ...base, ...incoming, local_photo: flag === 'n' ? '' : (ex ? '' : ''), photo_base64: base.photo_base64 || '', updated_at: new Date().toISOString(), id, status: base.status || 'active', created_at: base.created_at || new Date().toISOString() };
+      });
+
+      // ── 5. Process maids/cooks ──
+      setSyncResult(`Processing ${maidRows.length} maids/cooks...`);
+      const existingMC = await getLocalMaidsCooks();
+      const mResult = processRows<MaidCook>(maidRows, existingMC, (id, row, ex) => {
+        const mobile = getCol(row, 'Mobile', 'mobile', 'MOBILE', 'Phone', 'phone');
+        const incoming = {
+          name: getCol(row, 'Name', 'name', 'NAME'),
           flats: getCol(row, 'flat number', 'Flat', 'flat', 'FLAT', 'Flats', 'flats'),
           aadhar_masked: getCol(row, 'Aadhar/SRMID', 'Aadhar', 'aadhar', 'AADHAR'),
           phone_last4: mobile ? mobile.replace(/\D/g, '').slice(-4) : '',
@@ -320,76 +211,129 @@ export default function SyncScreen() {
           validity: getCol(row, 'ValidTill', 'Validity', 'validity', 'VALIDITY'),
           vehicle_plate: getCol(row, 'Vehicle', 'vehicle', 'Vehicle Plate', 'vehicle_plate'),
         };
+        const flag = getCol(row, 'update', 'Update', 'UPDATE').toLowerCase();
+        if (flag === 'ud' && ex) {
+          return { ...ex, ...incoming, photo_url: ex.photo_url, local_photo: ex.local_photo, updated_at: new Date().toISOString() };
+        }
+        const base = ex || { id, photo_base64: '', status: 'active', created_at: new Date().toISOString() } as any;
+        return { ...base, ...incoming, local_photo: flag === 'n' ? '' : (ex ? '' : ''), photo_base64: base.photo_base64 || '', updated_at: new Date().toISOString(), id, status: base.status || 'active', created_at: base.created_at || new Date().toISOString() };
+      });
 
-        const ex = existingMap.get(id.toLowerCase());
+      // ── 6. Process visitors (no ID/update column – full replace) ──
+      let visitorCount = 0;
+      if (visitorRows.length > 0) {
+        setSyncResult(`Processing ${visitorRows.length} visitors...`);
+        const existingV = await getLocalVisitors();
+        // Build map of existing photos by id so we preserve them
+        const existingPhotoMap = new Map<string, string>();
+        const existingIdPhotoMap = new Map<string, string>();
+        const existingCardMap = new Map<string, string>();
+        for (const v of existingV) {
+          if (v.local_photo) existingPhotoMap.set(v.id.toLowerCase(), v.local_photo);
+          if (v.local_photo_id) existingIdPhotoMap.set(v.id.toLowerCase(), v.local_photo_id);
+          if (v.card_number) existingCardMap.set(v.id.toLowerCase(), v.card_number);
+        }
 
-        if (updateFlag === 'n') {
-          allMC.set(id.toLowerCase(), {
+        const visitors: Visitor[] = [];
+        for (const row of visitorRows) {
+          const name = getCol(row, 'Visitor Name', 'visitor name', 'Name', 'name');
+          const flat = getCol(row, 'Flat', 'flat', 'FLAT', 'flat number');
+          if (!name || !flat) continue;
+          const visitDate = getCol(row, 'Visit Date', 'visit date', 'Visit date');
+          // Generate stable ID from flat + name + visit date
+          const id = (flat + '_' + name + '_' + visitDate).replace(/[^A-Za-z0-9]/g, '_').toLowerCase();
+          const existingPhoto = existingPhotoMap.get(id) || '';
+          visitors.push({
             id,
-            ...incoming as any,
-            photo_base64: '',
-            local_photo: '',
+            name,
+            flat,
+            aadhar_last4: getCol(row, 'Last 4 digits of Adhaar', 'last 4 digits of adhaar', 'Adhaar', 'Aadhar'),
+            nature: getCol(row, 'Nature of Visitor', 'nature of visitor', 'Nature', 'nature'),
+            visit_date: visitDate,
+            requested_by: getCol(row, 'Request raised by', 'request raised by'),
+            check_in: getCol(row, 'Check In', 'check in', 'Check in'),
+            check_out: getCol(row, 'Check out', 'check out', 'Check Out'),
+            night_stay: getCol(row, 'Night Stay', 'night stay', 'Nights'),
+            office_status: getCol(row, 'EFOA Office Status', 'efoa office status', 'Status', 'status'),
+            local_photo: existingPhoto,
+            local_photo_id: existingIdPhotoMap.get(id) || '',
+            card_number: existingCardMap.get(id) || '',
             status: 'active',
             created_at: new Date().toISOString(),
             updated_at: new Date().toISOString(),
           });
-          added++;
-        } else if (updateFlag === 'u') {
-          const base = ex || { id, photo_base64: '', status: 'active', created_at: new Date().toISOString() };
-          allMC.set(id.toLowerCase(), {
-            ...base,
-            ...incoming as any,
-            local_photo: '',
-            updated_at: new Date().toISOString(),
-          });
-          updated++;
-        } else if (updateFlag === 'up') {
-          if (ex) {
-            allMC.set(id.toLowerCase(), {
-              ...ex,
-              photo_url: incoming.photo_url || ex.photo_url,
-              local_photo: '',
-              updated_at: new Date().toISOString(),
-            });
-          }
-          photoOnly++;
-        } else if (updateFlag === 'ud') {
-          if (ex) {
-            allMC.set(id.toLowerCase(), {
-              ...ex,
-              ...incoming as any,
-              photo_url: ex.photo_url,
-              local_photo: ex.local_photo,
-              updated_at: new Date().toISOString(),
-            });
-          } else {
-            allMC.set(id.toLowerCase(), {
-              id,
-              ...incoming as any,
-              photo_base64: '',
-              local_photo: '',
-              status: 'active',
-              created_at: new Date().toISOString(),
-              updated_at: new Date().toISOString(),
-            });
-          }
-          dataOnly++;
-        } else {
-          skipped++;
         }
+        visitorCount = visitors.length;
+        await saveLocalVisitors(visitors);
+        setLocalCountV(visitors.length);
+        await setVisitorLastSyncTime(new Date().toISOString());
       }
 
-      const finalList = Array.from(allMC.values());
-      await saveLocalMaidsCooks(finalList);
+      // ── 7. Download & extract photos ZIP ──
+      const needsPhoto = sResult.added > 0 || sResult.updated > 0 || sResult.photoOnly > 0 ||
+                          mResult.added > 0 || mResult.updated > 0 || mResult.photoOnly > 0;
+
+      if (needsPhoto) {
+        setSyncResult('Downloading photos ZIP...');
+        const zipRes = await fetch(zipUrl(syncToken.trim()), { redirect: 'follow' });
+        if (!zipRes.ok) throw new Error('Failed to download ZIP: ' + zipRes.status);
+        const zipBase64 = await zipRes.text();
+        if (zipBase64.trimStart().startsWith('{')) {
+          const errObj = JSON.parse(zipBase64);
+          if (!errObj.ok) throw new Error(errObj.error || 'ZIP access denied');
+        }
+        setSyncResult('Extracting photos...');
+        await importPhotosFromBase64(zipBase64, (done, total) => {
+          setSyncResult(`Extracting photos: ${done}/${total}`);
+        });
+      }
+
+      // ── 8. Attach local photos ──
+      const studentsAttached = await attachLocalPhotosById(sResult.items);
+      const maidsAttached = await attachLocalPhotosById(mResult.items, MAIDCOOK_PHOTOS_DIR_NAME);
+
+      // ── 9. Save students ──
+      if (needsPhoto) {
+        setSyncResult('Downloading fallback URL photos...');
+        const withPhotos = await downloadAllPhotos(studentsAttached, (done, total) => {
+          setSyncResult(`Photos: ${done}/${total}`);
+        });
+        const cleaned = await cleanupExpiredPhotos(withPhotos);
+        await saveLocalResidents(cleaned);
+        setLocalCount(cleaned.length);
+      } else {
+        await saveLocalResidents(studentsAttached);
+        setLocalCount(studentsAttached.length);
+      }
+
+      // ── 10. Save maids/cooks (download photos from photo_url to separate dir) ──
+      const mcNeedsPhoto = mResult.added > 0 || mResult.updated > 0 || mResult.photoOnly > 0;
+      if (mcNeedsPhoto) {
+        setSyncResult('Downloading maid/cook photos...');
+        const mcWithPhotos = await downloadAllPhotos(maidsAttached, (done, total) => {
+          setSyncResult(`Maid/cook photos: ${done}/${total}`);
+        }, MAIDCOOK_PHOTOS_DIR_NAME);
+        await saveLocalMaidsCooks(mcWithPhotos);
+        setLocalCountMC(mcWithPhotos.length);
+      } else {
+        await saveLocalMaidsCooks(maidsAttached);
+        setLocalCountMC(maidsAttached.length);
+      }
+
       const now = new Date().toISOString();
+      await setLastSyncTime(now);
       await setMaidCookLastSyncTime(now);
-      setLocalCountMC(finalList.length);
-      setLastSyncMC(now);
-      setSyncResultMC(`Done! N:${added} U:${updated} UP:${photoOnly} UD:${dataOnly} D:${deleted} Skipped:${skipped}`);
+      setLastSync(now);
+
+      const parts: string[] = [];
+      if (studentRows.length > 0) parts.push(`Students: N${sResult.added} U${sResult.updated} D${sResult.deleted}`);
+      if (maidRows.length > 0) parts.push(`Maids: N${mResult.added} U${mResult.updated} D${mResult.deleted}`);
+      if (visitorRows.length > 0) parts.push(`Visitors: ${visitorCount}`);
+      setSyncResult('Done! ' + parts.join(' | '));
     } catch (error: any) {
-      setSyncErrorMC(`IMPORT FAILED: ${error?.message || 'Check connection & sheet URL'}`);
+      setSyncError(`SYNC FAILED: ${error?.message || 'Check connection'}`);
     } finally {
-      setSyncingMC(false);
+      setSyncing(false);
     }
   };
 
@@ -419,19 +363,23 @@ export default function SyncScreen() {
           </TouchableOpacity>
         </View>
 
-        {/* ── Students Sync Section ── */}
-        <View style={styles.sectionHeader}>
-          <Ionicons name="school" size={18} color="#D97706" />
-          <Text style={styles.sectionTitle}>STUDENTS</Text>
-        </View>
-
-        {/* Status */}
+        {/* ── Status Card ── */}
         <View style={styles.statusCard}>
           <View style={styles.statusRow}>
-            <Ionicons name="folder" size={24} color="#78350F" />
+            <Ionicons name="school" size={22} color="#78350F" />
             <View style={styles.statusInfo}>
-              <Text style={styles.statusLabel}>LOCAL DATABASE</Text>
-              <Text style={styles.statusValue}>{localCount} RESIDENTS</Text>
+              <Text style={styles.statusLabel}>STUDENTS</Text>
+              <Text style={styles.statusValue}>{localCount}</Text>
+            </View>
+            <Ionicons name="restaurant" size={22} color="#78350F" />
+            <View style={styles.statusInfo}>
+              <Text style={styles.statusLabel}>MAIDS/COOKS</Text>
+              <Text style={styles.statusValue}>{localCountMC}</Text>
+            </View>
+            <Ionicons name="person-add" size={22} color="#78350F" />
+            <View style={styles.statusInfo}>
+              <Text style={styles.statusLabel}>VISITORS</Text>
+              <Text style={styles.statusValue}>{localCountV}</Text>
             </View>
           </View>
           <View style={styles.divider} />
@@ -444,22 +392,21 @@ export default function SyncScreen() {
           </View>
         </View>
 
-        {/* Import from Sheet Button */}
+        {/* ── Sync Button ── */}
         <TouchableOpacity
           testID="import-sheet-btn"
           style={[styles.importBtn, syncing && styles.btnDisabled]}
-          onPress={handleImportFromSheet}
+          onPress={handleSync}
           disabled={syncing}
         >
           {syncing ? <ActivityIndicator color="#FFFFFF" /> : (
             <>
               <Ionicons name="cloud-download" size={24} color="#FFFFFF" />
-              <Text style={styles.importBtnText}>UPDATE DATA</Text>
+              <Text style={styles.importBtnText}>SYNC ALL DATA</Text>
             </>
           )}
         </TouchableOpacity>
 
-        {/* Messages */}
         {syncResult && (
           <View testID="sync-success" style={styles.successBox}>
             <Ionicons name="checkmark-circle" size={20} color="#00C853" />
@@ -478,65 +425,14 @@ export default function SyncScreen() {
           <Text style={styles.offlineText}>INTERNET REQUIRED ONLY FOR SYNC</Text>
         </View>
 
-        {/* ── Maid / Cook Sync Section ── */}
-        <View style={[styles.sectionHeader, { marginTop: 32 }]}>
-          <Ionicons name="restaurant" size={18} color="#D97706" />
-          <Text style={styles.sectionTitle}>MAIDS & COOKS</Text>
-        </View>
-
-        <View style={styles.statusCard}>
-          <View style={styles.statusRow}>
-            <Ionicons name="folder" size={24} color="#78350F" />
-            <View style={styles.statusInfo}>
-              <Text style={styles.statusLabel}>LOCAL DATABASE</Text>
-              <Text style={styles.statusValue}>{localCountMC} MAIDS & COOKS</Text>
-            </View>
-          </View>
-          <View style={styles.divider} />
-          <View style={styles.statusRow}>
-            <Ionicons name="time" size={24} color="#78350F" />
-            <View style={styles.statusInfo}>
-              <Text style={styles.statusLabel}>LAST SYNCED</Text>
-              <Text style={styles.statusValue}>{lastSyncMC ? formatSyncTime(lastSyncMC) : 'NEVER'}</Text>
-            </View>
-          </View>
-        </View>
-
-        <TouchableOpacity
-          testID="import-maidcook-btn"
-          style={[styles.importBtn, { backgroundColor: '#78350F' }, syncingMC && styles.btnDisabled]}
-          onPress={handleImportMaidsCooks}
-          disabled={syncingMC}
-        >
-          {syncingMC ? <ActivityIndicator color="#FFFFFF" /> : (
-            <>
-              <Ionicons name="cloud-download" size={24} color="#FFFFFF" />
-              <Text style={styles.importBtnText}>UPDATE MAIDS & COOKS</Text>
-            </>
-          )}
-        </TouchableOpacity>
-
-        {syncResultMC && (
-          <View style={styles.successBox}>
-            <Ionicons name="checkmark-circle" size={20} color="#00C853" />
-            <Text style={styles.successText}>{syncResultMC}</Text>
-          </View>
-        )}
-        {syncErrorMC && (
-          <View style={styles.errorBox}>
-            <Ionicons name="alert-circle" size={20} color="#FF3B30" />
-            <Text style={styles.errorText}>{syncErrorMC}</Text>
-          </View>
-        )}
-
         {/* ── Clear All Data ── */}
         <View style={{ marginTop: 32, borderTopWidth: 1, borderTopColor: '#E2E8F0', paddingTop: 24 }}>
           <TouchableOpacity
-            style={[styles.clearBtn, (clearing || syncing || syncingMC) && styles.btnDisabled]}
+            style={[styles.clearBtn, (clearing || syncing) && styles.btnDisabled]}
             onPress={() => {
               Alert.alert(
                 'Clear All Data',
-                'This will delete ALL residents, maids/cooks, photos, and logs. You will need to sync again from scratch.\n\nAre you sure?',
+                'This will delete ALL residents, maids/cooks, visitors, photos, and logs. You will need to sync again.\n\nAre you sure?',
                 [
                   { text: 'Cancel', style: 'cancel' },
                   {
@@ -549,10 +445,9 @@ export default function SyncScreen() {
                         await clearAllPhotos();
                         setLocalCount(0);
                         setLocalCountMC(0);
+                        setLocalCountV(0);
                         setLastSync(null);
-                        setLastSyncMC(null);
                         setSyncResult(null);
-                        setSyncResultMC(null);
                         Alert.alert('Done', 'All data and photos cleared.');
                       } catch (e: any) {
                         Alert.alert('Error', e.message || 'Failed to clear data');
@@ -564,7 +459,7 @@ export default function SyncScreen() {
                 ],
               );
             }}
-            disabled={clearing || syncing || syncingMC}
+            disabled={clearing || syncing}
           >
             {clearing ? <ActivityIndicator color="#FFFFFF" /> : (
               <>

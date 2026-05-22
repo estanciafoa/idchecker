@@ -8,7 +8,7 @@ import { useFocusEffect } from '@react-navigation/native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import HamburgerMenu from '../src/components/HamburgerMenu';
 import { fs } from '../src/utils/scale';
-import { getLocalResidents, getLocalMaidsCooks, type Resident, type MaidCook, clearAllData } from '../src/services/storage';
+import { getLocalResidents, getLocalMaidsCooks, type Resident, type MaidCook, clearAllData, addAccessLog, type AccessLogEntry } from '../src/services/storage';
 import PasswordLock from '../src/components/PasswordLock';
 
 export default function AdminScreen() {
@@ -57,6 +57,16 @@ export default function AdminScreen() {
   const confirmClearData = async () => {
     setClearing(true);
     try {
+      // Audit log before clearing
+      const auditEntry: AccessLogEntry = {
+        id: Date.now().toString(),
+        resident_id: 'ADMIN',
+        resident_name: 'ADMIN_ACTION',
+        unit: 'N/A',
+        timestamp: new Date().toISOString(),
+        status: 'clear_all_data',
+      };
+      await addAccessLog(auditEntry);
       await clearAllData();
       setShowClearConfirm(false);
       setResidents([]);

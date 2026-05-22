@@ -309,7 +309,12 @@
       var pw = document.getElementById('gatePassword').value;
       if (pw === 'Admin2026') {
         _adminToken = pw;
+        document.getElementById('gatePassword').value = '';
+        document.getElementById('gatePassword').blur();
         document.getElementById('passwordGate').style.display = 'none';
+        // Load sheet iframe only after login to prevent password leaking into cells
+        var iframe = document.getElementById('sheetEmbed');
+        iframe.src = 'https://docs.google.com/spreadsheets/d/1EDvYjDQVIpwib5PmQ5sbSchJI_B5HNHWNomXRLOxtk4/edit?rm=minimal&gid=0';
       } else {
         document.getElementById('gateError').style.display = 'block';
         document.getElementById('gatePassword').value = '';
@@ -334,7 +339,7 @@
           <button class="btn btn-sm" type="button" onclick="window.open('https://docs.google.com/spreadsheets/d/1EDvYjDQVIpwib5PmQ5sbSchJI_B5HNHWNomXRLOxtk4/edit#gid=0','sheetEditor','width=1200,height=800,menubar=no,toolbar=no')">Open Editor ↗</button>
         </div>
         <iframe id="sheetEmbed"
-          src="https://docs.google.com/spreadsheets/d/1EDvYjDQVIpwib5PmQ5sbSchJI_B5HNHWNomXRLOxtk4/edit?rm=minimal&gid=0"
+          src="about:blank"
           style="width:100%;flex:1;border:1px solid var(--border);border-radius:8px;background:#fff"
           loading="lazy" allow="clipboard-read; clipboard-write"></iframe>
       </div>

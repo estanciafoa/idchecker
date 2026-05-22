@@ -135,3 +135,78 @@ export async function pushLogsToGoogleDrive(logs: Array<{
     throw error;
   }
 }
+
+export async function uploadVisitorCheckin(data: {
+  visitor: { id: string; name: string; flat: string; phone: string; aadhar: string; purpose: string };
+  photoBase64: string;
+  idPhotoBase64?: string;
+  timestamp: string;
+}): Promise<{ uploaded: boolean; fileName?: string }> {
+  const payload: any = {
+    action: 'upload_visitor_checkin',
+    visitor: data.visitor,
+    photoBase64: data.photoBase64,
+    timestamp: data.timestamp,
+  };
+  if (data.idPhotoBase64) payload.idPhotoBase64 = data.idPhotoBase64;
+
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), 30000);
+
+  try {
+    const res = await fetch(APPS_SCRIPT_URL, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+      signal: controller.signal,
+      redirect: 'follow',
+    });
+    clearTimeout(timeoutId);
+
+    if (!res.ok) throw new Error('Visitor upload failed: ' + res.statusText);
+    const result = await res.json();
+    if (!result.ok) throw new Error(result.error || 'Visitor upload failed');
+    return result.result;
+  } catch (error: any) {
+    clearTimeout(timeoutId);
+    if (error.name === 'AbortError') {
+      throw new Error('Upload timed out - check internet connection');
+    }
+    throw error;
+  }
+}
+
+// Push maid/cook attendance logs to Google Sheet "maid/cook log" tab
+export async function pushMaidCookAttendance(entries: Array<{
+  id: string;
+  maid_cook_id: string;
+  name: string;
+  flat: string;
+  direction: 'IN' | 'OUT';
+  timestamp: string;
+}>): Promise<{ rowsAppended: number }> {
+  const payload = {
+    action: 'upload_maid_cook_attendance',
+    entries,
+  };
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), 30000);
+  try {
+    const res = await fetch(APPS_SCRIPT_URL, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+      signal: controller.signal,
+      redirect: 'follow',
+    });
+    clearTimeout(timeoutId);
+    if (!res.ok) throw new Error('Attendance upload failed: ' + res.statusText);
+    const data = await res.json();
+    if (!data.ok) throw new Error(data.error || 'Attendance upload failed');
+    return data.result;
+  } catch (error: any) {
+    clearTimeout(timeoutId);
+    if (error.name === 'AbortError') throw new Error('Upload timed out');
+    throw error;
+  }
+}

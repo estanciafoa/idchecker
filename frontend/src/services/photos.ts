@@ -15,9 +15,10 @@ import JSZip from 'jszip';
 import { type Resident } from './storage';
 
 const PHOTOS_DIR_NAME = 'resident_photos';
+export const MAIDCOOK_PHOTOS_DIR_NAME = 'maidcook_photos';
 
-async function getPhotosDir(): Promise<Directory> {
-  const dir = new Directory(Paths.document, PHOTOS_DIR_NAME);
+async function getPhotosDir(dirName: string = PHOTOS_DIR_NAME): Promise<Directory> {
+  const dir = new Directory(Paths.document, dirName);
   if (!dir.exists) {
     dir.create();
   }
@@ -51,12 +52,12 @@ function toDirectUrl(url: string): string {
   return url;
 }
 
-function getLegacyPhotosDirPath(): string {
-  return `${documentDirectory}${PHOTOS_DIR_NAME}`;
+function getLegacyPhotosDirPath(dirName: string = PHOTOS_DIR_NAME): string {
+  return `${documentDirectory}${dirName}`;
 }
 
-async function ensureLegacyPhotosDir(): Promise<string> {
-  const dir = getLegacyPhotosDirPath();
+async function ensureLegacyPhotosDir(dirName: string = PHOTOS_DIR_NAME): Promise<string> {
+  const dir = getLegacyPhotosDirPath(dirName);
   const info = await getInfoAsync(dir);
   if (!info.exists) {
     await makeDirectoryAsync(dir, { intermediates: true });
@@ -88,11 +89,11 @@ function stemMatchesResidentId(stem: string, residentId: string): boolean {
  * Download a photo from URL and save to local file system.
  * Returns the local file URI or empty string if failed.
  */
-export async function downloadPhoto(residentId: string, photoUrl: string): Promise<string> {
+export async function downloadPhoto(residentId: string, photoUrl: string, dirName?: string): Promise<string> {
   if (!photoUrl) return '';
 
   try {
-    const dir = await getPhotosDir();
+    const dir = await getPhotosDir(dirName);
     const directUrl = toDirectUrl(photoUrl);
     const ext = getFileExtension(directUrl);
     const fileName = `${residentId}${ext}`;
@@ -116,10 +117,11 @@ export async function downloadPhoto(residentId: string, photoUrl: string): Promi
  * Download all photos for residents that have a photo_url but no local_photo.
  * Returns updated residents with local_photo paths.
  */
-export async function downloadAllPhotos(
-  residents: Resident[],
-  onProgress?: (done: number, total: number) => void
-): Promise<Resident[]> {
+export async function downloadAllPhotos<T extends { id: string; photo_url: string; local_photo: string }>(
+  residents: T[],
+  onProgress?: (done: number, total: number) => void,
+  dirName?: string
+): Promise<T[]> {
   const total = residents.filter(r => r.photo_url && !r.local_photo).length;
   let done = 0;
 
@@ -127,7 +129,7 @@ export async function downloadAllPhotos(
   for (let i = 0; i < updated.length; i++) {
     const r = updated[i];
     if (r.photo_url && !r.local_photo) {
-      const localUri = await downloadPhoto(r.id, r.photo_url);
+      const localUri = await downloadPhoto(r.id, r.photo_url, dirName);
       if (localUri) {
         updated[i] = { ...r, local_photo: localUri };
       }
@@ -283,12 +285,13 @@ export async function downloadPhotosFromDriveFolder(
 }
 
 /**
- * Populate local_photo using extracted local files with name = resident id.
+ * Populate local_photo using extracted local files with name = item id.
+ * Works for Resident, MaidCook, or any type with id + local_photo.
  */
-export async function attachLocalPhotosById(residents: Resident[]): Promise<Resident[]> {
-  const updated = [...residents];
-  const photosDir = await getPhotosDir();
-  const legacyDir = await ensureLegacyPhotosDir();
+export async function attachLocalPhotosById<T extends { id: string; local_photo: string }>(items: T[], dirName?: string): Promise<T[]> {
+  const updated = [...items];
+  const photosDir = await getPhotosDir(dirName);
+  const legacyDir = await ensureLegacyPhotosDir(dirName);
   const legacyNames = await readDirectoryAsync(legacyDir);
   const legacyImageNames = legacyNames.filter((n) => isImageFile(n));
 
@@ -350,9 +353,18 @@ export async function clearAllPhotos(): Promise<void> {
     if (dir.exists) dir.delete();
   } catch (_) {}
   try {
+    const mcDir = new Directory(Paths.document, MAIDCOOK_PHOTOS_DIR_NAME);
+    if (mcDir.exists) mcDir.delete();
+  } catch (_) {}
+  try {
     const legacyDir = getLegacyPhotosDirPath();
     const info = await getInfoAsync(legacyDir);
     if (info.exists) await deleteAsync(legacyDir, { idempotent: true });
+  } catch (_) {}
+  try {
+    const legacyMcDir = getLegacyPhotosDirPath(MAIDCOOK_PHOTOS_DIR_NAME);
+    const mcInfo = await getInfoAsync(legacyMcDir);
+    if (mcInfo.exists) await deleteAsync(legacyMcDir, { idempotent: true });
   } catch (_) {}
 }
 

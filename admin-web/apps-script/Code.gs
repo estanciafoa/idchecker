@@ -107,10 +107,45 @@ function doPost(e) {
     const payload = parsePayload_(e);
     requestId = String(payload.requestId || '').trim() || null;
 
+    // Handle CSV fetch via POST (token in body instead of URL)
+    if (payload.action === 'get_csv') {
+      validateToken_(payload.token);
+      var ssId = payload.ssId || DEFAULT_SPREADSHEET_ID;
+      var ss = SpreadsheetApp.openById(ssId);
+      var targetSheet;
+      var rawGid = payload.gid || (e.parameter && e.parameter.gid);
+      if (rawGid) {
+        var gid = Number(rawGid);
+        var sheets = ss.getSheets();
+        for (var i = 0; i < sheets.length; i++) {
+          if (sheets[i].getSheetId() === gid) { targetSheet = sheets[i]; break; }
+        }
+        if (!targetSheet) return jsonResponse_(false, null, 'Sheet with gid ' + gid + ' not found');
+      } else {
+        var sheetName = payload.sheet || (e.parameter && e.parameter.sheet) || 'student id';
+        targetSheet = ss.getSheetByName(sheetName);
+        if (!targetSheet) return jsonResponse_(false, null, 'Sheet "' + sheetName + '" not found');
+      }
+      var csvText = sheetToCsv_(targetSheet);
+      return ContentService.createTextOutput(csvText).setMimeType(ContentService.MimeType.CSV);
+    }
+
     // Handle log upload action (no token/sheetName validation needed for logs)
     if (payload.action === 'upload_logs') {
       var logResult = uploadLogsToDrive_(payload);
       return jsonResponse_(true, logResult, null);
+    }
+
+    // Handle visitor check-in upload (photo + info)
+    if (payload.action === 'upload_visitor_checkin') {
+      var visitorResult = uploadVisitorCheckin_(payload);
+      return jsonResponse_(true, visitorResult, null);
+    }
+
+    // Handle maid/cook attendance log upload
+    if (payload.action === 'upload_maid_cook_attendance') {
+      var attResult = uploadMaidCookAttendance_(payload);
+      return jsonResponse_(true, attResult, null);
     }
 
     validatePayload_(payload);
@@ -472,6 +507,96 @@ function uploadLogsToDrive_(payload) {
   folder.createFile(fileName, csvContent, 'text/csv');
 
   return { fileName: fileName, rowCount: payload.logs.length };
+}
+
+// ---- VISITOR CHECK-IN ----
+function uploadVisitorCheckin_(payload) {
+  var visitor = payload.visitor;
+  if (!visitor || !visitor.id) {
+    throw new Error('visitor object with id is required');
+  }
+  var timestamp = payload.timestamp || new Date().toISOString();
+
+  var photoFileName = null;
+  // Save photo to Drive
+  if (payload.photoBase64) {
+    var folderId = payload.folderId || '1HYUCLO1VmuA20XgQKGqxuBofg0YwvDkZ';
+    var folder = DriveApp.getFolderById(folderId);
+    var safeName = 'visitor_' + String(visitor.id).replace(/[^A-Za-z0-9_-]/g, '') +
+      '_' + timestamp.replace(/[:.]/g, '-') + '.jpg';
+    var bytes = Utilities.base64Decode(payload.photoBase64);
+    var blob = Utilities.newBlob(bytes, 'image/jpeg', safeName);
+    folder.createFile(blob);
+    photoFileName = safeName;
+  }
+
+  // Append to visitor_log sheet
+  var ss = SpreadsheetApp.openById(DEFAULT_SPREADSHEET_ID);
+  var sheet = ss.getSheetByName('visitor_log');
+  if (!sheet) {
+    sheet = ss.insertSheet('visitor_log');
+    sheet.getRange(1, 1, 1, 8).setValues([
+      ['Timestamp', 'Visitor ID', 'Name', 'Flat', 'Phone', 'Aadhar', 'Purpose', 'Photo File']
+    ]);
+  }
+  sheet.appendRow([
+    timestamp,
+    visitor.id || '',
+    visitor.name || '',
+    visitor.flat || '',
+    visitor.phone || '',
+    visitor.aadhar || '',
+    visitor.purpose || '',
+    photoFileName || ''
+  ]);
+
+  return { uploaded: true, fileName: photoFileName };
+}
+
+// ---- MAID/COOK ATTENDANCE LOG ----
+function uploadMaidCookAttendance_(payload) {
+  var entries = payload.entries;
+  if (!Array.isArray(entries) || entries.length === 0) {
+    throw new Error('entries array is required');
+  }
+
+  var ss = SpreadsheetApp.openById(DEFAULT_SPREADSHEET_ID);
+  var sheet = ss.getSheetByName('maid_cook_log');
+  if (!sheet) {
+    sheet = ss.insertSheet('maid_cook_log');
+    sheet.getRange(1, 1, 1, 6).setValues([
+      ['Timestamp', 'Maid/Cook ID', 'Name', 'Flat', 'Direction', 'Log ID']
+    ]);
+  }
+
+  // Read existing Log IDs to avoid duplicates
+  var lastRow = sheet.getLastRow();
+  var existingIds = {};
+  if (lastRow > 1) {
+    var logIdCol = 6; // column F
+    var ids = sheet.getRange(2, logIdCol, lastRow - 1, 1).getValues();
+    for (var i = 0; i < ids.length; i++) {
+      if (ids[i][0]) existingIds[String(ids[i][0])] = true;
+    }
+  }
+
+  var appended = 0;
+  for (var j = 0; j < entries.length; j++) {
+    var e = entries[j];
+    var logId = e.id || '';
+    if (logId && existingIds[String(logId)]) continue; // skip duplicate
+    sheet.appendRow([
+      e.timestamp || new Date().toISOString(),
+      e.maid_cook_id || '',
+      e.name || '',
+      e.flat || '',
+      e.direction || '',
+      logId
+    ]);
+    appended++;
+  }
+
+  return { rowsAppended: appended };
 }
 
 function jsonpResponse_(callbackName, bodyObject) {

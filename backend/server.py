@@ -1,4 +1,5 @@
-from fastapi import FastAPI, APIRouter, HTTPException
+from fastapi import FastAPI, APIRouter, HTTPException, Depends, Security
+from fastapi.security import APIKeyHeader
 from dotenv import load_dotenv
 from starlette.middleware.cors import CORSMiddleware
 from motor.motor_asyncio import AsyncIOMotorClient
@@ -12,6 +13,7 @@ from typing import List, Optional
 import uuid
 from datetime import datetime, timezone
 import httpx
+from urllib.parse import urlparse
 
 ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / '.env')
@@ -21,8 +23,17 @@ mongo_url = os.environ['MONGO_URL']
 client = AsyncIOMotorClient(mongo_url)
 db = client[os.environ['DB_NAME']]
 
+# API key auth
+API_KEY = os.environ.get('API_KEY', 'Admin2026')
+api_key_header = APIKeyHeader(name='X-API-Key', auto_error=False)
+
+async def verify_api_key(api_key: str = Security(api_key_header)):
+    if not api_key or api_key != API_KEY:
+        raise HTTPException(status_code=401, detail='Invalid or missing API key')
+    return api_key
+
 app = FastAPI()
-api_router = APIRouter(prefix="/api")
+api_router = APIRouter(prefix="/api", dependencies=[Depends(verify_api_key)])
 
 
 # Models
@@ -226,6 +237,11 @@ async def import_from_sheet(data: SheetImportRequest):
     """
     sheet_url = data.sheet_url.strip()
     
+    # Validate URL scheme - only allow HTTPS Google Sheets URLs
+    parsed = urlparse(sheet_url)
+    if parsed.scheme not in ('https',) or 'docs.google.com' not in (parsed.hostname or ''):
+        raise HTTPException(status_code=400, detail="Only Google Sheets HTTPS URLs are allowed")
+    
     # Convert pubhtml URL to CSV URL if needed
     if "pubhtml" in sheet_url:
         sheet_url = sheet_url.replace("pubhtml", "pub?output=csv")
@@ -346,14 +362,16 @@ async def root():
     return {"message": "Gate ID Check API", "status": "online"}
 
 
+ALLOWED_ORIGINS = os.environ.get('ALLOWED_ORIGINS', 'http://localhost:8080,http://localhost:19006').split(',')
+
 app.include_router(api_router)
 
 app.add_middleware(
     CORSMiddleware,
     allow_credentials=True,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_origins=[o.strip() for o in ALLOWED_ORIGINS],
+    allow_methods=["GET", "POST", "PUT", "DELETE"],
+    allow_headers=["Content-Type", "X-API-Key"],
 )
 
 logging.basicConfig(

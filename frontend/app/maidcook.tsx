@@ -1,21 +1,13 @@
-import React, { useState, useEffect, useCallback, useRef } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import {
-  View,
-  Text,
-  StyleSheet,
-  TouchableOpacity,
-  TextInput,
-  Platform,
-  ActivityIndicator,
-  KeyboardAvoidingView,
-  AppState,
-  Image,
+  View, Text, StyleSheet, TouchableOpacity, TextInput,
+  Platform, ActivityIndicator, KeyboardAvoidingView,
+  AppState, Image, FlatList, Modal, Alert, Keyboard,
 } from 'react-native';
 import { Audio } from 'expo-av';
-import { CameraView, useCameraPermissions } from 'expo-camera';
 import { Ionicons } from '@expo/vector-icons';
-import { useRouter } from 'expo-router';
 import { SafeAreaView } from 'react-native-safe-area-context';
+import * as Notifications from 'expo-notifications';
 import HamburgerMenu from '../src/components/HamburgerMenu';
 import { fs } from '../src/utils/scale';
 
@@ -25,80 +17,139 @@ const FAILURE_SOUND = require('../assets/sounds/failure.mp3');
 import {
   getMaidCookById,
   preloadMaidsCooks,
-  addAccessLog,
   type MaidCook,
-  type AccessLogEntry,
+  addMaidCookAttendance,
+  type MaidCookAttendanceEntry,
+  getCurrentlyInMaidsCooks,
+  getUnpushedAttendance,
+  markAttendancePushed,
+  getOverstayMaidsCooks,
 } from '../src/services/storage';
-import { postAccessLog } from '../src/services/api';
+import { pushMaidCookAttendance } from '../src/services/api';
+
+Notifications.setNotificationHandler({
+  handleNotification: async () => ({
+    shouldShowAlert: true,
+    shouldShowBanner: true,
+    shouldShowList: true,
+    shouldPlaySound: true,
+    shouldSetBadge: false,
+  }),
+});
 
 export default function MaidCookScreen() {
-  const router = useRouter();
-  const [permission, requestPermission] = useCameraPermissions();
-  const [scanned, setScanned] = useState(false);
-  const [maidCook, setMaidCook] = useState<MaidCook | null>(null);
-  const [showResult, setShowResult] = useState(false);
-  const [notFound, setNotFound] = useState(false);
+  const [count, setCount] = useState(0);
   const [manualId, setManualId] = useState('');
   const [loading, setLoading] = useState(false);
-  const [count, setCount] = useState(0);
-  const cameraRef = useRef<any>(null);
 
+  // Lookup result
+  const [maidCook, setMaidCook] = useState<MaidCook | null>(null);
+  const [notFound, setNotFound] = useState(false);
+
+  // Flat selection + IN/OUT
+  const [selectedFlat, setSelectedFlat] = useState('');
+  const [flatOptions, setFlatOptions] = useState<string[]>([]);
+
+  // Currently-in modal
+  const [showCurrentModal, setShowCurrentModal] = useState(false);
+  const [currentlyIn, setCurrentlyIn] = useState<{ maid_cook_id: string; name: string; flat: string; in_time: string }[]>([]);
+
+  // Input refs
+  const idInputRef = useRef<TextInput>(null);
+  const flatInputRef = useRef<TextInput>(null);
+
+  // Sounds
   const successSoundRef = useRef<Audio.Sound | null>(null);
   const failureSoundRef = useRef<Audio.Sound | null>(null);
 
+  // Keyboard visible (to show/hide Back button)
+  const [keyboardVisible, setKeyboardVisible] = useState(false);
+
+  // Periodic push timer
+  const pushIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const overstayIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
+
   useEffect(() => {
-    Audio.setAudioModeAsync({
-      playsInSilentModeIOS: true,
-      allowsRecordingIOS: false,
-      staysActiveInBackground: false,
-      shouldDuckAndroid: true,
-    }).catch(() => {});
-    // Preload sounds for instant playback
+    Audio.setAudioModeAsync({ playsInSilentModeIOS: true, allowsRecordingIOS: false, staysActiveInBackground: false, shouldDuckAndroid: true }).catch(() => {});
     Audio.Sound.createAsync(SUCCESS_SOUND).then(({ sound }) => { successSoundRef.current = sound; }).catch(() => {});
     Audio.Sound.createAsync(FAILURE_SOUND).then(({ sound }) => { failureSoundRef.current = sound; }).catch(() => {});
     preloadMaidsCooks().then(setCount);
+
+    // Request notification permission
+    Notifications.requestPermissionsAsync().catch(() => {});
+
+    // Track keyboard visibility
+    const kbShow = Keyboard.addListener(Platform.OS === 'ios' ? 'keyboardWillShow' : 'keyboardDidShow', () => setKeyboardVisible(true));
+    const kbHide = Keyboard.addListener(Platform.OS === 'ios' ? 'keyboardWillHide' : 'keyboardDidHide', () => setKeyboardVisible(false));
+
+    // Periodic push every 30 min
+    pushIntervalRef.current = setInterval(() => { autoPushAttendance(); }, 30 * 60 * 1000);
+    // Check overstay every 30 min
+    overstayIntervalRef.current = setInterval(() => { checkOverstay(); }, 30 * 60 * 1000);
+    // Initial checks after 5s
+    setTimeout(() => { autoPushAttendance(); checkOverstay(); }, 5000);
+
     const sub = AppState.addEventListener('change', (state) => {
-      if (state === 'active') preloadMaidsCooks().then(setCount);
+      if (state === 'active') {
+        preloadMaidsCooks().then(setCount);
+        checkOverstay();
+      }
     });
+
     return () => {
       sub.remove();
+      kbShow.remove();
+      kbHide.remove();
       successSoundRef.current?.unloadAsync();
       failureSoundRef.current?.unloadAsync();
+      if (pushIntervalRef.current) clearInterval(pushIntervalRef.current);
+      if (overstayIntervalRef.current) clearInterval(overstayIntervalRef.current);
     };
   }, []);
 
-  useEffect(() => {
-    if (!showResult) preloadMaidsCooks().then(setCount);
-  }, [showResult]);
-
-  const handleManualLookup = async () => {
-    if (!manualId.trim()) return;
-    setLoading(true);
-    await preloadMaidsCooks().then(setCount);
-    await lookupMaidCook(manualId.trim());
-    setLoading(false);
-    setManualId('');
+  const autoPushAttendance = async () => {
+    try {
+      const unpushed = await getUnpushedAttendance();
+      if (unpushed.length === 0) return;
+      const result = await pushMaidCookAttendance(unpushed);
+      if (result.rowsAppended >= 0) {
+        await markAttendancePushed(unpushed.map(e => e.id));
+      }
+    } catch (_) { /* will retry next interval */ }
   };
 
-  const handleManualIdChange = (value: string) => {
-    setManualId(value.replace(/[^0-9]/g, ''));
+  const checkOverstay = async () => {
+    try {
+      const overstay = await getOverstayMaidsCooks(8);
+      for (const m of overstay) {
+        await Notifications.scheduleNotificationAsync({
+          content: {
+            title: 'Maid/Cook Overstay Alert',
+            body: `${m.name} (Flat ${m.flat}) has been inside for ${Math.floor(m.hours)}+ hours and hasn't left yet.`,
+            sound: true,
+          },
+          trigger: null,
+        });
+      }
+    } catch (_) {}
   };
 
-  const handleBarCodeScanned = useCallback(async ({ data }: { data: string }) => {
-    if (scanned) return;
-    setScanned(true);
-    setLoading(true);
-    await lookupMaidCook(data.trim());
-    setLoading(false);
-  }, [scanned]);
+  const playSound = async (soundFile: any) => {
+    try {
+      const ref = soundFile === SUCCESS_SOUND ? successSoundRef : failureSoundRef;
+      if (ref.current) {
+        await ref.current.setPositionAsync(0);
+        await ref.current.playAsync();
+      }
+    } catch (_) {}
+  };
 
   const parseValidityDate = (validity: string): Date | null => {
     const text = validity.trim();
     let match = text.match(/^(\d{1,2})[./-](\d{1,2})[./-](\d{4})$/);
     if (match) {
       const [, day, month, year] = match;
-      const parsed = new Date(Number(year), Number(month) - 1, Number(day));
-      return isNaN(parsed.getTime()) ? null : parsed;
+      return new Date(Number(year), Number(month) - 1, Number(day));
     }
     const monthMap: Record<string, number> = {
       january: 0, february: 1, march: 2, april: 3, may: 4, june: 5,
@@ -109,252 +160,212 @@ export default function MaidCookScreen() {
       const [, day, monthName, year] = match;
       const month = monthMap[monthName.toLowerCase()];
       if (month === undefined) return null;
-      const parsed = new Date(Number(year), month, Number(day));
-      return isNaN(parsed.getTime()) ? null : parsed;
+      return new Date(Number(year), month, Number(day));
     }
     return null;
   };
 
   const isExpired = (mc: MaidCook): boolean => {
-    if (!mc.validity) return false;
-    if (mc.validity.toUpperCase().includes('BLACK LISTED')) return false;
-    const validityDate = parseValidityDate(mc.validity);
-    if (!validityDate) return false;
-    const today = new Date();
-    today.setHours(0, 0, 0, 0);
-    return validityDate < today;
+    if (!mc.validity || mc.validity.toUpperCase().includes('BLACK LISTED')) return false;
+    const d = parseValidityDate(mc.validity);
+    if (!d) return false;
+    const today = new Date(); today.setHours(0, 0, 0, 0);
+    return d < today;
   };
 
   const isBlackListed = (mc: MaidCook): boolean => {
-    if (!mc.validity) return false;
-    return mc.validity.toUpperCase().includes('BLACK LISTED');
+    return (mc.validity || '').toUpperCase().includes('BLACK LISTED');
   };
 
-  const playSound = async (soundFile: any) => {
-    try {
-      const ref = soundFile === SUCCESS_SOUND ? successSoundRef : failureSoundRef;
-      if (ref.current) {
-        await ref.current.setPositionAsync(0);
-        await ref.current.playAsync();
-      } else {
-        const { sound } = await Audio.Sound.createAsync(soundFile, { shouldPlay: true, volume: 1.0 });
-        sound.setOnPlaybackStatusUpdate((status) => {
-          if ('didJustFinish' in status && status.didJustFinish) sound.unloadAsync();
-        });
-      }
-    } catch (e) {
-      console.warn('Sound playback error:', e);
-    }
-  };
+  const handleManualIdChange = (value: string) => setManualId(value.replace(/[^0-9]/g, ''));
 
-  const lookupMaidCook = async (id: string) => {
-    const found = await getMaidCookById(id);
+  const handleLookup = async () => {
+    if (!manualId.trim()) return;
+    setLoading(true);
+    await preloadMaidsCooks().then(setCount);
+    const found = await getMaidCookById(manualId.trim());
     if (found) {
-      setMaidCook(found);
-      setNotFound(false);
       const denied = found.status !== 'active' || isExpired(found) || isBlackListed(found);
-      const logEntry: AccessLogEntry = {
-        id: Date.now().toString(),
-        resident_id: found.id,
-        resident_name: found.name,
-        unit: found.flats,
-        timestamp: new Date().toISOString(),
-        status: denied ? 'denied' : 'verified',
-      };
-      await addAccessLog(logEntry);
-      void postAccessLog({
-        resident_id: found.id,
-        resident_name: found.name,
-        unit: found.flats,
-        status: logEntry.status,
-      }).catch(() => {});
-      void playSound(denied ? FAILURE_SOUND : SUCCESS_SOUND);
+      if (denied) {
+        setMaidCook(found);
+        setNotFound(false);
+        setFlatOptions([]);
+        setSelectedFlat('');
+        playSound(FAILURE_SOUND);
+      } else {
+        setMaidCook(found);
+        setNotFound(false);
+        const flats = found.flats ? found.flats.split(',').map(f => f.trim()).filter(Boolean) : [];
+        setFlatOptions(flats);
+        setSelectedFlat('');
+        playSound(SUCCESS_SOUND);
+      }
     } else {
       setMaidCook(null);
       setNotFound(true);
-      void playSound(FAILURE_SOUND);
+      setFlatOptions([]);
+      setSelectedFlat('');
+      playSound(FAILURE_SOUND);
     }
-    setShowResult(true);
+    setLoading(false);
   };
 
-  const resetScan = () => {
-    setScanned(false);
-    setShowResult(false);
+  const handleInOut = async (direction: 'IN' | 'OUT') => {
+    if (!maidCook) return;
+    Keyboard.dismiss();
+    const entry: MaidCookAttendanceEntry = {
+      id: `${Date.now()}_${maidCook.id}_${direction}`,
+      maid_cook_id: maidCook.id,
+      name: maidCook.name,
+      flat: selectedFlat,
+      direction,
+      timestamp: new Date().toISOString(),
+    };
+    await addMaidCookAttendance(entry);
+    Alert.alert(
+      direction === 'IN' ? 'Checked IN' : 'Checked OUT',
+      `${maidCook.name}${selectedFlat ? ' → Flat ' + selectedFlat : ''} at ${new Date().toLocaleTimeString('en-IN', { hour: '2-digit', minute: '2-digit' })}`,
+    );
+    resetScreen();
+  };
+
+  const resetScreen = () => {
     setMaidCook(null);
     setNotFound(false);
-    preloadMaidsCooks().then(setCount);
+    setManualId('');
+    setSelectedFlat('');
+    setFlatOptions([]);
   };
 
-  // RESULT SCREEN
-  if (showResult) {
+  const handleShowCurrent = async () => {
+    const list = await getCurrentlyInMaidsCooks();
+    setCurrentlyIn(list);
+    setShowCurrentModal(true);
+  };
+
+  const formatTime = (iso: string) => {
+    const d = new Date(iso);
+    return d.toLocaleTimeString('en-IN', { hour: '2-digit', minute: '2-digit' });
+  };
+
+  const hoursAgo = (iso: string) => {
+    const diff = Date.now() - new Date(iso).getTime();
+    const h = Math.floor(diff / 3600000);
+    const m = Math.floor((diff % 3600000) / 60000);
+    return h > 0 ? `${h}h ${m}m ago` : `${m}m ago`;
+  };
+
+  // ── DENIED/INVALID RESULT ──
+  if (notFound || (maidCook && (maidCook.status !== 'active' || isExpired(maidCook) || isBlackListed(maidCook)))) {
     return (
       <SafeAreaView style={styles.container}>
-        {notFound ? (
-          <View style={styles.resultFull}>
-            <View style={[styles.statusBanner, styles.deniedBanner]}>
-              <Ionicons name="close-circle" size={48} color="#FFFFFF" />
-              <Text style={styles.bannerText}>DENIED</Text>
-            </View>
-            <View style={{ flex: 1, justifyContent: 'center', alignItems: 'center', padding: 24, backgroundColor: '#7F1D1D' }}>
-              <Ionicons name="warning" size={80} color="#FFFFFF" />
-              <Text style={styles.invalidIdText}>INVALID{"\n"}or FAKE ID</Text>
-              <Text style={styles.invalidIdSubtext}>This ID does not exist in the system.</Text>
-            </View>
-            <TouchableOpacity style={styles.scanNextBtn} onPress={resetScan}>
-              <Text style={styles.scanNextText}>SCAN NEXT</Text>
-            </TouchableOpacity>
+        <View style={styles.resultFull}>
+          <View style={[styles.statusBanner, styles.deniedBanner]}>
+            <Ionicons name="close-circle" size={48} color="#FFFFFF" />
+            <Text style={styles.bannerText}>
+              {notFound ? 'INVALID ID' : isBlackListed(maidCook!) ? 'BLACK LISTED' : isExpired(maidCook!) ? 'EXPIRED ID' : 'INACTIVE'}
+            </Text>
           </View>
-        ) : maidCook ? (
-          <View style={styles.resultFull}>
-            <View
-              style={[
-                styles.statusBanner,
-                (isBlackListed(maidCook) || isExpired(maidCook) || maidCook.status !== 'active')
-                  ? styles.deniedBanner
-                  : styles.verifiedBanner,
-              ]}
-            >
-              <Ionicons
-                name={(isBlackListed(maidCook) || isExpired(maidCook) || maidCook.status !== 'active') ? 'ban' : 'checkmark-circle'}
-                size={28}
-                color="#FFFFFF"
-              />
-              <Text style={styles.bannerText}>
-                {isBlackListed(maidCook) ? 'BLACK LISTED' : isExpired(maidCook) ? 'EXPIRED ID' : maidCook.status === 'active' ? 'VERIFIED' : 'INACTIVE'}
-              </Text>
-            </View>
-
-            <View style={styles.photoFull}>
-              {(maidCook.local_photo || maidCook.photo_url || maidCook.photo_base64) ? (
-                <>
-                  <Image
-                    source={{ uri: maidCook.local_photo || maidCook.photo_url || maidCook.photo_base64 }}
-                    style={styles.photoImage}
-                    resizeMode="cover"
-                  />
-                  {(isExpired(maidCook) || isBlackListed(maidCook)) && (
-                    <View style={styles.photoOverlay}>
-                      <Text style={styles.overlayText}>
-                        {isBlackListed(maidCook) ? 'BLACK\nLISTED' : 'EXPIRED\nID'}
-                      </Text>
-                    </View>
-                  )}
-                </>
+          {maidCook ? (
+            <View style={{ flex: 1, backgroundColor: '#7F1D1D', justifyContent: 'center', alignItems: 'center', padding: 24 }}>
+              {(maidCook.local_photo || maidCook.photo_url) ? (
+                <Image source={{ uri: maidCook.local_photo || maidCook.photo_url }} style={{ width: 150, height: 150, borderRadius: 75 }} />
               ) : (
-                <>
-                  <Text style={styles.photoFullInitial}>
-                    {maidCook.name.charAt(0).toUpperCase()}
-                  </Text>
-                  <Text style={styles.photoName}>{maidCook.name}</Text>
-                  {(isExpired(maidCook) || isBlackListed(maidCook)) && (
-                    <View style={styles.photoOverlay}>
-                      <Text style={styles.overlayText}>
-                        {isBlackListed(maidCook) ? 'BLACK\nLISTED' : 'EXPIRED\nID'}
-                      </Text>
-                    </View>
-                  )}
-                </>
+                <Text style={{ fontSize: fs(120), fontWeight: '900', color: '#FFFFFF' }}>{maidCook.name.charAt(0)}</Text>
               )}
-            </View>
-
-            <View style={styles.nameBar}>
-              <Text style={styles.nameText}>{maidCook.name}</Text>
-              <Text style={styles.validityText}>
-                {maidCook.validity ? (isBlackListed(maidCook) ? 'BLACK LISTED' : `Valid till: ${maidCook.validity}`) : ''}
+              <Text style={{ fontSize: fs(28), fontWeight: '900', color: '#FFFFFF', marginTop: 12 }}>{maidCook.name}</Text>
+              <Text style={{ fontSize: fs(16), color: '#FECACA', marginTop: 8 }}>
+                {isBlackListed(maidCook) ? 'This person is black listed' : isExpired(maidCook) ? `ID expired: ${maidCook.validity}` : 'Account inactive'}
               </Text>
             </View>
-
-            <View style={styles.infoBar}>
-              <View style={styles.infoItem}>
-                <Text style={styles.infoLabel}>ID</Text>
-                <Text style={styles.infoValue}>{maidCook.id}</Text>
-              </View>
-              <View style={styles.infoSep} />
-              <View style={styles.infoItem}>
-                <Text style={styles.infoLabel}>FLATS</Text>
-                <Text style={styles.infoValue} numberOfLines={2}>{maidCook.flats}</Text>
-              </View>
-              <View style={styles.infoSep} />
-              <View style={styles.infoItem}>
-                <Text style={styles.infoLabel}>PHONE</Text>
-                <Text style={styles.infoValue}>{maidCook.phone_last4 ? `••••${maidCook.phone_last4}` : 'N/A'}</Text>
-              </View>
+          ) : (
+            <View style={{ flex: 1, backgroundColor: '#7F1D1D', justifyContent: 'center', alignItems: 'center', padding: 24 }}>
+              <Ionicons name="warning" size={80} color="#FFFFFF" />
+              <Text style={{ fontSize: fs(40), fontWeight: '900', color: '#FFFFFF', textAlign: 'center', marginTop: 16 }}>INVALID{'\n'}or FAKE ID</Text>
+              <Text style={{ fontSize: fs(16), fontWeight: '700', color: '#FECACA', marginTop: 12 }}>This ID does not exist in the system.</Text>
             </View>
-
-            <TouchableOpacity style={styles.scanNextBtn} onPress={resetScan}>
-              <Ionicons name="scan" size={20} color="#FFFFFF" />
-              <Text style={styles.scanNextText}>SCAN NEXT</Text>
-            </TouchableOpacity>
-          </View>
-        ) : null}
+          )}
+          <TouchableOpacity style={styles.scanNextBtn} onPress={resetScreen}>
+            <Text style={styles.scanNextText}>TRY AGAIN</Text>
+          </TouchableOpacity>
+        </View>
       </SafeAreaView>
     );
   }
 
-  if (!permission) {
-    return (
-      <View style={styles.container}>
-        <ActivityIndicator size="large" color="#0055FF" />
-      </View>
-    );
-  }
-
-  if (!permission.granted) {
+  // ── VERIFIED RESULT: show flat selection + IN/OUT ──
+  if (maidCook) {
     return (
       <SafeAreaView style={styles.container}>
-        <KeyboardAvoidingView
-          style={styles.container}
-          behavior={Platform.OS === 'ios' ? 'padding' : 'height'}
-          keyboardVerticalOffset={Platform.OS === 'ios' ? 12 : 0}
-        >
-          <View style={styles.titleBar}>
-            <HamburgerMenu />
-            <Text style={styles.titleText}>MAID / COOK</Text>
-            <View style={{ width: 36 }} />
+        <View style={styles.resultFull}>
+          <View style={[styles.statusBanner, styles.verifiedBanner]}>
+            <Ionicons name="checkmark-circle" size={28} color="#FFFFFF" />
+            <Text style={styles.bannerText}>VERIFIED</Text>
           </View>
-          <View style={styles.statusBarRow}>
-            <View style={[styles.statusDot, count > 0 ? styles.dotOnline : styles.dotOffline]} />
-            <Text style={styles.statusText}>{count} MAIDS/COOKS IN LOCAL DB</Text>
-          </View>
-          <View style={styles.permissionBox}>
-            <Ionicons name="camera-outline" size={56} color="#78350F" />
-            <Text style={styles.permissionTitle}>CAMERA ACCESS</Text>
-            <Text style={styles.permissionText}>Grant camera to scan barcodes</Text>
-            <TouchableOpacity style={styles.actionButton} onPress={requestPermission}>
-              <Text style={styles.actionButtonText}>GRANT PERMISSION</Text>
-            </TouchableOpacity>
-          </View>
-          <View style={styles.manualSection}>
-            <Text style={styles.manualLabel}>MANUAL ID ENTRY</Text>
-            <View style={styles.manualRow}>
-              <TextInput
-                style={styles.manualInput}
-                value={manualId}
-                onChangeText={handleManualIdChange}
-                placeholder="e.g. 5124"
-                placeholderTextColor="#94A3B8"
-                keyboardType="number-pad"
-                maxLength={6}
-                returnKeyType="done"
-                onSubmitEditing={handleManualLookup}
-              />
-              <TouchableOpacity style={styles.lookupBtn} onPress={handleManualLookup} disabled={loading}>
-                {loading ? <ActivityIndicator color="#FFFFFF" size="small" /> : <Text style={styles.lookupBtnText}>LOOK UP</Text>}
-              </TouchableOpacity>
+
+          {/* Photo + Name section */}
+          <View style={styles.profileSection}>
+            {(maidCook.local_photo || maidCook.photo_url || maidCook.photo_base64) ? (
+              <Image source={{ uri: maidCook.local_photo || maidCook.photo_url || maidCook.photo_base64 }} style={styles.profilePhoto} resizeMode="cover" />
+            ) : (
+              <View style={styles.profileInitialCircle}>
+                <Text style={styles.profileInitial}>{maidCook.name.charAt(0).toUpperCase()}</Text>
+              </View>
+            )}
+            <View style={styles.profileInfo}>
+              <Text style={styles.profileName}>{maidCook.name}</Text>
+              <Text style={styles.profileDetail}>ID: {maidCook.id}</Text>
+              <Text style={styles.profileDetail}>Flats: {maidCook.flats}</Text>
+              {maidCook.validity && <Text style={styles.profileDetail}>Valid till: {maidCook.validity}</Text>}
             </View>
           </View>
-        </KeyboardAvoidingView>
+
+          {/* Flat number input */}
+          <View style={styles.flatSection}>
+            <Text style={styles.flatLabel}>GOING TO FLAT</Text>
+            <TextInput
+              ref={flatInputRef}
+              style={styles.flatInput}
+              value={selectedFlat}
+              onChangeText={(v) => setSelectedFlat(v.replace(/[^0-9]/g, ''))}
+              placeholder="Optional"
+              placeholderTextColor="#94A3B8"
+              keyboardType="number-pad"
+              maxLength={6}
+              autoFocus
+            />
+          </View>
+
+          {/* IN / OUT buttons */}
+          <View style={styles.inOutRow}>
+            <TouchableOpacity
+              style={[styles.inOutBtn, styles.inBtn]}
+              onPress={() => handleInOut('IN')}
+            >
+              <Ionicons name="log-in" size={32} color="#FFFFFF" />
+              <Text style={styles.inOutText}>IN</Text>
+            </TouchableOpacity>
+            <TouchableOpacity
+              style={[styles.inOutBtn, styles.outBtn]}
+              onPress={() => handleInOut('OUT')}
+            >
+              <Ionicons name="log-out" size={32} color="#FFFFFF" />
+              <Text style={styles.inOutText}>OUT</Text>
+            </TouchableOpacity>
+          </View>
+
+          <TouchableOpacity style={styles.cancelBtn} onPress={resetScreen}>
+            <Text style={styles.cancelText}>CANCEL</Text>
+          </TouchableOpacity>
+        </View>
       </SafeAreaView>
     );
   }
 
+  // ── MAIN INPUT SCREEN ──
   return (
     <SafeAreaView style={styles.container}>
-      <KeyboardAvoidingView
-        style={styles.container}
-        behavior={Platform.OS === 'ios' ? 'padding' : 'height'}
-        keyboardVerticalOffset={Platform.OS === 'ios' ? 12 : 0}
-      >
+      <KeyboardAvoidingView style={styles.container} behavior={Platform.OS === 'ios' ? 'padding' : 'height'}>
         <View style={styles.titleBar}>
           <HamburgerMenu />
           <Text style={styles.titleText}>MAID / COOK</Text>
@@ -364,51 +375,82 @@ export default function MaidCookScreen() {
           <View style={[styles.statusDot, count > 0 ? styles.dotOnline : styles.dotOffline]} />
           <Text style={styles.statusText}>{count} MAIDS/COOKS IN LOCAL DB</Text>
         </View>
-        {!scanned && (
-          <View style={styles.cameraContainer}>
-            <CameraView
-              ref={cameraRef}
-              style={styles.camera}
-              facing="back"
-              barcodeScannerSettings={{ barcodeTypes: ['qr', 'code128', 'code39', 'ean13', 'ean8'] }}
-              onBarcodeScanned={scanned ? undefined : handleBarCodeScanned}
-            />
-            <View style={styles.overlay}>
-              <View style={styles.viewfinder}>
-                <View style={[styles.corner, styles.cornerTL]} />
-                <View style={[styles.corner, styles.cornerTR]} />
-                <View style={[styles.corner, styles.cornerBL]} />
-                <View style={[styles.corner, styles.cornerBR]} />
-              </View>
-              <Text style={styles.scanHint}>ALIGN BARCODE WITHIN FRAME</Text>
-            </View>
-          </View>
-        )}
-        {scanned && loading && (
-          <View style={styles.loadingContainer}>
-            <ActivityIndicator size="large" color="#0055FF" />
-            <Text style={styles.loadingText}>LOOKING UP...</Text>
-          </View>
-        )}
-        <View style={styles.manualSection}>
-          <Text style={styles.manualLabel}>MANUAL ID ENTRY</Text>
-          <View style={styles.manualRow}>
+
+        <View style={styles.mainContent}>
+          <Ionicons name="person-circle" size={80} color="#78350F" />
+          <Text style={styles.promptText}>Enter Maid/Cook ID</Text>
+          <View style={styles.idInputRow}>
             <TextInput
-              style={styles.manualInput}
+              ref={idInputRef}
+              style={styles.idInput}
               value={manualId}
               onChangeText={handleManualIdChange}
-              placeholder="Enter Maid/Cook ID"
+              placeholder="e.g. 5124"
               placeholderTextColor="#94A3B8"
               keyboardType="number-pad"
               maxLength={6}
               returnKeyType="done"
-              onSubmitEditing={handleManualLookup}
+              onSubmitEditing={handleLookup}
+              autoFocus
             />
-            <TouchableOpacity style={styles.lookupBtn} onPress={handleManualLookup} disabled={loading}>
-              {loading ? <ActivityIndicator color="#FFFFFF" size="small" /> : <Ionicons name="search" size={22} color="#FFFFFF" />}
+            <TouchableOpacity style={styles.lookupBtn} onPress={handleLookup} disabled={loading || !manualId.trim()}>
+              {loading ? <ActivityIndicator color="#FFFFFF" size="small" /> : <Ionicons name="search" size={24} color="#FFFFFF" />}
             </TouchableOpacity>
           </View>
         </View>
+
+        <View style={styles.bottomButtons}>
+          {keyboardVisible && (
+            <TouchableOpacity style={styles.backBtn} onPress={() => { Keyboard.dismiss(); }}>
+              <Ionicons name="arrow-back" size={20} color="#FFFFFF" />
+              <Text style={styles.backBtnText}>Back</Text>
+            </TouchableOpacity>
+          )}
+          <TouchableOpacity style={styles.showCurrentBtn} onPress={handleShowCurrent}>
+            <Ionicons name="people" size={22} color="#FFFFFF" />
+            <Text style={styles.showCurrentText}>Show Current Maids/Cooks</Text>
+          </TouchableOpacity>
+        </View>
+
+        {/* Currently-In Modal */}
+        <Modal visible={showCurrentModal} animationType="slide" transparent>
+          <View style={styles.modalOverlay}>
+            <View style={styles.modalContent}>
+              <View style={styles.modalHeader}>
+                <Text style={styles.modalTitle}>Currently Inside</Text>
+                <TouchableOpacity onPress={() => setShowCurrentModal(false)}>
+                  <Ionicons name="close" size={28} color="#0F172A" />
+                </TouchableOpacity>
+              </View>
+              {currentlyIn.length === 0 ? (
+                <View style={styles.emptyState}>
+                  <Ionicons name="checkmark-circle" size={48} color="#00C853" />
+                  <Text style={styles.emptyText}>No maids/cooks currently inside</Text>
+                </View>
+              ) : (
+                <FlatList
+                  data={currentlyIn}
+                  keyExtractor={(item, idx) => `${item.maid_cook_id}_${item.flat}_${idx}`}
+                  renderItem={({ item }) => {
+                    const h = (Date.now() - new Date(item.in_time).getTime()) / 3600000;
+                    return (
+                      <View style={[styles.currentItem, h >= 8 && styles.currentItemAlert]}>
+                        <View style={styles.currentLeft}>
+                          <Text style={styles.currentName}>{item.name}</Text>
+                          <Text style={styles.currentFlat}>Flat {item.flat}</Text>
+                        </View>
+                        <View style={styles.currentRight}>
+                          <Text style={styles.currentTime}>IN: {formatTime(item.in_time)}</Text>
+                          <Text style={[styles.currentAgo, h >= 8 && styles.currentAgoAlert]}>{hoursAgo(item.in_time)}</Text>
+                        </View>
+                      </View>
+                    );
+                  }}
+                />
+              )}
+            </View>
+          </View>
+        </Modal>
       </KeyboardAvoidingView>
     </SafeAreaView>
   );
@@ -416,65 +458,67 @@ export default function MaidCookScreen() {
 
 const styles = StyleSheet.create({
   container: { flex: 1, backgroundColor: '#FFFFFF' },
-  titleBar: {
-    backgroundColor: '#78350F',
-    paddingVertical: 14,
-    paddingHorizontal: 16,
-    flexDirection: 'row',
-    alignItems: 'center',
-    justifyContent: 'space-between',
-  },
+  titleBar: { backgroundColor: '#78350F', paddingVertical: 14, paddingHorizontal: 16, flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between' },
   titleText: { fontSize: fs(20), fontWeight: '900', color: '#FFFBEB', letterSpacing: 2 },
   statusBarRow: { flexDirection: 'row', alignItems: 'center', padding: 12, paddingHorizontal: 24, backgroundColor: '#F8FAFC', borderBottomWidth: 1, borderBottomColor: '#E2E8F0' },
   statusDot: { width: 10, height: 10, borderRadius: 5, marginRight: 8 },
   dotOnline: { backgroundColor: '#00C853' },
   dotOffline: { backgroundColor: '#FFB300' },
   statusText: { fontSize: fs(12), fontWeight: '700', color: '#475569', letterSpacing: 1 },
-  cameraContainer: { flex: 1, position: 'relative' },
-  camera: { flex: 1 },
-  overlay: { ...StyleSheet.absoluteFillObject, justifyContent: 'center', alignItems: 'center', backgroundColor: 'rgba(0,0,0,0.4)' },
-  viewfinder: { width: 250, height: 250, position: 'relative' },
-  corner: { position: 'absolute', width: 40, height: 40, borderColor: '#FFFFFF' },
-  cornerTL: { top: 0, left: 0, borderTopWidth: 4, borderLeftWidth: 4 },
-  cornerTR: { top: 0, right: 0, borderTopWidth: 4, borderRightWidth: 4 },
-  cornerBL: { bottom: 0, left: 0, borderBottomWidth: 4, borderLeftWidth: 4 },
-  cornerBR: { bottom: 0, right: 0, borderBottomWidth: 4, borderRightWidth: 4 },
-  scanHint: { marginTop: 24, color: '#FFFFFF', fontSize: fs(14), fontWeight: '700', letterSpacing: 2 },
-  loadingContainer: { flex: 1, justifyContent: 'center', alignItems: 'center' },
-  loadingText: { marginTop: 16, fontSize: fs(16), fontWeight: '700', color: '#475569' },
-  manualSection: { padding: 16, paddingHorizontal: 24, backgroundColor: '#F8FAFC', borderTopWidth: 2, borderTopColor: '#000000' },
-  manualLabel: { fontSize: fs(12), fontWeight: '700', color: '#64748B', letterSpacing: 2, marginBottom: 8 },
-  manualRow: { flexDirection: 'row', gap: 8 },
-  manualInput: { flex: 1, height: 56, borderWidth: 2, borderColor: '#E2E8F0', paddingHorizontal: 16, fontSize: fs(18), fontWeight: '700', backgroundColor: '#FFFFFF' },
-  lookupBtn: { width: 80, height: 56, backgroundColor: '#0055FF', justifyContent: 'center', alignItems: 'center', borderWidth: 2, borderColor: '#000000' },
-  lookupBtnText: { color: '#FFFFFF', fontWeight: '900', fontSize: fs(13) },
-  permissionBox: { flex: 1, justifyContent: 'center', alignItems: 'center', padding: 24 },
-  permissionTitle: { fontSize: fs(22), fontWeight: '900', color: '#0F172A', marginTop: 16 },
-  permissionText: { fontSize: fs(15), color: '#475569', marginTop: 6 },
-  actionButton: { marginTop: 20, height: 56, paddingHorizontal: 28, backgroundColor: '#0055FF', justifyContent: 'center', alignItems: 'center', borderWidth: 2, borderColor: '#000000' },
-  actionButtonText: { color: '#FFFFFF', fontSize: fs(15), fontWeight: '900', letterSpacing: 1 },
+  mainContent: { flex: 1, justifyContent: 'center', alignItems: 'center', padding: 32 },
+  promptText: { fontSize: fs(22), fontWeight: '900', color: '#0F172A', marginTop: 16, marginBottom: 24 },
+  idInputRow: { flexDirection: 'row', gap: 8, width: '100%', maxWidth: 320 },
+  idInput: { flex: 1, height: 64, borderWidth: 2, borderColor: '#78350F', borderRadius: 8, paddingHorizontal: 20, fontSize: fs(24), fontWeight: '900', backgroundColor: '#FFFBEB', textAlign: 'center', letterSpacing: 4 },
+  lookupBtn: { width: 64, height: 64, backgroundColor: '#0055FF', justifyContent: 'center', alignItems: 'center', borderRadius: 8, borderWidth: 2, borderColor: '#000000' },
+  bottomButtons: { flexDirection: 'row', gap: 10, marginHorizontal: 16, marginBottom: 16 },
+  backBtn: { flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 6, backgroundColor: '#64748B', paddingVertical: 18, paddingHorizontal: 20, borderRadius: 8 },
+  backBtnText: { fontSize: fs(16), fontWeight: '900', color: '#FFFFFF' },
+  showCurrentBtn: { flex: 1, flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 10, backgroundColor: '#334155', paddingVertical: 18, borderRadius: 8 },
+  showCurrentText: { fontSize: fs(16), fontWeight: '900', color: '#FFFFFF', letterSpacing: 1 },
   resultFull: { flex: 1 },
   statusBanner: { height: 52, justifyContent: 'center', alignItems: 'center', flexDirection: 'row', gap: 10 },
   verifiedBanner: { backgroundColor: '#00C853' },
   deniedBanner: { backgroundColor: '#FF3B30' },
   bannerText: { fontSize: fs(24), fontWeight: '900', color: '#FFFFFF' },
-  notFoundText: { fontSize: fs(16), color: '#475569', textAlign: 'center', lineHeight: 24 },
-  invalidIdText: { fontSize: fs(48), fontWeight: '900', color: '#FFFFFF', textAlign: 'center', marginTop: 16, letterSpacing: 2 },
-  invalidIdSubtext: { fontSize: fs(16), fontWeight: '700', color: '#FECACA', textAlign: 'center', marginTop: 12 },
-  photoFull: { flex: 1, width: '100%', backgroundColor: '#0055FF', justifyContent: 'center', alignItems: 'center' },
-  photoImage: { width: '100%', height: '100%' },
-  photoOverlay: { ...StyleSheet.absoluteFillObject, justifyContent: 'center', alignItems: 'center', backgroundColor: 'transparent', transform: [{ rotate: '-35deg' }] },
-  overlayText: { fontSize: fs(72), fontWeight: '900', color: '#FF3B30', textAlign: 'center', lineHeight: fs(80), textShadowColor: '#000000', textShadowOffset: { width: 2, height: 2 }, textShadowRadius: 6, letterSpacing: 4 },
-  photoFullInitial: { fontSize: fs(200), fontWeight: '900', color: '#FFFFFF', opacity: 0.9 },
-  photoName: { fontSize: fs(28), fontWeight: '900', color: '#FFFFFF', marginTop: -10 },
-  nameBar: { backgroundColor: '#FFFFFF', paddingVertical: 12, paddingHorizontal: 20, borderBottomWidth: 1, borderBottomColor: '#E2E8F0', flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between' },
-  nameText: { fontSize: fs(22), fontWeight: '900', color: '#000000' },
-  validityText: { fontSize: fs(13), fontWeight: '700', color: '#475569' },
-  infoBar: { flexDirection: 'row', backgroundColor: '#0F172A', paddingVertical: 14, paddingHorizontal: 16 },
-  infoItem: { flex: 1, alignItems: 'center' },
-  infoLabel: { fontSize: fs(10), fontWeight: '700', color: '#94A3B8', letterSpacing: 1 },
-  infoValue: { fontSize: fs(16), fontWeight: '900', color: '#FFFFFF', marginTop: 4, textAlign: 'center' },
-  infoSep: { width: 1, backgroundColor: '#334155' },
+  profileSection: { flexDirection: 'row', padding: 20, backgroundColor: '#F1F5F9', gap: 16, alignItems: 'center' },
+  profilePhoto: { width: 100, height: 100, borderRadius: 50, borderWidth: 3, borderColor: '#78350F' },
+  profileInitialCircle: { width: 100, height: 100, borderRadius: 50, backgroundColor: '#0055FF', justifyContent: 'center', alignItems: 'center' },
+  profileInitial: { fontSize: fs(48), fontWeight: '900', color: '#FFFFFF' },
+  profileInfo: { flex: 1 },
+  profileName: { fontSize: fs(22), fontWeight: '900', color: '#0F172A' },
+  profileDetail: { fontSize: fs(14), color: '#475569', marginTop: 4, fontWeight: '600' },
+  flatSection: { padding: 20, backgroundColor: '#FFFFFF', borderBottomWidth: 1, borderBottomColor: '#E2E8F0' },
+  flatLabel: { fontSize: fs(13), fontWeight: '900', color: '#64748B', letterSpacing: 2, marginBottom: 12 },
+  flatOptions: { flexDirection: 'row', flexWrap: 'wrap', gap: 10 },
+  flatChip: { paddingVertical: 12, paddingHorizontal: 24, borderWidth: 2, borderColor: '#78350F', borderRadius: 8, backgroundColor: '#FFFBEB' },
+  flatChipSelected: { backgroundColor: '#78350F' },
+  flatChipText: { fontSize: fs(18), fontWeight: '900', color: '#78350F' },
+  flatChipTextSelected: { color: '#FFFFFF' },
+  flatSingle: { fontSize: fs(24), fontWeight: '900', color: '#78350F' },
+  flatInput: { height: 56, borderWidth: 2, borderColor: '#E2E8F0', borderRadius: 8, paddingHorizontal: 16, fontSize: fs(18), fontWeight: '700', backgroundColor: '#F8FAFC' },
+  inOutRow: { flex: 1, flexDirection: 'row', gap: 0 },
+  inOutBtn: { flex: 1, justifyContent: 'center', alignItems: 'center', gap: 8 },
+  inBtn: { backgroundColor: '#00C853' },
+  outBtn: { backgroundColor: '#FF3B30' },
+  inOutBtnDisabled: { opacity: 0.4 },
+  inOutText: { fontSize: fs(36), fontWeight: '900', color: '#FFFFFF', letterSpacing: 4 },
+  cancelBtn: { height: 56, backgroundColor: '#475569', justifyContent: 'center', alignItems: 'center' },
+  cancelText: { fontSize: fs(16), fontWeight: '900', color: '#FFFFFF', letterSpacing: 2 },
   scanNextBtn: { height: 100, backgroundColor: '#00C853', justifyContent: 'center', alignItems: 'center', flexDirection: 'row', gap: 10, borderWidth: 3, borderColor: '#00A844', elevation: 6 },
   scanNextText: { color: '#FFFFFF', fontSize: fs(20), fontWeight: '900', letterSpacing: 2 },
+  modalOverlay: { flex: 1, backgroundColor: 'rgba(0,0,0,0.5)', justifyContent: 'flex-end' },
+  modalContent: { backgroundColor: '#FFFFFF', borderTopLeftRadius: 20, borderTopRightRadius: 20, maxHeight: '80%', paddingBottom: 40 },
+  modalHeader: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', padding: 20, borderBottomWidth: 1, borderBottomColor: '#E2E8F0' },
+  modalTitle: { fontSize: fs(20), fontWeight: '900', color: '#0F172A' },
+  emptyState: { padding: 40, alignItems: 'center', gap: 12 },
+  emptyText: { fontSize: fs(16), color: '#475569', fontWeight: '600' },
+  currentItem: { flexDirection: 'row', padding: 16, paddingHorizontal: 20, borderBottomWidth: 1, borderBottomColor: '#F1F5F9' },
+  currentItemAlert: { backgroundColor: '#FEF2F2' },
+  currentLeft: { flex: 1 },
+  currentName: { fontSize: fs(16), fontWeight: '900', color: '#0F172A' },
+  currentFlat: { fontSize: fs(13), color: '#475569', marginTop: 2 },
+  currentRight: { alignItems: 'flex-end' },
+  currentTime: { fontSize: fs(14), fontWeight: '700', color: '#0F172A' },
+  currentAgo: { fontSize: fs(12), color: '#64748B', marginTop: 2 },
+  currentAgoAlert: { color: '#FF3B30', fontWeight: '700' },
 });

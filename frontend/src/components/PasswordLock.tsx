@@ -1,11 +1,24 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import {
   View, Text, StyleSheet, TextInput, TouchableOpacity,
   KeyboardAvoidingView, Platform, SafeAreaView,
 } from 'react-native';
 import { Ionicons } from '@expo/vector-icons';
 
-const ADMIN_PASSWORD = 'Admin2026';
+// Simple hash to avoid storing password in plaintext
+// Hash of 'Admin2026' using djb2
+const ADMIN_PASSWORD_HASH = -1832341192;
+const MAX_ATTEMPTS = 5;
+const LOCKOUT_MS = 60000; // 60 seconds
+
+function djb2Hash(str: string): number {
+  let hash = 5381;
+  for (let i = 0; i < str.length; i++) {
+    hash = ((hash << 5) + hash) + str.charCodeAt(i);
+    hash = hash & hash; // Convert to 32bit integer
+  }
+  return hash;
+}
 
 interface Props {
   onUnlock: () => void;
@@ -16,13 +29,40 @@ export default function PasswordLock({ onUnlock, title = 'ADMIN ACCESS' }: Props
   const [password, setPassword] = useState('');
   const [error, setError] = useState(false);
   const [showPassword, setShowPassword] = useState(false);
+  const [attempts, setAttempts] = useState(0);
+  const [lockedUntil, setLockedUntil] = useState<number | null>(null);
+  const [lockMsg, setLockMsg] = useState('');
+
+  useEffect(() => {
+    if (!lockedUntil) return;
+    const tick = setInterval(() => {
+      const remaining = Math.ceil((lockedUntil - Date.now()) / 1000);
+      if (remaining <= 0) {
+        setLockedUntil(null);
+        setLockMsg('');
+        setAttempts(0);
+        clearInterval(tick);
+      } else {
+        setLockMsg(`Too many attempts. Try again in ${remaining}s`);
+      }
+    }, 1000);
+    return () => clearInterval(tick);
+  }, [lockedUntil]);
 
   const handleSubmit = () => {
-    if (password === ADMIN_PASSWORD) {
+    if (lockedUntil && Date.now() < lockedUntil) return;
+    if (djb2Hash(password) === ADMIN_PASSWORD_HASH) {
       setError(false);
+      setAttempts(0);
       onUnlock();
     } else {
+      const next = attempts + 1;
+      setAttempts(next);
       setError(true);
+      if (next >= MAX_ATTEMPTS) {
+        setLockedUntil(Date.now() + LOCKOUT_MS);
+        setLockMsg(`Too many attempts. Try again in 60s`);
+      }
     }
   };
 
@@ -53,14 +93,19 @@ export default function PasswordLock({ onUnlock, title = 'ADMIN ACCESS' }: Props
           </TouchableOpacity>
         </View>
 
-        {error && (
+        {error && !lockMsg && (
           <Text testID="password-error" style={styles.errorText}>INCORRECT PASSWORD</Text>
         )}
 
+        {lockMsg ? (
+          <Text testID="password-error" style={styles.errorText}>{lockMsg}</Text>
+        ) : null}
+
         <TouchableOpacity
           testID="unlock-btn"
-          style={styles.unlockBtn}
+          style={[styles.unlockBtn, !!lockedUntil && { opacity: 0.4 }]}
           onPress={handleSubmit}
+          disabled={!!lockedUntil}
         >
           <Ionicons name="lock-open" size={20} color="#FFFFFF" />
           <Text style={styles.unlockText}>UNLOCK</Text>
