@@ -22,6 +22,7 @@ import {
   addPendingVisitorCheckin,
   hasCameraConsent,
   setCameraConsent,
+  getDeviceLocation,
   type Visitor,
   type AccessLogEntry,
 } from '../src/services/storage';
@@ -179,6 +180,7 @@ export default function VisitorsScreen() {
     }
 
     // Create access log
+    const location = await getDeviceLocation();
     const logEntry: AccessLogEntry = {
       id: Date.now().toString(),
       resident_id: selectedVisitor.id,
@@ -186,6 +188,7 @@ export default function VisitorsScreen() {
       unit: selectedVisitor.flat,
       timestamp: new Date().toISOString(),
       status: 'visitor_checkin',
+      location,
     };
     await addAccessLog(logEntry);
 
@@ -208,6 +211,7 @@ export default function VisitorsScreen() {
         },
         compositeBase64,
         timestamp: new Date().toISOString(),
+        location,
       });
       Alert.alert('Saved', 'Visitor check-in saved. It will be uploaded during the next log sync.');
     } catch (err: any) {

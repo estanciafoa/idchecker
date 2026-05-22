@@ -30,6 +30,7 @@ import {
   preloadResidents,
   type Resident,
   type AccessLogEntry,
+  getDeviceLocation,
 } from '../src/services/storage';
 import { postAccessLog } from '../src/services/api';
 
@@ -192,6 +193,7 @@ export default function ScannerScreen() {
       setResident(found);
       setNotFound(false);
       const denied = found.status !== 'active' || isExpired(found) || isBlackListed(found);
+      const location = await getDeviceLocation();
       const logEntry: AccessLogEntry = {
         id: Date.now().toString(),
         resident_id: found.id,
@@ -199,6 +201,7 @@ export default function ScannerScreen() {
         unit: found.unit,
         timestamp: new Date().toISOString(),
         status: denied ? 'denied' : 'verified',
+        location,
       };
       await addAccessLog(logEntry);
       void postAccessLog({
@@ -206,6 +209,7 @@ export default function ScannerScreen() {
         resident_name: found.name,
         unit: found.unit,
         status: logEntry.status,
+        location,
       }).catch(() => {});
       // Play success or failure sound based on status
       void playSound(denied ? FAILURE_SOUND : SUCCESS_SOUND);

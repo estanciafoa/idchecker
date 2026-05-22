@@ -24,6 +24,7 @@ import {
   getUnpushedAttendance,
   markAttendancePushed,
   getOverstayMaidsCooks,
+  getDeviceLocation,
 } from '../src/services/storage';
 import { pushMaidCookAttendance } from '../src/services/api';
 
@@ -213,6 +214,7 @@ export default function MaidCookScreen() {
   const handleInOut = async (direction: 'IN' | 'OUT') => {
     if (!maidCook) return;
     Keyboard.dismiss();
+    const location = await getDeviceLocation();
     const entry: MaidCookAttendanceEntry = {
       id: `${Date.now()}_${maidCook.id}_${direction}`,
       maid_cook_id: maidCook.id,
@@ -220,6 +222,7 @@ export default function MaidCookScreen() {
       flat: selectedFlat,
       direction,
       timestamp: new Date().toISOString(),
+      location,
     };
     await addMaidCookAttendance(entry);
     Alert.alert(
@@ -408,7 +411,7 @@ export default function MaidCookScreen() {
           )}
           <TouchableOpacity style={styles.showCurrentBtn} onPress={handleShowCurrent}>
             <Ionicons name="people" size={22} color="#FFFFFF" />
-            <Text style={styles.showCurrentText}>Show Current Maids/Cooks</Text>
+            <Text style={styles.showCurrentText}>Tower Status</Text>
           </TouchableOpacity>
         </View>
 
@@ -417,7 +420,7 @@ export default function MaidCookScreen() {
           <View style={styles.modalOverlay}>
             <View style={styles.modalContent}>
               <View style={styles.modalHeader}>
-                <Text style={styles.modalTitle}>Currently Inside</Text>
+                <Text style={styles.modalTitle}>Tower Status</Text>
                 <TouchableOpacity onPress={() => setShowCurrentModal(false)}>
                   <Ionicons name="close" size={28} color="#0F172A" />
                 </TouchableOpacity>

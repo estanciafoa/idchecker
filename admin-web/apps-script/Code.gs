@@ -486,7 +486,7 @@ function uploadLogsToDrive_(payload) {
   var folder = DriveApp.getFolderById(folderId);
 
   // Build CSV
-  var headers = ['timestamp', 'resident_id', 'resident_name', 'unit', 'status'];
+  var headers = ['timestamp', 'resident_id', 'resident_name', 'unit', 'status', 'location'];
   var csvRows = [headers.join(',')];
   payload.logs.forEach(function (log) {
     var row = headers.map(function (h) {
@@ -535,8 +535,8 @@ function uploadVisitorCheckin_(payload) {
   var sheet = ss.getSheetByName('visitor_log');
   if (!sheet) {
     sheet = ss.insertSheet('visitor_log');
-    sheet.getRange(1, 1, 1, 8).setValues([
-      ['Timestamp', 'Visitor ID', 'Name', 'Flat', 'Phone', 'Aadhar', 'Purpose', 'Photo File']
+    sheet.getRange(1, 1, 1, 9).setValues([
+      ['Timestamp', 'Visitor ID', 'Name', 'Flat', 'Phone', 'Aadhar', 'Purpose', 'Photo File', 'Location']
     ]);
   }
   sheet.appendRow([
@@ -547,7 +547,8 @@ function uploadVisitorCheckin_(payload) {
     visitor.phone || '',
     visitor.aadhar || '',
     visitor.purpose || '',
-    photoFileName || ''
+    photoFileName || '',
+    payload.location || ''
   ]);
 
   return { uploaded: true, fileName: photoFileName };
@@ -564,8 +565,8 @@ function uploadMaidCookAttendance_(payload) {
   var sheet = ss.getSheetByName('maid_cook_log');
   if (!sheet) {
     sheet = ss.insertSheet('maid_cook_log');
-    sheet.getRange(1, 1, 1, 6).setValues([
-      ['Timestamp', 'Maid/Cook ID', 'Name', 'Flat', 'Direction', 'Log ID']
+    sheet.getRange(1, 1, 1, 7).setValues([
+      ['Timestamp', 'Maid/Cook ID', 'Name', 'Flat', 'Direction', 'Log ID', 'Location']
     ]);
   }
 
@@ -591,7 +592,8 @@ function uploadMaidCookAttendance_(payload) {
       e.name || '',
       e.flat || '',
       e.direction || '',
-      logId
+      logId,
+      e.location || ''
     ]);
     appended++;
   }

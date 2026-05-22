@@ -11,12 +11,14 @@ const PENDING_VISITOR_CHECKINS_KEY = '@gate_check_pending_visitor_checkins';
 const CAMERA_CONSENT_KEY = '@gate_check_camera_consent';
 const MAID_COOK_ATTENDANCE_KEY = '@gate_check_maid_cook_attendance';
 const MAID_COOK_ATTENDANCE_PUSHED_KEY = '@gate_check_maid_cook_attendance_pushed';
+const DEVICE_LOCATION_KEY = '@gate_check_device_location';
 
 export interface PendingVisitorCheckin {
   id: string;
   visitor: { id: string; name: string; flat: string; phone: string; aadhar: string; purpose: string };
   compositeBase64: string;
   timestamp: string;
+  location?: string;
 }
 
 export interface Resident {
@@ -42,6 +44,7 @@ export interface AccessLogEntry {
   unit: string;
   timestamp: string;
   status: string;
+  location?: string;
 }
 
 export interface MaidCook {
@@ -392,6 +395,7 @@ export interface MaidCookAttendanceEntry {
   flat: string;         // flat they are going to
   direction: 'IN' | 'OUT';
   timestamp: string;    // ISO string
+  location?: string;    // device location (e.g. "Front Gate")
 }
 
 export async function getMaidCookAttendance(): Promise<MaidCookAttendanceEntry[]> {
@@ -457,4 +461,26 @@ export async function getOverstayMaidsCooks(maxHours: number = 8): Promise<{ mai
   return currentlyIn
     .map(m => ({ ...m, hours: Math.round((now - new Date(m.in_time).getTime()) / 3600000 * 10) / 10 }))
     .filter(m => m.hours >= maxHours);
+}
+
+// ---- Device Location ----
+export const LOCATION_OPTIONS = [
+  'Front Gate',
+  'Tower 1',
+  'Tower 2',
+  'Tower 3',
+  'Tower 4',
+  'Tower 5',
+  'Rear Gate',
+] as const;
+
+export type DeviceLocation = typeof LOCATION_OPTIONS[number];
+
+export async function getDeviceLocation(): Promise<string> {
+  const val = await AsyncStorage.getItem(DEVICE_LOCATION_KEY);
+  return val || '';
+}
+
+export async function setDeviceLocation(location: string): Promise<void> {
+  await AsyncStorage.setItem(DEVICE_LOCATION_KEY, location);
 }

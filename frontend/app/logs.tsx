@@ -13,8 +13,8 @@ import { Ionicons } from '@expo/vector-icons';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import HamburgerMenu from '../src/components/HamburgerMenu';
 import { fs } from '../src/utils/scale';
-import { getLocalAccessLogs, getPendingVisitorCheckins, removePendingVisitorCheckin, type AccessLogEntry } from '../src/services/storage';
-import { pushLogsToGoogleDrive, uploadVisitorCheckin } from '../src/services/api';
+import { getLocalAccessLogs, getPendingVisitorCheckins, removePendingVisitorCheckin, getUnpushedAttendance, markAttendancePushed, type AccessLogEntry } from '../src/services/storage';
+import { pushLogsToGoogleDrive, uploadVisitorCheckin, pushMaidCookAttendance } from '../src/services/api';
 
 export default function LogsScreen() {
   const [logs, setLogs] = useState<AccessLogEntry[]>([]);
@@ -38,8 +38,9 @@ export default function LogsScreen() {
 
   const handlePushLogs = async () => {
     const pendingCheckins = await getPendingVisitorCheckins();
-    if (logs.length === 0 && pendingCheckins.length === 0) {
-      Alert.alert('Nothing to Push', 'There are no logs or visitor check-ins to push.');
+    const unpushedAttendance = await getUnpushedAttendance();
+    if (logs.length === 0 && pendingCheckins.length === 0 && unpushedAttendance.length === 0) {
+      Alert.alert('Nothing to Push', 'There are no logs to push.');
       return;
     }
     setPushing(true);
@@ -48,7 +49,7 @@ export default function LogsScreen() {
       // Push access logs
       if (logs.length > 0) {
         const result = await pushLogsToGoogleDrive(logs);
-        results.push(`${result.rowCount} logs uploaded`);
+        results.push(`${result.rowCount} access logs uploaded`);
       }
 
       // Push pending visitor check-ins
@@ -59,6 +60,7 @@ export default function LogsScreen() {
             visitor: checkin.visitor,
             photoBase64: checkin.compositeBase64,
             timestamp: checkin.timestamp,
+            location: checkin.location,
           });
           await removePendingVisitorCheckin(checkin.id);
           checkinOk++;
@@ -68,6 +70,17 @@ export default function LogsScreen() {
       }
       if (checkinOk > 0) results.push(`${checkinOk} visitor check-in(s) uploaded`);
       if (checkinFail > 0) results.push(`${checkinFail} check-in(s) failed`);
+
+      // Push maid/cook attendance logs
+      if (unpushedAttendance.length > 0) {
+        try {
+          const attResult = await pushMaidCookAttendance(unpushedAttendance);
+          await markAttendancePushed(unpushedAttendance.map(e => e.id));
+          results.push(`${attResult.rowsAppended} maid/cook attendance(s) uploaded`);
+        } catch {
+          results.push(`Maid/cook attendance upload failed`);
+        }
+      }
 
       Alert.alert('Done', results.join('\n'));
     } catch (error: any) {

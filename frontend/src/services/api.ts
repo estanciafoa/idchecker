@@ -31,6 +31,7 @@ export async function postAccessLog(data: {
   resident_name: string;
   unit: string;
   status: string;
+  location?: string;
 }) {
   const res = await fetchWithTimeout(`${BACKEND_URL}/api/access-logs`, {
     method: 'POST',
@@ -103,6 +104,7 @@ export async function pushLogsToGoogleDrive(logs: Array<{
   unit: string;
   timestamp: string;
   status: string;
+  location?: string;
 }>): Promise<{ fileName: string; rowCount: number }> {
   const payload = {
     action: 'upload_logs',
@@ -141,12 +143,14 @@ export async function uploadVisitorCheckin(data: {
   photoBase64: string;
   idPhotoBase64?: string;
   timestamp: string;
+  location?: string;
 }): Promise<{ uploaded: boolean; fileName?: string }> {
   const payload: any = {
     action: 'upload_visitor_checkin',
     visitor: data.visitor,
     photoBase64: data.photoBase64,
     timestamp: data.timestamp,
+    location: data.location || '',
   };
   if (data.idPhotoBase64) payload.idPhotoBase64 = data.idPhotoBase64;
 
@@ -184,6 +188,7 @@ export async function pushMaidCookAttendance(entries: Array<{
   flat: string;
   direction: 'IN' | 'OUT';
   timestamp: string;
+  location?: string;
 }>): Promise<{ rowsAppended: number }> {
   const payload = {
     action: 'upload_maid_cook_attendance',
