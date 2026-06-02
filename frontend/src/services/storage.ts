@@ -12,6 +12,9 @@ const CAMERA_CONSENT_KEY = '@gate_check_camera_consent';
 const MAID_COOK_ATTENDANCE_KEY = '@gate_check_maid_cook_attendance';
 const MAID_COOK_ATTENDANCE_PUSHED_KEY = '@gate_check_maid_cook_attendance_pushed';
 const DEVICE_LOCATION_KEY = '@gate_check_device_location';
+const ACCESS_LOGS_PUSHED_KEY = '@gate_check_access_logs_pushed';
+const TAXI_LOG_KEY = '@gate_check_taxi_log';
+const TAXI_LOG_PUSHED_KEY = '@gate_check_taxi_log_pushed';
 
 export interface PendingVisitorCheckin {
   id: string;
@@ -157,8 +160,30 @@ export async function addAccessLog(log: AccessLogEntry): Promise<void> {
   const anonymized = { ...log, resident_name: anonymizeName(log.resident_name) };
   const logs = await getLocalAccessLogs();
   logs.unshift(anonymized);
-  const trimmed = logs.slice(0, 500);
+  const trimmed = logs.slice(0, 5000);
   await AsyncStorage.setItem(ACCESS_LOGS_KEY, JSON.stringify(trimmed));
+}
+
+/** Get the set of access log IDs already pushed */
+export async function getPushedAccessLogIds(): Promise<Set<string>> {
+  const data = await AsyncStorage.getItem(ACCESS_LOGS_PUSHED_KEY);
+  return new Set(data ? JSON.parse(data) : []);
+}
+
+/** Mark access log IDs as pushed */
+export async function markAccessLogsPushed(ids: string[]): Promise<void> {
+  const existing = await getPushedAccessLogIds();
+  for (const id of ids) existing.add(id);
+  const arr = Array.from(existing);
+  const trimmed = arr.slice(-5000);
+  await AsyncStorage.setItem(ACCESS_LOGS_PUSHED_KEY, JSON.stringify(trimmed));
+}
+
+/** Get unpushed access logs */
+export async function getUnpushedAccessLogs(): Promise<AccessLogEntry[]> {
+  const all = await getLocalAccessLogs();
+  const pushed = await getPushedAccessLogIds();
+  return all.filter(e => !pushed.has(e.id));
 }
 
 // Sync timestamp
@@ -171,7 +196,13 @@ export async function setLastSyncTime(time: string): Promise<void> {
 }
 
 export async function clearAllData(): Promise<void> {
-  await AsyncStorage.multiRemove([RESIDENTS_KEY, LAST_SYNC_KEY, MAIDS_COOKS_KEY, MAIDS_COOKS_SYNC_KEY, VISITORS_KEY, VISITORS_SYNC_KEY, PENDING_VISITOR_CHECKINS_KEY]);
+  await AsyncStorage.multiRemove([
+    RESIDENTS_KEY, LAST_SYNC_KEY, MAIDS_COOKS_KEY, MAIDS_COOKS_SYNC_KEY,
+    VISITORS_KEY, VISITORS_SYNC_KEY, PENDING_VISITOR_CHECKINS_KEY,
+    ACCESS_LOGS_KEY, ACCESS_LOGS_PUSHED_KEY,
+    MAID_COOK_ATTENDANCE_KEY, MAID_COOK_ATTENDANCE_PUSHED_KEY,
+    TAXI_LOG_KEY, TAXI_LOG_PUSHED_KEY,
+  ]);
   invalidateMaidCookCache();
   invalidateVisitorCache();
 }
@@ -483,4 +514,49 @@ export async function getDeviceLocation(): Promise<string> {
 
 export async function setDeviceLocation(location: string): Promise<void> {
   await AsyncStorage.setItem(DEVICE_LOCATION_KEY, location);
+}
+
+// ---- Taxi/Cab Log ----
+
+export type VehicleType = 'auto' | 'car' | 'tempo';
+
+export interface TaxiLogEntry {
+  id: string;
+  vehicle_number: string;
+  vehicle_type?: VehicleType;
+  flat: string;
+  timestamp: string;
+  compositeBase64: string;
+  location?: string;
+}
+
+export async function addTaxiLog(entry: TaxiLogEntry): Promise<void> {
+  const logs = await getTaxiLogs();
+  logs.unshift(entry);
+  const trimmed = logs.slice(0, 2000);
+  await AsyncStorage.setItem(TAXI_LOG_KEY, JSON.stringify(trimmed));
+}
+
+export async function getTaxiLogs(): Promise<TaxiLogEntry[]> {
+  const data = await AsyncStorage.getItem(TAXI_LOG_KEY);
+  return data ? JSON.parse(data) : [];
+}
+
+export async function getPushedTaxiLogIds(): Promise<Set<string>> {
+  const data = await AsyncStorage.getItem(TAXI_LOG_PUSHED_KEY);
+  return new Set(data ? JSON.parse(data) : []);
+}
+
+export async function markTaxiLogsPushed(ids: string[]): Promise<void> {
+  const existing = await getPushedTaxiLogIds();
+  for (const id of ids) existing.add(id);
+  const arr = Array.from(existing);
+  const trimmed = arr.slice(-5000);
+  await AsyncStorage.setItem(TAXI_LOG_PUSHED_KEY, JSON.stringify(trimmed));
+}
+
+export async function getUnpushedTaxiLogs(): Promise<TaxiLogEntry[]> {
+  const all = await getTaxiLogs();
+  const pushed = await getPushedTaxiLogIds();
+  return all.filter(e => !pushed.has(e.id));
 }

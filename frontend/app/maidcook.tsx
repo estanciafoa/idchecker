@@ -27,6 +27,7 @@ import {
   getDeviceLocation,
 } from '../src/services/storage';
 import { pushMaidCookAttendance } from '../src/services/api';
+import { pushAllUnpushed } from '../src/services/autoPush';
 
 Notifications.setNotificationHandler({
   handleNotification: async () => ({
@@ -225,6 +226,7 @@ export default function MaidCookScreen() {
       location,
     };
     await addMaidCookAttendance(entry);
+    void pushAllUnpushed();
     Alert.alert(
       direction === 'IN' ? 'Checked IN' : 'Checked OUT',
       `${maidCook.name}${selectedFlat ? ' → Flat ' + selectedFlat : ''} at ${new Date().toLocaleTimeString('en-IN', { hour: '2-digit', minute: '2-digit' })}`,

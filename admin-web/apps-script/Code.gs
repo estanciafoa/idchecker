@@ -11,6 +11,12 @@ const REQUIRED_HEADERS = [
 const DEFAULT_SPREADSHEET_ID = '1EDvYjDQVIpwib5PmQ5sbSchJI_B5HNHWNomXRLOxtk4';
 const DEFAULT_ZIP_FILE_ID = '1De7JzvhoEHfsrVJzKojcQu_QgHq4tRUE';
 
+// Separate Drive folders for each log category
+const FOLDER_STUDENTS = '12U_VPBkpatzeIaqKJ4wdZHf3-2GPHQgl';
+const FOLDER_MAIDCOOK = '1T4es3-liT2hptht5Cmw97TjK6VLbXCgI';
+const FOLDER_TAXIS    = '1bn6eM4iRsy98J9u08U6jIzbK3DoQQeNw';
+const FOLDER_VISITORS = '1BZFQxiOvo1Xb6mTl_wc5meEKLtngsAY7';
+
 function doGet(e) {
   try {
     if (e && e.parameter && e.parameter.action === 'status') {
@@ -146,6 +152,12 @@ function doPost(e) {
     if (payload.action === 'upload_maid_cook_attendance') {
       var attResult = uploadMaidCookAttendance_(payload);
       return jsonResponse_(true, attResult, null);
+    }
+
+    // Handle taxi/cab log upload
+    if (payload.action === 'upload_taxi_log') {
+      var taxiResult = uploadTaxiLog_(payload);
+      return jsonResponse_(true, taxiResult, null);
     }
 
     validatePayload_(payload);
@@ -476,37 +488,29 @@ function jsonResponse_(ok, result, error) {
     .setMimeType(ContentService.MimeType.JSON);
 }
 
-// ---- LOG UPLOAD ----
+// ---- LOG UPLOAD (Access / Student logs) ----
 function uploadLogsToDrive_(payload) {
   if (!payload.logs || !Array.isArray(payload.logs) || payload.logs.length === 0) {
     throw new Error('logs array is required and must not be empty');
   }
 
-  var folderId = payload.folderId || '1HYUCLO1VmuA20XgQKGqxuBofg0YwvDkZ';
-  var folder = DriveApp.getFolderById(folderId);
-
-  // Build CSV
-  var headers = ['timestamp', 'resident_id', 'resident_name', 'unit', 'status', 'location'];
-  var csvRows = [headers.join(',')];
-  payload.logs.forEach(function (log) {
-    var row = headers.map(function (h) {
-      var val = String(log[h] || '').replace(/"/g, '""');
-      return '"' + val + '"';
-    });
-    csvRows.push(row.join(','));
+  var headers = ['Timestamp', 'Resident ID', 'Resident Name', 'Unit', 'Status', 'Location', 'Log ID'];
+  var rows = payload.logs.map(function(log) {
+    return [
+      log.timestamp || '',
+      log.resident_id || '',
+      log.resident_name || '',
+      log.unit || '',
+      log.status || '',
+      log.location || '',
+      log.id || ''
+    ];
   });
-  var csvContent = csvRows.join('\n');
 
-  // File name: access_logs_YYYY-MM-DD_HH-MM.csv
-  var now = new Date();
-  var pad = function (n) { return n < 10 ? '0' + n : String(n); };
-  var fileName = 'access_logs_' +
-    now.getFullYear() + '-' + pad(now.getMonth() + 1) + '-' + pad(now.getDate()) +
-    '_' + pad(now.getHours()) + '-' + pad(now.getMinutes()) + '.csv';
+  // logIdCol = 6 (0-based index of 'Log ID' column) for dedup
+  var appended = appendToCsvFile_(FOLDER_STUDENTS, 'access_logs.csv', headers, rows, 6);
 
-  folder.createFile(fileName, csvContent, 'text/csv');
-
-  return { fileName: fileName, rowCount: payload.logs.length };
+  return { fileName: 'access_logs.csv', rowCount: appended };
 }
 
 // ---- VISITOR CHECK-IN ----
@@ -517,11 +521,11 @@ function uploadVisitorCheckin_(payload) {
   }
   var timestamp = payload.timestamp || new Date().toISOString();
 
-  var photoFileName = null;
+  var folder = DriveApp.getFolderById(FOLDER_VISITORS);
+
+  var photoFileName = '';
   // Save photo to Drive
   if (payload.photoBase64) {
-    var folderId = payload.folderId || '1HYUCLO1VmuA20XgQKGqxuBofg0YwvDkZ';
-    var folder = DriveApp.getFolderById(folderId);
     var safeName = 'visitor_' + String(visitor.id).replace(/[^A-Za-z0-9_-]/g, '') +
       '_' + timestamp.replace(/[:.]/g, '-') + '.jpg';
     var bytes = Utilities.base64Decode(payload.photoBase64);
@@ -550,6 +554,21 @@ function uploadVisitorCheckin_(payload) {
     photoFileName || '',
     payload.location || ''
   ]);
+
+  // Append to persistent CSV
+  var csvHeaders = ['Timestamp', 'Visitor ID', 'Name', 'Flat', 'Phone', 'Aadhar', 'Purpose', 'Photo File', 'Location'];
+  var csvRow = [[
+    timestamp,
+    visitor.id || '',
+    visitor.name || '',
+    visitor.flat || '',
+    visitor.phone || '',
+    visitor.aadhar || '',
+    visitor.purpose || '',
+    photoFileName,
+    payload.location || ''
+  ]];
+  appendToCsvFile_(FOLDER_VISITORS, 'visitor_logs.csv', csvHeaders, csvRow, -1);
 
   return { uploaded: true, fileName: photoFileName };
 }
@@ -582,6 +601,7 @@ function uploadMaidCookAttendance_(payload) {
   }
 
   var appended = 0;
+  var csvRows = [];
   for (var j = 0; j < entries.length; j++) {
     var e = entries[j];
     var logId = e.id || '';
@@ -595,10 +615,230 @@ function uploadMaidCookAttendance_(payload) {
       logId,
       e.location || ''
     ]);
+    csvRows.push([
+      e.timestamp || new Date().toISOString(),
+      e.maid_cook_id || '',
+      e.name || '',
+      e.flat || '',
+      e.direction || '',
+      logId,
+      e.location || ''
+    ]);
     appended++;
   }
 
+  // Append to persistent CSV (logIdCol = 5 for dedup)
+  if (csvRows.length > 0) {
+    var csvHeaders = ['Timestamp', 'Maid/Cook ID', 'Name', 'Flat', 'Direction', 'Log ID', 'Location'];
+    appendToCsvFile_(FOLDER_MAIDCOOK, 'maidcook_logs.csv', csvHeaders, csvRows, 5);
+  }
+
   return { rowsAppended: appended };
+}
+
+// ---- TAXI/CAB LOG ----
+function uploadTaxiLog_(payload) {
+  var entries = payload.entries;
+  if (!Array.isArray(entries) || entries.length === 0) {
+    throw new Error('entries array is required');
+  }
+
+  var folder = DriveApp.getFolderById(FOLDER_TAXIS);
+
+  var appended = 0;
+  var csvRows = [];
+  for (var j = 0; j < entries.length; j++) {
+    var e = entries[j];
+    var logId = e.id || '';
+
+    // Save composite photo to Drive
+    var photoFileName = '';
+    if (e.compositeBase64) {
+      var safeName = 'taxi_' + String(logId).replace(/[^A-Za-z0-9_-]/g, '') +
+        '_' + (e.timestamp || '').replace(/[:.]/g, '-') + '.jpg';
+      var bytes = Utilities.base64Decode(e.compositeBase64);
+      var blob = Utilities.newBlob(bytes, 'image/jpeg', safeName);
+      folder.createFile(blob);
+      photoFileName = safeName;
+    }
+
+    csvRows.push([
+      e.timestamp || new Date().toISOString(),
+      e.vehicle_type || '',
+      e.vehicle_number || '',
+      e.flat || '',
+      logId,
+      photoFileName,
+      e.location || ''
+    ]);
+    appended++;
+  }
+
+  // Append to persistent CSV (logIdCol = 4 for dedup)
+  if (csvRows.length > 0) {
+    var csvHeaders = ['Timestamp', 'Vehicle Type', 'Vehicle Number', 'Flat', 'Log ID', 'Photo File', 'Location'];
+    appendToCsvFile_(FOLDER_TAXIS, 'taxi_logs.csv', csvHeaders, csvRows, 4);
+  }
+
+  return { rowsAppended: appended };
+}
+
+/**
+ * Append rows to a persistent CSV file in a Drive folder.
+ * If the file doesn't exist, it is created with headers.
+ * If it exists, new rows are appended (duplicates skipped by logId column).
+ * After 10000 data rows, a new numbered file is created (e.g. access_logs_2.csv).
+ *
+ * @param {string} folderId  - Google Drive folder ID
+ * @param {string} fileName  - e.g. "access_logs.csv"
+ * @param {string[]} headers - column headers
+ * @param {string[][]} rows  - array of row arrays (same order as headers)
+ * @param {number} logIdCol  - 0-based index of the log-ID column for dedup (-1 to skip dedup)
+ * @returns {number} number of rows actually appended
+ */
+function appendToCsvFile_(folderId, fileName, headers, rows, logIdCol) {
+  var MAX_ROWS = 10000;
+  var folder = DriveApp.getFolderById(folderId);
+
+  // Derive base name and extension: "access_logs.csv" → base="access_logs", ext=".csv"
+  var dotIdx = fileName.lastIndexOf('.');
+  var baseName = dotIdx > 0 ? fileName.substring(0, dotIdx) : fileName;
+  var ext = dotIdx > 0 ? fileName.substring(dotIdx) : '.csv';
+
+  // Find all numbered CSV files for this base name
+  // Pattern: baseName.csv, baseName_2.csv, baseName_3.csv, ...
+  var allFiles = [];
+  var iter = folder.getFiles();
+  var pattern = new RegExp('^' + baseName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '(_\\d+)?' + ext.replace(/[.]/g, '\\.') + '$', 'i');
+  while (iter.hasNext()) {
+    var f = iter.next();
+    var fname = f.getName();
+    if (fname === baseName + ext || fname.match(new RegExp('^' + baseName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '_(\\d+)' + ext.replace(/[.]/g, '\\.') + '$'))) {
+      var num = 1;
+      var m = fname.match(new RegExp('_(\\d+)' + ext.replace(/[.]/g, '\\.') + '$'));
+      if (m) num = parseInt(m[1], 10);
+      allFiles.push({ file: f, num: num, name: fname });
+    }
+  }
+  // Sort by number ascending
+  allFiles.sort(function(a, b) { return a.num - b.num; });
+
+  // Collect ALL existing IDs across all files for dedup
+  var existingIds = {};
+  for (var fi = 0; fi < allFiles.length; fi++) {
+    if (logIdCol >= 0) {
+      var content = allFiles[fi].file.getBlob().getDataAsString();
+      if (content) {
+        var lines = content.split('\n');
+        for (var li = 1; li < lines.length; li++) {
+          var line = lines[li].trim();
+          if (!line) continue;
+          var cols = parseCsvLine_(line);
+          if (cols[logIdCol]) {
+            existingIds[cols[logIdCol].replace(/^"|"$/g, '')] = true;
+          }
+        }
+      }
+    }
+  }
+
+  // Filter out duplicates
+  var newRows = [];
+  for (var j = 0; j < rows.length; j++) {
+    if (logIdCol >= 0) {
+      var id = String(rows[j][logIdCol] || '').replace(/^"|"$/g, '');
+      if (id && existingIds[id]) continue;
+    }
+    newRows.push(rows[j]);
+  }
+
+  if (newRows.length === 0) return 0;
+
+  // Find the latest file and its row count
+  var latestEntry = allFiles.length > 0 ? allFiles[allFiles.length - 1] : null;
+  var latestContent = '';
+  var latestRowCount = 0;
+
+  if (latestEntry) {
+    latestContent = latestEntry.file.getBlob().getDataAsString();
+    var dataLines = latestContent.split('\n').filter(function(l) { return l.trim() !== ''; });
+    latestRowCount = Math.max(0, dataLines.length - 1); // subtract header
+  }
+
+  var totalAppended = 0;
+  var rowIdx = 0;
+
+  while (rowIdx < newRows.length) {
+    var spaceLeft;
+    if (latestEntry && latestRowCount < MAX_ROWS) {
+      // Append to existing latest file
+      spaceLeft = MAX_ROWS - latestRowCount;
+      var batch = newRows.slice(rowIdx, rowIdx + spaceLeft);
+      var csvLines = batch.map(function(row) {
+        return row.map(function(cell) {
+          var val = String(cell || '').replace(/"/g, '""');
+          return '"' + val + '"';
+        }).join(',');
+      });
+      var updated = latestContent.replace(/\n*$/, '') + '\n' + csvLines.join('\n') + '\n';
+      latestEntry.file.setContent(updated);
+      latestContent = updated;
+      latestRowCount += batch.length;
+      totalAppended += batch.length;
+      rowIdx += batch.length;
+    } else {
+      // Create a new file
+      var nextNum = latestEntry ? latestEntry.num + 1 : 1;
+      var newFileName = nextNum === 1 ? baseName + ext : baseName + '_' + nextNum + ext;
+      var headerLine = headers.map(function(h) {
+        return '"' + String(h).replace(/"/g, '""') + '"';
+      }).join(',');
+      spaceLeft = MAX_ROWS;
+      var batch2 = newRows.slice(rowIdx, rowIdx + spaceLeft);
+      var csvLines2 = batch2.map(function(row) {
+        return row.map(function(cell) {
+          var val = String(cell || '').replace(/"/g, '""');
+          return '"' + val + '"';
+        }).join(',');
+      });
+      var newContent = headerLine + '\n' + csvLines2.join('\n') + '\n';
+      var newFile = folder.createFile(newFileName, newContent, 'text/csv');
+      latestEntry = { file: newFile, num: nextNum, name: newFileName };
+      latestContent = newContent;
+      latestRowCount = batch2.length;
+      totalAppended += batch2.length;
+      rowIdx += batch2.length;
+    }
+  }
+
+  return totalAppended;
+}
+
+/**
+ * Simple CSV line parser (handles quoted fields).
+ */
+function parseCsvLine_(line) {
+  var result = [];
+  var current = '';
+  var inQuotes = false;
+  for (var i = 0; i < line.length; i++) {
+    var ch = line[i];
+    if (ch === '"') {
+      if (inQuotes && i + 1 < line.length && line[i + 1] === '"') {
+        current += '"';
+        i++;
+      } else {
+        inQuotes = !inQuotes;
+      }
+    } else if (ch === ',' && !inQuotes) {
+      result.push(current);
+      current = '';
+    } else {
+      current += ch;
+    }
+  }
+  result.push(current);
+  return result;
 }
 
 function jsonpResponse_(callbackName, bodyObject) {

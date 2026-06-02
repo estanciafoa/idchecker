@@ -32,6 +32,7 @@ import {
   type AccessLogEntry,
   getDeviceLocation,
 } from '../src/services/storage';
+import { pushAllUnpushed } from '../src/services/autoPush';
 import { postAccessLog } from '../src/services/api';
 
 export default function ScannerScreen() {
@@ -204,6 +205,7 @@ export default function ScannerScreen() {
         location,
       };
       await addAccessLog(logEntry);
+      void pushAllUnpushed();
       void postAccessLog({
         resident_id: found.id,
         resident_name: found.name,

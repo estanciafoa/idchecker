@@ -1,7 +1,7 @@
 import React, { useState, useEffect, useCallback } from 'react';
 import {
   View, Text, StyleSheet, FlatList, TouchableOpacity,
-  Modal, ScrollView, RefreshControl, Platform, Image, Alert,
+  Modal, ScrollView, RefreshControl, Platform, Image, Alert, TextInput,
 } from 'react-native';
 import { Ionicons } from '@expo/vector-icons';
 import { useFocusEffect } from '@react-navigation/native';
@@ -21,6 +21,7 @@ export default function AdminScreen() {
   const [selectedMaidCook, setSelectedMaidCook] = useState<MaidCook | null>(null);
   const [showClearConfirm, setShowClearConfirm] = useState(false);
   const [clearing, setClearing] = useState(false);
+  const [searchQuery, setSearchQuery] = useState('');
 
   const loadData = async () => {
     const data = await getLocalResidents();
@@ -228,27 +229,52 @@ export default function AdminScreen() {
         <Text style={styles.idFormatText}>View-only. Data managed via Google Sheet sync.</Text>
       </View>
 
-      {activeTab === 'students' ? (
-        residents.length === 0 ? (
+      {/* Search Bar */}
+      <View style={styles.searchBar}>
+        <Ionicons name="search" size={18} color="#94A3B8" />
+        <TextInput
+          style={styles.searchInput}
+          placeholder="Search by name or flat..."
+          placeholderTextColor="#94A3B8"
+          value={searchQuery}
+          onChangeText={setSearchQuery}
+          autoCapitalize="none"
+          autoCorrect={false}
+        />
+        {searchQuery.length > 0 && (
+          <TouchableOpacity onPress={() => setSearchQuery('')}>
+            <Ionicons name="close-circle" size={20} color="#94A3B8" />
+          </TouchableOpacity>
+        )}
+      </View>
+
+      {(() => {
+        const q = searchQuery.toLowerCase().trim();
+        const filteredResidents = q ? residents.filter(r => r.name.toLowerCase().includes(q) || r.unit.toLowerCase().includes(q)) : residents;
+        const filteredMC = q ? maidsCooks.filter(m => m.name.toLowerCase().includes(q) || m.flats.toLowerCase().includes(q)) : maidsCooks;
+
+        return activeTab === 'students' ? (
+        filteredResidents.length === 0 ? (
           <View style={styles.emptyContainer}>
             <Ionicons name="people-outline" size={64} color="#CBD5E1" />
-            <Text style={styles.emptyText}>NO RESIDENTS</Text>
-            <Text style={styles.emptySubtext}>Go to SYNC to pull data from sheet</Text>
+            <Text style={styles.emptyText}>{q ? 'NO MATCHES' : 'NO RESIDENTS'}</Text>
+            <Text style={styles.emptySubtext}>{q ? 'Try a different search' : 'Go to SYNC to pull data from sheet'}</Text>
           </View>
         ) : (
-          <FlatList testID="admin-resident-list" data={residents} keyExtractor={(item) => item.id} renderItem={renderResident} contentContainerStyle={styles.listContent} refreshControl={<RefreshControl refreshing={refreshing} onRefresh={onRefresh} />} />
+          <FlatList testID="admin-resident-list" data={filteredResidents} keyExtractor={(item) => item.id} renderItem={renderResident} contentContainerStyle={styles.listContent} refreshControl={<RefreshControl refreshing={refreshing} onRefresh={onRefresh} />} />
         )
       ) : (
-        maidsCooks.length === 0 ? (
+        filteredMC.length === 0 ? (
           <View style={styles.emptyContainer}>
             <Ionicons name="restaurant-outline" size={64} color="#CBD5E1" />
-            <Text style={styles.emptyText}>NO MAIDS & COOKS</Text>
-            <Text style={styles.emptySubtext}>Go to SYNC to pull data from sheet</Text>
+            <Text style={styles.emptyText}>{q ? 'NO MATCHES' : 'NO MAIDS & COOKS'}</Text>
+            <Text style={styles.emptySubtext}>{q ? 'Try a different search' : 'Go to SYNC to pull data from sheet'}</Text>
           </View>
         ) : (
-          <FlatList testID="admin-maidcook-list" data={maidsCooks} keyExtractor={(item) => item.id} renderItem={renderMaidCook} contentContainerStyle={styles.listContent} refreshControl={<RefreshControl refreshing={refreshing} onRefresh={onRefresh} />} />
+          <FlatList testID="admin-maidcook-list" data={filteredMC} keyExtractor={(item) => item.id} renderItem={renderMaidCook} contentContainerStyle={styles.listContent} refreshControl={<RefreshControl refreshing={refreshing} onRefresh={onRefresh} />} />
         )
-      )}
+      );
+      })()}
 
       {/* Resident Detail Modal */}
       {selectedResident && (
@@ -374,6 +400,8 @@ const styles = StyleSheet.create({
   headerLabel: { fontSize: fs(11), fontWeight: '700', color: '#64748B', letterSpacing: 2 },
   idFormatInfo: { flexDirection: 'row', alignItems: 'center', gap: 6, paddingHorizontal: 24, paddingVertical: 10, backgroundColor: '#F8FAFC', borderBottomWidth: 1, borderBottomColor: '#E2E8F0' },
   idFormatText: { fontSize: fs(11), fontWeight: '600', color: '#64748B' },
+  searchBar: { flexDirection: 'row', alignItems: 'center', paddingHorizontal: 16, paddingVertical: 8, backgroundColor: '#F1F5F9', borderBottomWidth: 1, borderBottomColor: '#E2E8F0', gap: 8 },
+  searchInput: { flex: 1, fontSize: fs(14), color: '#0F172A', paddingVertical: 6 },
   emptyContainer: { flex: 1, justifyContent: 'center', alignItems: 'center', padding: 24 },
   emptyText: { fontSize: fs(18), fontWeight: '900', color: '#475569', marginTop: 16 },
   emptySubtext: { fontSize: fs(14), color: '#94A3B8', marginTop: 8 },

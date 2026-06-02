@@ -1,8 +1,9 @@
 import React, { useState, useEffect } from 'react';
 import {
   View, Text, StyleSheet, TouchableOpacity, ActivityIndicator,
-  ScrollView, Alert, TextInput,
+  ScrollView, Alert, TextInput, Modal,
 } from 'react-native';
+import PasswordLock from '../src/components/PasswordLock';
 import { Ionicons } from '@expo/vector-icons';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import HamburgerMenu from '../src/components/HamburgerMenu';
@@ -78,6 +79,7 @@ export default function SyncScreen() {
   const [syncResult, setSyncResult] = useState<string | null>(null);
   const [syncError, setSyncError] = useState<string | null>(null);
   const [clearing, setClearing] = useState(false);
+  const [showClearPassword, setShowClearPassword] = useState(false);
 
   const [syncToken, setSyncToken] = useState('');
   const [showPassword, setShowPassword] = useState(false);
@@ -429,36 +431,7 @@ export default function SyncScreen() {
         <View style={{ marginTop: 32, borderTopWidth: 1, borderTopColor: '#E2E8F0', paddingTop: 24 }}>
           <TouchableOpacity
             style={[styles.clearBtn, (clearing || syncing) && styles.btnDisabled]}
-            onPress={() => {
-              Alert.alert(
-                'Clear All Data',
-                'This will delete ALL residents, maids/cooks, visitors, photos, and logs. You will need to sync again.\n\nAre you sure?',
-                [
-                  { text: 'Cancel', style: 'cancel' },
-                  {
-                    text: 'Clear Everything',
-                    style: 'destructive',
-                    onPress: async () => {
-                      setClearing(true);
-                      try {
-                        await clearSyncData();
-                        await clearAllPhotos();
-                        setLocalCount(0);
-                        setLocalCountMC(0);
-                        setLocalCountV(0);
-                        setLastSync(null);
-                        setSyncResult(null);
-                        Alert.alert('Done', 'All data and photos cleared.');
-                      } catch (e: any) {
-                        Alert.alert('Error', e.message || 'Failed to clear data');
-                      } finally {
-                        setClearing(false);
-                      }
-                    },
-                  },
-                ],
-              );
-            }}
+            onPress={() => setShowClearPassword(true)}
             disabled={clearing || syncing}
           >
             {clearing ? <ActivityIndicator color="#FFFFFF" /> : (
@@ -470,6 +443,50 @@ export default function SyncScreen() {
           </TouchableOpacity>
         </View>
       </ScrollView>
+
+      {/* Password modal for clear data */}
+      <Modal visible={showClearPassword} animationType="slide" transparent={false} onRequestClose={() => setShowClearPassword(false)}>
+        <PasswordLock
+          title="Enter password to clear data"
+          onUnlock={() => {
+            setShowClearPassword(false);
+            Alert.alert(
+              'Clear All Data',
+              'This will delete ALL residents, maids/cooks, visitors, photos, and logs. You will need to sync again.\n\nAre you sure?',
+              [
+                { text: 'Cancel', style: 'cancel' },
+                {
+                  text: 'Clear Everything',
+                  style: 'destructive',
+                  onPress: async () => {
+                    setClearing(true);
+                    try {
+                      await clearSyncData();
+                      await clearAllPhotos();
+                      setLocalCount(0);
+                      setLocalCountMC(0);
+                      setLocalCountV(0);
+                      setLastSync(null);
+                      setSyncResult(null);
+                      Alert.alert('Done', 'All data and photos cleared.');
+                    } catch (e: any) {
+                      Alert.alert('Error', e.message || 'Failed to clear data');
+                    } finally {
+                      setClearing(false);
+                    }
+                  },
+                },
+              ],
+            );
+          }}
+        />
+        <TouchableOpacity
+          onPress={() => setShowClearPassword(false)}
+          style={{ position: 'absolute', top: 50, left: 16, zIndex: 10, backgroundColor: '#00000080', borderRadius: 20, padding: 8 }}
+        >
+          <Ionicons name="close" size={24} color="#FFFFFF" />
+        </TouchableOpacity>
+      </Modal>
     </SafeAreaView>
   );
 }

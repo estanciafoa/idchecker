@@ -215,3 +215,47 @@ export async function pushMaidCookAttendance(entries: Array<{
     throw error;
   }
 }
+
+// Push taxi/cab logs to Google Sheet + photo to Drive
+export async function pushTaxiLogs(entries: Array<{
+  id: string;
+  vehicle_number: string;
+  vehicle_type?: string;
+  flat: string;
+  timestamp: string;
+  compositeBase64: string;
+  location?: string;
+}>): Promise<{ rowsAppended: number }> {
+  const payload = {
+    action: 'upload_taxi_log',
+    entries: entries.map(e => ({
+      id: e.id,
+      vehicle_number: e.vehicle_number,
+      vehicle_type: e.vehicle_type || '',
+      flat: e.flat,
+      timestamp: e.timestamp,
+      compositeBase64: e.compositeBase64,
+      location: e.location || '',
+    })),
+  };
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), 60000);
+  try {
+    const res = await fetch(APPS_SCRIPT_URL, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+      signal: controller.signal,
+      redirect: 'follow',
+    });
+    clearTimeout(timeoutId);
+    if (!res.ok) throw new Error('Taxi log upload failed: ' + res.statusText);
+    const data = await res.json();
+    if (!data.ok) throw new Error(data.error || 'Taxi log upload failed');
+    return data.result;
+  } catch (error: any) {
+    clearTimeout(timeoutId);
+    if (error.name === 'AbortError') throw new Error('Upload timed out');
+    throw error;
+  }
+}

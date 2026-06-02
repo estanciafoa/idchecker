@@ -26,6 +26,7 @@ import {
   type Visitor,
   type AccessLogEntry,
 } from '../src/services/storage';
+import { pushAllUnpushed } from '../src/services/autoPush';
 
 export default function VisitorsScreen() {
   const [flatNumber, setFlatNumber] = useState('');
@@ -213,7 +214,8 @@ export default function VisitorsScreen() {
         timestamp: new Date().toISOString(),
         location,
       });
-      Alert.alert('Saved', 'Visitor check-in saved. It will be uploaded during the next log sync.');
+      void pushAllUnpushed();
+      Alert.alert('Saved', 'Visitor check-in saved.');
     } catch (err: any) {
       Alert.alert('Error', 'Failed to save check-in.\n' + (err.message || ''));
     } finally {
