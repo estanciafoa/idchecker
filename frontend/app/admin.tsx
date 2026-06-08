@@ -1,15 +1,52 @@
-import React, { useState, useEffect, useCallback } from 'react';
+import React, { useState, useEffect, useCallback, useMemo, useRef } from 'react';
 import {
   View, Text, StyleSheet, FlatList, TouchableOpacity,
-  Modal, ScrollView, RefreshControl, Platform, Image, Alert, TextInput,
+  Modal, ScrollView, RefreshControl, Platform, Image, Alert, TextInput, Pressable,
 } from 'react-native';
 import { Ionicons } from '@expo/vector-icons';
 import { useFocusEffect } from '@react-navigation/native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import HamburgerMenu from '../src/components/HamburgerMenu';
 import { fs } from '../src/utils/scale';
-import { getLocalResidents, getLocalMaidsCooks, type Resident, type MaidCook, clearAllData, addAccessLog, type AccessLogEntry } from '../src/services/storage';
+import { parseValidityDate } from '../src/utils/dateUtils';
+import { getLocalResidents, getLocalMaidsCooks, saveLocalResidents, getSyncToken, type Resident, type MaidCook, clearAllData, clearNewFlags, addAccessLog, type AccessLogEntry } from '../src/services/storage';
 import PasswordLock from '../src/components/PasswordLock';
+
+const APPS_SCRIPT_URL = 'https://script.google.com/macros/s/AKfycby2yjp7UEvBdYIDzKjOyFInegp_9CA7LVhpmbHbqwnxdPYEI5WJE8BYki-3Dwrgfm7pkw/exec';
+
+function parseCSV(text: string): Record<string, string>[] {
+  const lines = text.split('\n');
+  if (lines.length < 2) return [];
+  const headers = lines[0].split(',').map(h => h.trim().replace(/^"|"$/g, ''));
+  const rows: Record<string, string>[] = [];
+  for (let i = 1; i < lines.length; i++) {
+    const line = lines[i].trim();
+    if (!line) continue;
+    const values: string[] = [];
+    let current = '';
+    let inQuotes = false;
+    for (let c = 0; c < line.length; c++) {
+      if (line[c] === '"') { inQuotes = !inQuotes; }
+      else if (line[c] === ',' && !inQuotes) { values.push(current.trim()); current = ''; }
+      else { current += line[c]; }
+    }
+    values.push(current.trim());
+    const row: Record<string, string> = {};
+    headers.forEach((h, idx) => { row[h] = values[idx] || ''; });
+    rows.push(row);
+  }
+  return rows;
+}
+
+function getCol(row: Record<string, string>, ...keys: string[]): string {
+  for (const k of keys) {
+    const val = row[k] || row[k.toLowerCase()] || row[k.toUpperCase()];
+    if (val) return val.trim();
+  }
+  return '';
+}
+
+const ADMIN_TIMEOUT_MS = 5 * 60 * 1000; // 5 minutes
 
 export default function AdminScreen() {
   const [unlocked, setUnlocked] = useState(false);
@@ -22,12 +59,43 @@ export default function AdminScreen() {
   const [showClearConfirm, setShowClearConfirm] = useState(false);
   const [clearing, setClearing] = useState(false);
   const [searchQuery, setSearchQuery] = useState('');
+  const inactivityTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  const resetInactivityTimer = useCallback(() => {
+    if (inactivityTimer.current) clearTimeout(inactivityTimer.current);
+    if (unlocked) {
+      inactivityTimer.current = setTimeout(() => {
+        setUnlocked(false);
+        setSelectedResident(null);
+        setSelectedMaidCook(null);
+      }, ADMIN_TIMEOUT_MS);
+    }
+  }, [unlocked]);
+
+  useEffect(() => {
+    resetInactivityTimer();
+    return () => { if (inactivityTimer.current) clearTimeout(inactivityTimer.current); };
+  }, [unlocked, resetInactivityTimer]);
+
+  const filteredResidents = useMemo(() => {
+    const q = searchQuery.toLowerCase().trim();
+    return q ? residents.filter(r => r.name.toLowerCase().includes(q) || r.unit.toLowerCase().includes(q)) : residents;
+  }, [residents, searchQuery]);
+
+  const filteredMC = useMemo(() => {
+    const q = searchQuery.toLowerCase().trim();
+    return q ? maidsCooks.filter(m => m.name.toLowerCase().includes(q) || m.flats.toLowerCase().includes(q)) : maidsCooks;
+  }, [maidsCooks, searchQuery]);
 
   const loadData = async () => {
     const data = await getLocalResidents();
-    setResidents(data);
+    setResidents([...data].reverse());
     const mc = await getLocalMaidsCooks();
-    setMaidsCooks(mc);
+    setMaidsCooks([...mc].reverse());
+    // Clear "new" flags after displaying
+    if (data.some(r => r.is_new)) {
+      setTimeout(() => clearNewFlags(), 3000);
+    }
   };
 
   useEffect(() => { if (unlocked) loadData(); }, [unlocked]);
@@ -41,7 +109,87 @@ export default function AdminScreen() {
   const onRefresh = useCallback(async () => {
     setRefreshing(true);
     try {
+      const token = await getSyncToken();
+      if (!token) {
+        // No token saved — just reload local data
+        await loadData();
+        setRefreshing(false);
+        return;
+      }
+      // Fetch CSV from sheet
+      const res = await fetch(APPS_SCRIPT_URL, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ action: 'get_csv', gid: '0', token }),
+        redirect: 'follow',
+      });
+      if (!res.ok) throw new Error('Fetch failed');
+      const raw = await res.text();
+      if (raw.trimStart().startsWith('{')) {
+        const err = JSON.parse(raw);
+        if (!err.ok) throw new Error(err.error || 'Access denied');
+      }
+      const rows = parseCSV(raw);
+      const existing = await getLocalResidents();
+      const existingIds = new Set(existing.map(r => r.id.toLowerCase()));
+
+      let added = 0;
+      let deleted = 0;
+      const newEntries: Resident[] = [];
+      const deleteIds = new Set<string>();
+
+      for (const row of rows) {
+        const id = getCol(row, 'ID', 'Id', 'id');
+        if (!id) continue;
+        const flag = getCol(row, 'update', 'Update', 'UPDATE').toLowerCase();
+        if (flag === 'd') {
+          if (existingIds.has(id.toLowerCase())) {
+            deleteIds.add(id.toLowerCase());
+            deleted++;
+          }
+          continue;
+        }
+        const name = getCol(row, 'Name', 'name', 'NAME');
+        if (!name) continue;
+        if (existingIds.has(id.toLowerCase())) continue;
+        const mobile = getCol(row, 'Mobile', 'mobile', 'MOBILE', 'Phone', 'phone');
+        newEntries.push({
+          id,
+          name,
+          unit: getCol(row, 'flat number', 'Flat', 'flat', 'FLAT', 'Unit', 'unit'),
+          aadhar_masked: getCol(row, 'Aadhar/SRMID', 'Aadhar', 'aadhar', 'AADHAR'),
+          phone_last4: mobile ? mobile.replace(/\D/g, '').slice(-4) : '',
+          photo_url: '',
+          photo_base64: '',
+          local_photo: '',
+          validity: getCol(row, 'ValidTill', 'Validity', 'validity', 'VALIDITY'),
+          vehicle_plate: getCol(row, 'Vehicle', 'vehicle', 'Vehicle Plate', 'vehicle_plate'),
+          status: 'active',
+          is_new: true,
+          created_at: new Date().toISOString(),
+          updated_at: new Date().toISOString(),
+        });
+        added++;
+      }
+
+      if (added > 0 || deleted > 0) {
+        // Remove deleted, clear old new flags, append new entries at end (sheet order)
+        const filtered = existing.filter(r => !deleteIds.has(r.id.toLowerCase()));
+        const cleared = filtered.map(r => ({ ...r, is_new: false }));
+        const merged = [...cleared, ...newEntries];
+        await saveLocalResidents(merged);
+        setResidents([...merged].reverse());
+        const parts: string[] = [];
+        if (added > 0) parts.push(`${added} new student(s) added`);
+        if (deleted > 0) parts.push(`${deleted} student(s) removed`);
+        Alert.alert('Quick Sync', parts.join('\n') + (added > 0 ? '\nRun full Sync for photos.' : ''));
+      } else {
+        await loadData();
+      }
+    } catch (e: any) {
+      // Fallback to local reload on error
       await loadData();
+      Alert.alert('Sync Error', e?.message || 'Failed to fetch. Showing local data.');
     } finally {
       setRefreshing(false);
     }
@@ -78,43 +226,6 @@ export default function AdminScreen() {
     } finally {
       setClearing(false);
     }
-  };
-
-  const parseValidityDate = (validity: string): Date | null => {
-    const text = validity.trim();
-
-    let match = text.match(/^(\d{1,2})[./-](\d{1,2})[./-](\d{4})$/);
-    if (match) {
-      const [, day, month, year] = match;
-      const parsed = new Date(Number(year), Number(month) - 1, Number(day));
-      return isNaN(parsed.getTime()) ? null : parsed;
-    }
-
-    const monthMap: Record<string, number> = {
-      january: 0,
-      february: 1,
-      march: 2,
-      april: 3,
-      may: 4,
-      june: 5,
-      july: 6,
-      august: 7,
-      september: 8,
-      october: 9,
-      november: 10,
-      december: 11,
-    };
-
-    match = text.match(/^(\d{1,2})(?:st|nd|rd|th)?\s+([A-Za-z]+)\s+(\d{4})$/i);
-    if (match) {
-      const [, day, monthName, year] = match;
-      const month = monthMap[monthName.toLowerCase()];
-      if (month === undefined) return null;
-      const parsed = new Date(Number(year), month, Number(day));
-      return isNaN(parsed.getTime()) ? null : parsed;
-    }
-
-    return null;
   };
 
   const isBlackMarked = (resident: Resident): boolean => {
@@ -164,6 +275,11 @@ export default function AdminScreen() {
       <View style={[styles.statusBadge, statusMeta.style]}>
         <Text style={styles.statusBadgeText}>{statusMeta.label}</Text>
       </View>
+      {item.is_new && (
+        <View style={styles.newBadge}>
+          <Text style={styles.newBadgeText}>NEW</Text>
+        </View>
+      )}
     </TouchableOpacity>
     );
   };
@@ -198,6 +314,7 @@ export default function AdminScreen() {
   };
 
   return (
+    <Pressable style={{ flex: 1 }} onTouchStart={resetInactivityTimer}>
     <SafeAreaView testID="admin-screen" style={styles.container}>
       <View style={styles.titleBar}>
         <HamburgerMenu />
@@ -248,17 +365,12 @@ export default function AdminScreen() {
         )}
       </View>
 
-      {(() => {
-        const q = searchQuery.toLowerCase().trim();
-        const filteredResidents = q ? residents.filter(r => r.name.toLowerCase().includes(q) || r.unit.toLowerCase().includes(q)) : residents;
-        const filteredMC = q ? maidsCooks.filter(m => m.name.toLowerCase().includes(q) || m.flats.toLowerCase().includes(q)) : maidsCooks;
-
-        return activeTab === 'students' ? (
+      {activeTab === 'students' ? (
         filteredResidents.length === 0 ? (
           <View style={styles.emptyContainer}>
             <Ionicons name="people-outline" size={64} color="#CBD5E1" />
-            <Text style={styles.emptyText}>{q ? 'NO MATCHES' : 'NO RESIDENTS'}</Text>
-            <Text style={styles.emptySubtext}>{q ? 'Try a different search' : 'Go to SYNC to pull data from sheet'}</Text>
+            <Text style={styles.emptyText}>{searchQuery.trim() ? 'NO MATCHES' : 'NO RESIDENTS'}</Text>
+            <Text style={styles.emptySubtext}>{searchQuery.trim() ? 'Try a different search' : 'Go to SYNC to pull data from sheet'}</Text>
           </View>
         ) : (
           <FlatList testID="admin-resident-list" data={filteredResidents} keyExtractor={(item) => item.id} renderItem={renderResident} contentContainerStyle={styles.listContent} refreshControl={<RefreshControl refreshing={refreshing} onRefresh={onRefresh} />} />
@@ -267,14 +379,13 @@ export default function AdminScreen() {
         filteredMC.length === 0 ? (
           <View style={styles.emptyContainer}>
             <Ionicons name="restaurant-outline" size={64} color="#CBD5E1" />
-            <Text style={styles.emptyText}>{q ? 'NO MATCHES' : 'NO MAIDS & COOKS'}</Text>
-            <Text style={styles.emptySubtext}>{q ? 'Try a different search' : 'Go to SYNC to pull data from sheet'}</Text>
+            <Text style={styles.emptyText}>{searchQuery.trim() ? 'NO MATCHES' : 'NO MAIDS & COOKS'}</Text>
+            <Text style={styles.emptySubtext}>{searchQuery.trim() ? 'Try a different search' : 'Go to SYNC to pull data from sheet'}</Text>
           </View>
         ) : (
           <FlatList testID="admin-maidcook-list" data={filteredMC} keyExtractor={(item) => item.id} renderItem={renderMaidCook} contentContainerStyle={styles.listContent} refreshControl={<RefreshControl refreshing={refreshing} onRefresh={onRefresh} />} />
         )
-      );
-      })()}
+      )}
 
       {/* Resident Detail Modal */}
       {selectedResident && (
@@ -383,6 +494,7 @@ export default function AdminScreen() {
         </View>
       </Modal>
     </SafeAreaView>
+    </Pressable>
   );
 }
 
@@ -421,6 +533,8 @@ const styles = StyleSheet.create({
   badgeBlackMarked: { backgroundColor: '#7F1D1D' },
   badgeInactive: { backgroundColor: '#FF3B30' },
   statusBadgeText: { fontSize: fs(10), fontWeight: '900', color: '#FFFFFF', letterSpacing: 1 },
+  newBadge: { position: 'absolute', top: 4, right: 4, backgroundColor: '#00C853', paddingHorizontal: 6, paddingVertical: 2, borderRadius: 4 },
+  newBadgeText: { fontSize: fs(9), fontWeight: '900', color: '#FFFFFF', letterSpacing: 0.5 },
   // Detail
   detailContainer: { flex: 1, backgroundColor: '#FFFFFF' },
   backBtn: { flexDirection: 'row', alignItems: 'center', gap: 10, backgroundColor: '#0F172A', paddingVertical: 18, paddingHorizontal: 24, minHeight: 64 },

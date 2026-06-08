@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useCallback } from 'react';
+import React, { useState, useEffect, useCallback, useMemo } from 'react';
 import {
   View,
   Text,
@@ -14,10 +14,11 @@ import {
 } from 'react-native';
 import { Ionicons } from '@expo/vector-icons';
 import { SafeAreaView } from 'react-native-safe-area-context';
+import { useFocusEffect } from 'expo-router';
 import HamburgerMenu from '../src/components/HamburgerMenu';
 import { AutoRickshawIcon, TruckIcon } from '../src/components/VehicleIcons';
 import { fs } from '../src/utils/scale';
-import { getLocalAccessLogs, getUnpushedAccessLogs, markAccessLogsPushed, getPendingVisitorCheckins, removePendingVisitorCheckin, getUnpushedAttendance, markAttendancePushed, getUnpushedTaxiLogs, markTaxiLogsPushed, getMaidCookAttendance, getTaxiLogs, type AccessLogEntry, type MaidCookAttendanceEntry, type TaxiLogEntry, type PendingVisitorCheckin } from '../src/services/storage';
+import { getLocalAccessLogs, getUnpushedAccessLogs, markAccessLogsPushed, getPendingVisitorCheckins, removePendingVisitorCheckin, getUnpushedAttendance, markAttendancePushed, getUnpushedTaxiLogs, markTaxiLogsPushed, getMaidCookAttendance, getTaxiLogs, getCurrentlyInMaidsCooks, loadLogPhoto, type AccessLogEntry, type MaidCookAttendanceEntry, type TaxiLogEntry, type PendingVisitorCheckin } from '../src/services/storage';
 import { pushLogsToGoogleDrive, uploadVisitorCheckin, pushMaidCookAttendance, pushTaxiLogs } from '../src/services/api';
 
 type UnifiedLogEntry = {
@@ -38,11 +39,58 @@ export default function LogsScreen() {
   const [activeFilter, setActiveFilter] = useState<'all' | 'access' | 'visitor' | 'maidcook' | 'taxi'>('all');
   const [refreshing, setRefreshing] = useState(false);
   const [pushing, setPushing] = useState(false);
+  const [pendingCount, setPendingCount] = useState(0);
   const [selectedLog, setSelectedLog] = useState<UnifiedLogEntry | null>(null);
+  const [shiftStats, setShiftStats] = useState({ scans: 0, verified: 0, denied: 0, maidIn: 0, maidOut: 0, visitors: 0, vehicles: 0 });
+
+  const handleShiftSummary = async () => {
+    const todayStr = new Date().toISOString().slice(0, 10);
+    const accessLogs = await getLocalAccessLogs();
+    const todayAccess = accessLogs.filter(l => l.timestamp.slice(0, 10) === todayStr);
+    const verified = todayAccess.filter(l => l.status === 'verified').length;
+    const denied = todayAccess.filter(l => l.status !== 'verified').length;
+
+    const maidLogs = await getMaidCookAttendance();
+    const todayMaid = maidLogs.filter(l => l.timestamp.slice(0, 10) === todayStr);
+    const maidIn = todayMaid.filter(l => l.direction === 'IN').length;
+    const maidOut = todayMaid.filter(l => l.direction === 'OUT').length;
+
+    const taxiLogs = await getTaxiLogs();
+    const todayTaxi = taxiLogs.filter(l => l.timestamp.slice(0, 10) === todayStr);
+
+    const checkins = await getPendingVisitorCheckins();
+    const todayVisitors = checkins.filter(c => c.timestamp.slice(0, 10) === todayStr);
+
+    const stillIn = await getCurrentlyInMaidsCooks();
+    const stillInNames = stillIn.map(m => `${m.name} (Flat ${m.flat})`).join(', ') || 'None';
+
+    const unpushedAccess = await getUnpushedAccessLogs();
+    const unpushedAtt = await getUnpushedAttendance();
+    const unpushedTaxi = await getUnpushedTaxiLogs();
+    const pendingCount = unpushedAccess.length + checkins.length + unpushedAtt.length + unpushedTaxi.length;
+
+    Alert.alert(
+      'SHIFT SUMMARY',
+      `Today (${new Date().toLocaleDateString('en-IN', { day: '2-digit', month: 'short' })}):\n\n` +
+      `ID Scans: ${todayAccess.length} (${verified} verified, ${denied} denied)\n` +
+      `Visitors: ${todayVisitors.length}\n` +
+      `Maid/Cook: ${maidIn} IN, ${maidOut} OUT\n` +
+      `Vehicles: ${todayTaxi.length}\n\n` +
+      `Still Inside: ${stillInNames}\n\n` +
+      `Pending Upload: ${pendingCount} entries`,
+    );
+  };
 
   useEffect(() => {
     loadLogs();
   }, []);
+
+  // Reload logs every time the tab is focused
+  useFocusEffect(
+    useCallback(() => {
+      loadLogs();
+    }, [])
+  );
 
   const loadLogs = async () => {
     const [accessLogs, pendingCheckins, maidCookLogs, taxiLogs] = await Promise.all([
@@ -114,9 +162,32 @@ export default function LogsScreen() {
     // Sort by timestamp descending (newest first)
     unified.sort((a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime());
     setAllLogs(unified);
+
+    // Count pending uploads
+    const [ua, uc, uatt, ut] = await Promise.all([
+      getUnpushedAccessLogs(), getPendingVisitorCheckins(),
+      getUnpushedAttendance(), getUnpushedTaxiLogs(),
+    ]);
+    setPendingCount(ua.length + uc.length + uatt.length + ut.length);
+
+    // Compute today's shift stats
+    const todayStr = new Date().toISOString().slice(0, 10);
+    const todayAccess = accessLogs.filter(l => l.timestamp.slice(0, 10) === todayStr);
+    const todayMaid = maidCookLogs.filter(l => l.timestamp.slice(0, 10) === todayStr);
+    const todayTaxi = taxiLogs.filter(l => l.timestamp.slice(0, 10) === todayStr);
+    const todayVisitors = pendingCheckins.filter(c => c.timestamp.slice(0, 10) === todayStr);
+    setShiftStats({
+      scans: todayAccess.length,
+      verified: todayAccess.filter(l => l.status === 'verified').length,
+      denied: todayAccess.filter(l => l.status !== 'verified').length,
+      maidIn: todayMaid.filter(l => l.direction === 'IN').length,
+      maidOut: todayMaid.filter(l => l.direction === 'OUT').length,
+      visitors: todayVisitors.length,
+      vehicles: todayTaxi.length,
+    });
   };
 
-  const filteredLogs = activeFilter === 'all' ? allLogs : allLogs.filter(l => l.type === activeFilter);
+  const filteredLogs = useMemo(() => activeFilter === 'all' ? allLogs : allLogs.filter(l => l.type === activeFilter), [allLogs, activeFilter]);
 
   const FILTERS: { key: typeof activeFilter; label: string; icon: keyof typeof Ionicons.glyphMap }[] = [
     { key: 'all', label: 'ALL', icon: 'list' },
@@ -159,9 +230,10 @@ export default function LogsScreen() {
       let checkinOk = 0, checkinFail = 0;
       for (const checkin of pendingCheckins) {
         try {
+          const photoBase64 = await loadLogPhoto(checkin.compositeBase64);
           await uploadVisitorCheckin({
             visitor: checkin.visitor,
-            photoBase64: checkin.compositeBase64,
+            photoBase64,
             timestamp: checkin.timestamp,
             location: checkin.location,
           });
@@ -188,7 +260,11 @@ export default function LogsScreen() {
       // Push taxi/cab logs
       if (unpushedTaxi.length > 0) {
         try {
-          const taxiResult = await pushTaxiLogs(unpushedTaxi);
+          const withPhotos = await Promise.all(unpushedTaxi.map(async e => ({
+            ...e,
+            compositeBase64: await loadLogPhoto(e.compositeBase64),
+          })));
+          const taxiResult = await pushTaxiLogs(withPhotos);
           await markTaxiLogsPushed(unpushedTaxi.map(e => e.id));
           results.push(`${taxiResult.rowsAppended} taxi/cab log(s) uploaded`);
         } catch (taxiErr: any) {
@@ -221,8 +297,17 @@ export default function LogsScreen() {
     });
   };
 
+  const handleSelectLog = async (item: UnifiedLogEntry) => {
+    if (item.rawData?.compositeBase64 && (item.type === 'taxi' || item.type === 'visitor')) {
+      const photo = await loadLogPhoto(item.rawData.compositeBase64);
+      setSelectedLog({ ...item, rawData: { ...item.rawData, compositeBase64: photo } });
+    } else {
+      setSelectedLog(item);
+    }
+  };
+
   const renderLogItem = ({ item }: { item: UnifiedLogEntry }) => (
-    <TouchableOpacity testID={`log-item-${item.id}`} style={[styles.logItem, item.isDenied && { backgroundColor: '#FEE2E2', borderColor: '#FECACA' }]} onPress={() => setSelectedLog(item)} activeOpacity={0.7}>
+    <TouchableOpacity testID={`log-item-${item.id}`} style={[styles.logItem, item.isDenied && { backgroundColor: '#FEE2E2', borderColor: '#FECACA' }]} onPress={() => handleSelectLog(item)} activeOpacity={0.7}>
       <View style={styles.logLeft}>
         <View style={[styles.iconCircle, { backgroundColor: item.color + '20' }]}>
           {item.vehicleType === 'auto' ? (
@@ -250,17 +335,61 @@ export default function LogsScreen() {
       <View style={styles.titleBar}>
         <HamburgerMenu />
         <Text style={styles.titleText}>LOGS</Text>
-        <TouchableOpacity onPress={handlePushLogs} disabled={pushing} style={styles.pushButton}>
+        <View style={{ flexDirection: 'row', gap: 12 }}>
+          <TouchableOpacity onPress={handlePushLogs} disabled={pushing} style={styles.pushButton}>
           {pushing ? (
             <ActivityIndicator size="small" color="#FFFBEB" />
           ) : (
-            <Ionicons name="cloud-upload-outline" size={28} color="#FFFBEB" />
+            <View>
+              <Ionicons name="cloud-upload-outline" size={28} color="#FFFBEB" />
+              {pendingCount > 0 && (
+                <View style={styles.pushBadge}>
+                  <Text style={styles.pushBadgeText}>{pendingCount > 99 ? '99+' : pendingCount}</Text>
+                </View>
+              )}
+            </View>
           )}
         </TouchableOpacity>
+        </View>
+      </View>
+      {/* Push status banner */}
+      <View style={[styles.pushStatusBanner, { backgroundColor: pendingCount === 0 ? '#F0FFF4' : '#FFFBEB' }]}>
+        <Ionicons
+          name={pendingCount === 0 ? 'checkmark-circle' : 'cloud-upload'}
+          size={16}
+          color={pendingCount === 0 ? '#00C853' : '#D97706'}
+        />
+        <Text style={[styles.pushStatusText, { color: pendingCount === 0 ? '#00C853' : '#D97706' }]}>
+          {pendingCount === 0 ? 'ALL LOGS PUSHED' : `${pendingCount} LOG${pendingCount === 1 ? '' : 'S'} PENDING UPLOAD`}
+        </Text>
       </View>
       <View style={styles.header}>
         <Text style={styles.headerCount}>{filteredLogs.length}</Text>
         <Text style={styles.headerLabel}>ENTRIES</Text>
+      </View>
+
+      {/* Today's Shift Summary */}
+      <View style={styles.shiftSummaryRow}>
+        <View style={styles.shiftStat}>
+          <Ionicons name="school" size={14} color="#00C853" />
+          <Text style={styles.shiftStatValue}>{shiftStats.verified}</Text>
+          <Text style={styles.shiftStatLabel}>OK</Text>
+        </View>
+        <View style={styles.shiftStat}>
+          <Ionicons name="close-circle" size={14} color="#FF3B30" />
+          <Text style={[styles.shiftStatValue, { color: '#FF3B30' }]}>{shiftStats.denied}</Text>
+          <Text style={styles.shiftStatLabel}>DENIED</Text>
+        </View>
+        <View style={styles.shiftStat}>
+          <Ionicons name="people" size={14} color="#F59E0B" />
+          <Text style={styles.shiftStatValue}>{shiftStats.visitors}</Text>
+          <Text style={styles.shiftStatLabel}>VISIT</Text>
+        </View>
+        <View style={styles.shiftStat}>
+          <Ionicons name="car" size={14} color="#0EA5E9" />
+          <Text style={styles.shiftStatValue}>{shiftStats.vehicles}</Text>
+          <Text style={styles.shiftStatLabel}>VEHICLE</Text>
+        </View>
       </View>
 
       {/* Filter Chips */}
@@ -395,6 +524,10 @@ const styles = StyleSheet.create({
   titleBar: { backgroundColor: '#78350F', paddingVertical: 14, paddingHorizontal: 16, flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between' },
   titleText: { fontSize: fs(20), fontWeight: '900', color: '#FFFBEB', letterSpacing: 2 },
   pushButton: { width: 36, height: 36, alignItems: 'center', justifyContent: 'center' },
+  pushBadge: { position: 'absolute', top: -6, right: -8, backgroundColor: '#FF3B30', borderRadius: 10, minWidth: 18, height: 18, justifyContent: 'center', alignItems: 'center', paddingHorizontal: 4 },
+  pushBadgeText: { color: '#FFFFFF', fontSize: 10, fontWeight: '900' },
+  pushStatusBanner: { flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 6, paddingVertical: 6, borderBottomWidth: 1, borderBottomColor: '#E2E8F0' },
+  pushStatusText: { fontSize: fs(11), fontWeight: '800', letterSpacing: 0.5 },
   header: {
     flexDirection: 'row',
     alignItems: 'baseline',
@@ -414,6 +547,30 @@ const styles = StyleSheet.create({
     fontWeight: '700',
     color: '#64748B',
     letterSpacing: 2,
+  },
+  shiftSummaryRow: {
+    flexDirection: 'row',
+    justifyContent: 'space-around',
+    paddingVertical: 8,
+    paddingHorizontal: 8,
+    backgroundColor: '#F8FAFC',
+    borderBottomWidth: 1,
+    borderBottomColor: '#E2E8F0',
+  },
+  shiftStat: {
+    alignItems: 'center',
+    gap: 2,
+  },
+  shiftStatValue: {
+    fontSize: fs(16),
+    fontWeight: '900',
+    color: '#000000',
+  },
+  shiftStatLabel: {
+    fontSize: fs(8),
+    fontWeight: '700',
+    color: '#94A3B8',
+    letterSpacing: 0.5,
   },
   filterRow: {
     flexDirection: 'row',

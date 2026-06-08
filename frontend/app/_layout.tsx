@@ -1,17 +1,43 @@
 import { Tabs } from 'expo-router';
 import { Ionicons } from '@expo/vector-icons';
-import { StyleSheet, View, LogBox } from 'react-native';
+import { StyleSheet, View, Text, LogBox, Alert } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useRef } from 'react';
 import { fs } from '../src/utils/scale';
-import { getDeviceLocation } from '../src/services/storage';
+import { getDeviceLocation, getOverstayVisitors } from '../src/services/storage';
 import { startNetworkSync, pushAllUnpushed } from '../src/services/autoPush';
+import { useNetworkStatus } from '../src/utils/useNetworkStatus';
+import ErrorBoundary from '../src/components/ErrorBoundary';
+
+import AsyncStorage from '@react-native-async-storage/async-storage';
 
 LogBox.ignoreLogs(['Looks like you have configured linking in multiple places']);
+
+const LAST_DAILY_PUSH_KEY = '@gate_check_last_daily_push';
 
 export default function TabLayout() {
   const insets = useSafeAreaInsets();
   const [location, setLocation] = useState('');
+  const isConnected = useNetworkStatus();
+  const overstayAlertShown = useRef(false);
+
+  const getTowerFromFlat = (flat: string): number | null => {
+    const raw = (flat || '').trim();
+    if (!raw) return null;
+    const lower = raw.toLowerCase();
+    const towerWord = lower.match(/tower\s*([1-5])/);
+    if (towerWord) return Number(towerWord[1]);
+    const leadingDigit = raw.match(/^([1-5])\d{2,4}$/);
+    if (leadingDigit) return Number(leadingDigit[1]);
+    const prefixedDigit = raw.match(/^([1-5])[\s\-\/]/);
+    if (prefixedDigit) return Number(prefixedDigit[1]);
+    return null;
+  };
+
+  const getTowerFromLocation = (loc: string): number | null => {
+    const m = (loc || '').match(/tower\s*([1-5])/i);
+    return m ? Number(m[1]) : null;
+  };
 
   useEffect(() => {
     getDeviceLocation().then(setLocation);
@@ -22,12 +48,74 @@ export default function TabLayout() {
     // Start network-recovery sync and push any cached logs
     startNetworkSync();
     pushAllUnpushed();
-    return () => clearInterval(interval);
+
+    // Daily auto-backup: push all unpushed once per day
+    const checkDailyPush = async () => {
+      const last = await AsyncStorage.getItem(LAST_DAILY_PUSH_KEY);
+      const todayStr = new Date().toISOString().slice(0, 10);
+      if (last !== todayStr) {
+        await pushAllUnpushed();
+        await AsyncStorage.setItem(LAST_DAILY_PUSH_KEY, todayStr);
+      }
+    };
+    checkDailyPush();
+    const dailyInterval = setInterval(checkDailyPush, 60 * 60 * 1000); // check every hour
+
+    // Visitor overstay check every hour
+    const checkOverstay = async () => {
+      try {
+        const overstay = await getOverstayVisitors();
+        if (overstay.length > 0) {
+          const currentLocation = await getDeviceLocation();
+          const normalized = currentLocation.trim().toLowerCase();
+          const locationTower = getTowerFromLocation(currentLocation);
+
+          // Notify only on Front Gate, EM Office, or the corresponding Tower device.
+          let relevant = overstay;
+          if (normalized === 'front gate' || normalized === 'em office') {
+            relevant = overstay;
+          } else if (locationTower) {
+            relevant = overstay.filter(v => getTowerFromFlat(v.flat) === locationTower);
+          } else {
+            relevant = [];
+          }
+
+          if (relevant.length === 0) return;
+
+          const lines = relevant.map(v =>
+            `• ${v.name} (Flat ${v.flat}) — Card #${v.card_number}, expected out: ${v.check_out}`
+          ).join('\n');
+          Alert.alert(
+            `⚠️ ${relevant.length} VISITOR${relevant.length > 1 ? 'S' : ''} OVERSTAYING`,
+            `The following visitor${relevant.length > 1 ? 's have' : ' has'} not returned the ID card and exceeded check-out time:\n\n${lines}`,
+            [{ text: 'OK' }],
+          );
+        }
+      } catch (_) {}
+    };
+    // Run first check after 1 minute (let app load), then every hour
+    const overstayTimeout = setTimeout(checkOverstay, 60 * 1000);
+    const overstayInterval = setInterval(checkOverstay, 60 * 60 * 1000);
+
+    return () => {
+      clearInterval(interval);
+      clearInterval(dailyInterval);
+      clearTimeout(overstayTimeout);
+      clearInterval(overstayInterval);
+    };
   }, []);
 
   const isGateLocation = location.toLowerCase().includes('gate');
   
   return (
+    <ErrorBoundary>
+    <View style={{ flex: 1 }}>
+    {!isConnected && (
+      <View style={styles.offlineBanner}>
+        <Ionicons name="cloud-offline" size={14} color="#FFFFFF" />
+        <Text style={styles.offlineBannerText}>OFFLINE — logs queued for push</Text>
+      </View>
+    )}
     <Tabs
       screenOptions={{
         tabBarStyle: [
@@ -76,7 +164,7 @@ export default function TabLayout() {
         options={{
           title: 'VISITORS',
           headerShown: false,
-          href: null, // temporarily hidden
+          href: location === 'Front Gate' ? undefined : null,
           tabBarIcon: ({ color }) => (
             <Ionicons name="person-add" size={28} color={color} />
           ),
@@ -118,10 +206,26 @@ export default function TabLayout() {
         }}
       />
     </Tabs>
+    </View>
+    </ErrorBoundary>
   );
 }
 
 const styles = StyleSheet.create({
+  offlineBanner: {
+    backgroundColor: '#DC2626',
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: 6,
+    paddingVertical: 4,
+  },
+  offlineBannerText: {
+    color: '#FFFFFF',
+    fontSize: fs(11),
+    fontWeight: '800',
+    letterSpacing: 0.5,
+  },
   tabBar: {
     backgroundColor: '#FFFFFF',
     borderTopWidth: 2,

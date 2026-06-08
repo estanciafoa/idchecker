@@ -1,4 +1,44 @@
 import AsyncStorage from '@react-native-async-storage/async-storage';
+import * as FileSystem from 'expo-file-system/legacy';
+
+const LOG_PHOTOS_DIR = FileSystem.documentDirectory + 'log_photos/';
+
+/** Save base64 photo to file, return file path */
+export async function saveLogPhoto(base64: string, prefix: string): Promise<string> {
+  const dirInfo = await FileSystem.getInfoAsync(LOG_PHOTOS_DIR);
+  if (!dirInfo.exists) {
+    await FileSystem.makeDirectoryAsync(LOG_PHOTOS_DIR, { intermediates: true });
+  }
+  const fileName = `${prefix}_${Date.now()}.jpg`;
+  const filePath = LOG_PHOTOS_DIR + fileName;
+  await FileSystem.writeAsStringAsync(filePath, base64, { encoding: FileSystem.EncodingType.Base64 });
+  return filePath;
+}
+
+/** Load base64 from file path. Returns empty string if file not found. */
+export async function loadLogPhoto(pathOrBase64: string): Promise<string> {
+  if (!pathOrBase64) return '';
+  // Backward compat: if it doesn't look like a file path, it's inline base64
+  if (!pathOrBase64.startsWith('file://') && !pathOrBase64.startsWith('/')) {
+    return pathOrBase64;
+  }
+  try {
+    const info = await FileSystem.getInfoAsync(pathOrBase64);
+    if (!info.exists) return '';
+    return await FileSystem.readAsStringAsync(pathOrBase64, { encoding: FileSystem.EncodingType.Base64 });
+  } catch {
+    return '';
+  }
+}
+
+/** Delete a log photo file */
+async function deleteLogPhoto(pathOrBase64: string): Promise<void> {
+  if (!pathOrBase64 || (!pathOrBase64.startsWith('file://') && !pathOrBase64.startsWith('/'))) return;
+  try {
+    const info = await FileSystem.getInfoAsync(pathOrBase64);
+    if (info.exists) await FileSystem.deleteAsync(pathOrBase64, { idempotent: true });
+  } catch { /* ignore */ }
+}
 
 const RESIDENTS_KEY = '@gate_check_residents';
 const ACCESS_LOGS_KEY = '@gate_check_logs';
@@ -15,6 +55,7 @@ const DEVICE_LOCATION_KEY = '@gate_check_device_location';
 const ACCESS_LOGS_PUSHED_KEY = '@gate_check_access_logs_pushed';
 const TAXI_LOG_KEY = '@gate_check_taxi_log';
 const TAXI_LOG_PUSHED_KEY = '@gate_check_taxi_log_pushed';
+const SYNC_TOKEN_KEY = '@gate_check_sync_token';
 
 export interface PendingVisitorCheckin {
   id: string;
@@ -38,6 +79,7 @@ export interface Resident {
   status: string;
   created_at: string;
   updated_at: string;
+  is_new?: boolean;
 }
 
 export interface AccessLogEntry {
@@ -196,6 +238,13 @@ export async function setLastSyncTime(time: string): Promise<void> {
 }
 
 export async function clearAllData(): Promise<void> {
+  // Delete log photo files from disk to prevent orphans
+  try {
+    const dirInfo = await FileSystem.getInfoAsync(LOG_PHOTOS_DIR);
+    if (dirInfo.exists) {
+      await FileSystem.deleteAsync(LOG_PHOTOS_DIR, { idempotent: true });
+    }
+  } catch { /* ignore */ }
   await AsyncStorage.multiRemove([
     RESIDENTS_KEY, LAST_SYNC_KEY, MAIDS_COOKS_KEY, MAIDS_COOKS_SYNC_KEY,
     VISITORS_KEY, VISITORS_SYNC_KEY, PENDING_VISITOR_CHECKINS_KEY,
@@ -352,6 +401,56 @@ export async function returnCard(cardNumber: string): Promise<void> {
   if (changed) await saveLocalVisitors(visitors);
 }
 
+/** Get visitors who have a card assigned and are past their check_out time */
+export async function getOverstayVisitors(): Promise<Visitor[]> {
+  const visitors = await getLocalVisitors();
+  const now = new Date();
+  return visitors.filter(v => {
+    // Must have a card assigned (still inside)
+    if (!v.card_number || !v.card_number.trim()) return false;
+    // Need a check_out time to compare against
+    if (!v.check_out || !v.check_out.trim()) return false;
+    // Parse check_out time (e.g. "17:00", "5:00 PM", "17:30")
+    const coTime = parseTimeToToday(v.check_out.trim(), v.visit_date);
+    if (!coTime) return false;
+    return now > coTime;
+  });
+}
+
+/** Parse a time string (HH:MM, H:MM AM/PM) into a Date object for today or the visit date */
+function parseTimeToToday(timeStr: string, visitDate?: string): Date | null {
+  const now = new Date();
+  let hours = 0, minutes = 0;
+
+  // Try "HH:MM" or "H:MM"
+  const match24 = timeStr.match(/^(\d{1,2}):(\d{2})$/);
+  if (match24) {
+    hours = parseInt(match24[1], 10);
+    minutes = parseInt(match24[2], 10);
+  } else {
+    // Try "H:MM AM/PM" or "HH:MM AM/PM"
+    const match12 = timeStr.match(/^(\d{1,2}):(\d{2})\s*(AM|PM)$/i);
+    if (match12) {
+      hours = parseInt(match12[1], 10);
+      minutes = parseInt(match12[2], 10);
+      const period = match12[3].toUpperCase();
+      if (period === 'PM' && hours !== 12) hours += 12;
+      if (period === 'AM' && hours === 12) hours = 0;
+    } else {
+      return null;
+    }
+  }
+
+  const d = new Date(now.getFullYear(), now.getMonth(), now.getDate(), hours, minutes, 0, 0);
+  return d;
+}
+
+/** Get all visitors currently inside the campus (have a card assigned) */
+export async function getVisitorsInsideCampus(): Promise<Visitor[]> {
+  const visitors = await getLocalVisitors();
+  return visitors.filter(v => v.card_number && v.card_number.trim() !== '');
+}
+
 export async function updateVisitorPhoto(visitorId: string, photoUri: string): Promise<void> {
   const visitors = await getLocalVisitors();
   const idx = visitors.findIndex(v => v.id.toLowerCase() === visitorId.toLowerCase());
@@ -391,13 +490,18 @@ export async function getPendingVisitorCheckins(): Promise<PendingVisitorCheckin
 }
 
 export async function addPendingVisitorCheckin(checkin: PendingVisitorCheckin): Promise<void> {
+  // Save photo to file to avoid CursorWindow size limit
+  const filePath = await saveLogPhoto(checkin.compositeBase64, 'visitor');
+  const stored = { ...checkin, compositeBase64: filePath };
   const pending = await getPendingVisitorCheckins();
-  pending.push(checkin);
+  pending.push(stored);
   await AsyncStorage.setItem(PENDING_VISITOR_CHECKINS_KEY, JSON.stringify(pending));
 }
 
 export async function removePendingVisitorCheckin(id: string): Promise<void> {
   const pending = await getPendingVisitorCheckins();
+  const toRemove = pending.find(c => c.id === id);
+  if (toRemove) await deleteLogPhoto(toRemove.compositeBase64);
   const filtered = pending.filter(c => c.id !== id);
   await AsyncStorage.setItem(PENDING_VISITOR_CHECKINS_KEY, JSON.stringify(filtered));
 }
@@ -503,6 +607,7 @@ export const LOCATION_OPTIONS = [
   'Tower 4',
   'Tower 5',
   'Rear Gate',
+  'EM Office',
 ] as const;
 
 export type DeviceLocation = typeof LOCATION_OPTIONS[number];
@@ -514,6 +619,20 @@ export async function getDeviceLocation(): Promise<string> {
 
 export async function setDeviceLocation(location: string): Promise<void> {
   await AsyncStorage.setItem(DEVICE_LOCATION_KEY, location);
+}
+
+export async function getSyncToken(): Promise<string> {
+  return (await AsyncStorage.getItem(SYNC_TOKEN_KEY)) || '';
+}
+
+export async function setSyncToken(token: string): Promise<void> {
+  await AsyncStorage.setItem(SYNC_TOKEN_KEY, token);
+}
+
+export async function clearNewFlags(): Promise<void> {
+  const residents = await getLocalResidents();
+  const updated = residents.map(r => ({ ...r, is_new: false }));
+  await saveLocalResidents(updated);
 }
 
 // ---- Taxi/Cab Log ----
@@ -531,8 +650,11 @@ export interface TaxiLogEntry {
 }
 
 export async function addTaxiLog(entry: TaxiLogEntry): Promise<void> {
+  // Save photo to file to avoid CursorWindow size limit
+  const filePath = await saveLogPhoto(entry.compositeBase64, 'taxi');
+  const stored = { ...entry, compositeBase64: filePath };
   const logs = await getTaxiLogs();
-  logs.unshift(entry);
+  logs.unshift(stored);
   const trimmed = logs.slice(0, 2000);
   await AsyncStorage.setItem(TAXI_LOG_KEY, JSON.stringify(trimmed));
 }

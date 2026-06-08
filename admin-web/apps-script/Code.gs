@@ -651,15 +651,23 @@ function uploadTaxiLog_(payload) {
     var e = entries[j];
     var logId = e.id || '';
 
-    // Save composite photo to Drive
+    // Save composite photo to Drive (dedup by logId — skip if file already exists)
     var photoFileName = '';
     if (e.compositeBase64) {
-      var safeName = 'taxi_' + String(logId).replace(/[^A-Za-z0-9_-]/g, '') +
+      var safeId = String(logId).replace(/[^A-Za-z0-9_-]/g, '');
+      var safeName = 'taxi_' + safeId +
         '_' + (e.timestamp || '').replace(/[:.]/g, '-') + '.jpg';
-      var bytes = Utilities.base64Decode(e.compositeBase64);
-      var blob = Utilities.newBlob(bytes, 'image/jpeg', safeName);
-      folder.createFile(blob);
-      photoFileName = safeName;
+      // Check if a file for this logId already exists (any timestamp)
+      var existing = folder.searchFiles("title contains 'taxi_" + safeId + "_'");
+      if (existing.hasNext()) {
+        // Already uploaded — reuse existing filename, skip upload
+        photoFileName = existing.next().getName();
+      } else {
+        var bytes = Utilities.base64Decode(e.compositeBase64);
+        var blob = Utilities.newBlob(bytes, 'image/jpeg', safeName);
+        folder.createFile(blob);
+        photoFileName = safeName;
+      }
     }
 
     csvRows.push([

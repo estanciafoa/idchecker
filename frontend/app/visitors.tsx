@@ -14,6 +14,7 @@ import { fs } from '../src/utils/scale';
 import {
   getVisitorsByFlat,
   getVisitorByCard,
+  getVisitorsInsideCampus,
   assignCardToVisitor,
   returnCard,
   updateVisitorPhoto,
@@ -30,7 +31,6 @@ import { pushAllUnpushed } from '../src/services/autoPush';
 
 export default function VisitorsScreen() {
   const [flatNumber, setFlatNumber] = useState('');
-  const [cardNumber, setCardNumber] = useState('');
   const [visitors, setVisitors] = useState<Visitor[]>([]);
   const [searched, setSearched] = useState(false);
   const [loading, setLoading] = useState(false);
@@ -43,19 +43,36 @@ export default function VisitorsScreen() {
   const cameraRef = useRef<any>(null);
   const compositeRef = useRef<any>(null);
   const [assigningCard, setAssigningCard] = useState('');
-
+  const [detailMode, setDetailMode] = useState<'checkin' | 'return'>('checkin');
+  const [mainMode, setMainMode] = useState<'entry' | 'return'>('entry');
+  const [insideVisitors, setInsideVisitors] = useState<Visitor[]>([]);
+  const [showInsideModal, setShowInsideModal] = useState(false);
+  const [showCardScanner, setShowCardScanner] = useState(false);
+  const [cardScanned, setCardScanned] = useState(false);
+  const [scannerMode, setScannerMode] = useState<'assign' | 'return'>('assign');
   // Reset all state when screen gains focus (tab switch / navigate back)
   useFocusEffect(
     useCallback(() => {
       setFlatNumber('');
-      setCardNumber('');
       setVisitors([]);
       setSearched(false);
       setSelectedVisitor(null);
       setShowCamera(false);
       setAssigningCard('');
+      setMainMode('entry');
+      setShowInsideModal(false);
+      setShowCardScanner(false);
+      setCardScanned(false);
+      setDetailMode('checkin');
+      setScannerMode('assign');
+      getVisitorsInsideCampus().then(setInsideVisitors);
     }, [])
   );
+
+  const loadInsideVisitors = async () => {
+    const inside = await getVisitorsInsideCampus();
+    setInsideVisitors(inside);
+  };
 
   const handleSearch = async () => {
     if (!flatNumber.trim()) return;
@@ -68,28 +85,20 @@ export default function VisitorsScreen() {
       setVisitors([]);
     }
     setLoading(false);
+    setFlatNumber('');
   };
 
-  const handleCardLookup = async () => {
-    if (!cardNumber.trim()) return;
-    setLoading(true);
-    try {
-      const visitor = await getVisitorByCard(cardNumber.trim());
-      if (visitor) {
-        setSelectedVisitor(visitor);
-        setAssigningCard(visitor.card_number || cardNumber.trim());
-      } else {
-        Alert.alert('Not Found', `No visitor assigned to card ${cardNumber.trim()}`);
-      }
-    } catch (_) {
-      Alert.alert('Error', 'Failed to look up card');
-    }
-    setLoading(false);
+  const formatCard = (num: string) => {
+    const n = num.trim();
+    if (!n) return '';
+    return n.startsWith('EST-V-') ? n : `EST-V-${n}`;
   };
 
-  const handleAssignCard = async () => {
-    if (!selectedVisitor || !assigningCard.trim()) return;
-    const card = assigningCard.trim();
+  const handleAssignCard = async (overrideCard?: string) => {
+    if (!selectedVisitor) return;
+    const raw = overrideCard !== undefined ? overrideCard : assigningCard;
+    if (!raw.trim()) return;
+    const card = formatCard(raw);
     // Check if card is currently with someone else
     const current = await getVisitorByCard(card);
     if (current && current.id !== selectedVisitor.id) {
@@ -103,6 +112,7 @@ export default function VisitorsScreen() {
             onPress: async () => {
               await assignCardToVisitor(selectedVisitor.id, card);
               setSelectedVisitor(prev => prev ? { ...prev, card_number: card } : null);
+              setAssigningCard('');
               Alert.alert('Card Reassigned', `Card ${card} moved from ${current.name} to ${selectedVisitor.name}`);
             },
           },
@@ -111,13 +121,92 @@ export default function VisitorsScreen() {
     } else {
       await assignCardToVisitor(selectedVisitor.id, card);
       setSelectedVisitor(prev => prev ? { ...prev, card_number: card } : null);
+      setAssigningCard('');
       Alert.alert('Card Assigned', `Card ${card} assigned to ${selectedVisitor.name}`);
     }
+  };
+
+  const handleCardBarcodeScanned = useCallback(async ({ data }: { data: string }) => {
+    if (cardScanned) return;
+    setCardScanned(true);
+    const trimmed = (data || '').trim();
+    if (!trimmed) {
+      setCardScanned(false);
+      return;
+    }
+    setShowCardScanner(false);
+
+    if (scannerMode === 'return') {
+      const fullCard = formatCard(trimmed);
+      try {
+        const visitor = await getVisitorByCard(fullCard);
+        if (!visitor) {
+          Alert.alert('Not Found', `No visitor assigned to card ${fullCard}`);
+        } else {
+          setSelectedVisitor(visitor);
+          setAssigningCard(visitor.card_number || fullCard);
+          setDetailMode('return');
+        }
+      } catch (_) {
+        Alert.alert('Error', 'Failed to look up card');
+      }
+    } else {
+      // Assign mode: if the barcode is EST-V-NNN, extract digits; else use raw
+      let cardValue = trimmed;
+      const m = trimmed.match(/EST-V-(\d+)/i);
+      if (m) cardValue = m[1];
+      await handleAssignCard(cardValue);
+    }
+
+    setTimeout(() => setCardScanned(false), 500);
+  }, [cardScanned, scannerMode, selectedVisitor, assigningCard]);
+
+  const openCardScanner = async (mode: 'assign' | 'return') => {
+    if (!permission?.granted) {
+      const res = await requestPermission();
+      if (!res.granted) return;
+    }
+    setScannerMode(mode);
+    setCardScanned(false);
+    setShowCardScanner(true);
+  };
+
+  const openInsideVisitors = async () => {
+    await loadInsideVisitors();
+    setShowInsideModal(true);
+  };
+
+  const handleReturnSelectedCard = async () => {
+    if (!selectedVisitor?.card_number) return;
+    const cardNum = selectedVisitor.card_number;
+    await returnCard(cardNum);
+    const location = await getDeviceLocation();
+    const exitLog: AccessLogEntry = {
+      id: Date.now().toString(),
+      resident_id: selectedVisitor.id,
+      resident_name: selectedVisitor.name,
+      unit: selectedVisitor.flat,
+      timestamp: new Date().toISOString(),
+      status: 'visitor_checkout',
+      location,
+    };
+    await addAccessLog(exitLog);
+    void pushAllUnpushed();
+    Alert.alert('Card Returned', `Card ${cardNum} returned. Exit logged for ${selectedVisitor.name}.`);
+    setSelectedVisitor(null);
+    setAssigningCard('');
+    setDetailMode('checkin');
+    if (flatNumber.trim()) {
+      const results = await getVisitorsByFlat(flatNumber.trim());
+      setVisitors(results);
+    }
+    await loadInsideVisitors();
   };
 
   const handleSelectVisitor = (visitor: Visitor) => {
     setSelectedVisitor(visitor);
     setAssigningCard(visitor.card_number || '');
+    setDetailMode('checkin');
   };
 
   const openCamera = async (type: 'face' | 'id') => {
@@ -175,6 +264,10 @@ export default function VisitorsScreen() {
 
   const handleDone = async () => {
     if (!selectedVisitor) return;
+    if (!selectedVisitor.card_number || !selectedVisitor.card_number.trim()) {
+      Alert.alert('Card Required', 'Please assign a visitor card before check-in.');
+      return;
+    }
     if (!selectedVisitor.local_photo && !selectedVisitor.local_photo_id) {
       Alert.alert('No Photos', 'Please take at least one photo before submitting.');
       return;
@@ -274,6 +367,40 @@ export default function VisitorsScreen() {
     );
   }
 
+  // ── Card Barcode Scanner Modal ──
+  if (showCardScanner) {
+    return (
+      <SafeAreaView style={styles.container}>
+        <CameraView
+          style={{ flex: 1 }}
+          facing="back"
+          barcodeScannerSettings={{ barcodeTypes: ['qr', 'code128', 'code39', 'ean13', 'ean8'] }}
+          onBarcodeScanned={cardScanned ? undefined : handleCardBarcodeScanned}
+        >
+          <View style={styles.cameraOverlay}>
+            <View style={styles.cameraTopBar}>
+              <TouchableOpacity style={styles.cameraCancelBtn} onPress={() => setShowCardScanner(false)}>
+                <Ionicons name="close" size={32} color="#FFFFFF" />
+              </TouchableOpacity>
+              <View style={styles.photoTypeLabel}>
+                <Ionicons name="barcode-outline" size={20} color="#FFFFFF" />
+                <Text style={styles.photoTypeLabelText}>
+                  {scannerMode === 'return' ? 'SCAN CARD TO RETURN' : 'SCAN CARD BARCODE'}
+                </Text>
+              </View>
+            </View>
+            <View style={{ flex: 1, justifyContent: 'center', alignItems: 'center' }}>
+              <View style={{ width: 280, height: 120, borderWidth: 3, borderColor: '#7C3AED', borderRadius: 12 }} />
+              <Text style={{ color: '#FFFFFF', marginTop: 16, fontSize: fs(16), fontWeight: '700' }}>
+                {scannerMode === 'return' ? 'ALIGN CARD BARCODE TO FETCH VISITOR' : 'ALIGN VISITOR CARD BARCODE'}
+              </Text>
+            </View>
+          </View>
+        </CameraView>
+      </SafeAreaView>
+    );
+  }
+
   // ── Visitor Detail Modal ──
   if (selectedVisitor) {
     const expired = !isValidTill(selectedVisitor);
@@ -344,48 +471,48 @@ export default function VisitorsScreen() {
             <InfoRow label="STATUS" value={selectedVisitor.office_status || 'N/A'} />
           </View>
 
-          {/* Card Number Assignment */}
-          <View style={styles.cardAssignSection}>
-            <Text style={styles.searchLabel}>ASSIGN CARD NUMBER</Text>
-            <View style={styles.searchRow}>
-              <TextInput
-                style={[styles.searchInput, { borderColor: '#7C3AED' }]}
-                value={assigningCard}
-                onChangeText={setAssigningCard}
-                placeholder="Enter card number"
-                placeholderTextColor="#94A3B8"
-                keyboardType="numeric"
-                returnKeyType="done"
-                onSubmitEditing={() => handleAssignCard()}
-              />
+          {/* Card Number Assignment – hidden when expired, but allow return even if expired */}
+          {!expired && detailMode !== 'return' ? (
+            <View style={styles.cardAssignSection}>
+              <Text style={styles.searchLabel}>ASSIGN CARD NUMBER</Text>
               <TouchableOpacity
-                style={[styles.searchBtn, { backgroundColor: '#7C3AED', borderColor: '#7C3AED' }]}
-                onPress={() => handleAssignCard()}
+                style={styles.scanCardBtn}
+                onPress={() => openCardScanner('assign')}
               >
-                <Ionicons name="checkmark" size={22} color="#FFFFFF" />
+                <Ionicons name="barcode-outline" size={22} color="#FFFFFF" />
+                <Text style={styles.scanCardBtnText}>ASSIGN CARD</Text>
               </TouchableOpacity>
+              <Text style={styles.scanCardHint}>Scan the visitor card barcode to assign it automatically.</Text>
+              {selectedVisitor.card_number ? (
+                <View style={styles.currentCardRow}>
+                  <Text style={styles.currentCardText}>Current card: {selectedVisitor.card_number}</Text>
+                  <TouchableOpacity
+                    style={styles.returnCardBtn}
+                    onPress={handleReturnSelectedCard}
+                  >
+                    <Ionicons name="arrow-undo" size={16} color="#DC2626" />
+                    <Text style={styles.returnCardText}>RETURN</Text>
+                  </TouchableOpacity>
+                </View>
+              ) : null}
             </View>
-            {selectedVisitor.card_number ? (
+          ) : selectedVisitor.card_number ? (
+            <View style={styles.cardAssignSection}>
               <View style={styles.currentCardRow}>
                 <Text style={styles.currentCardText}>Current card: {selectedVisitor.card_number}</Text>
                 <TouchableOpacity
                   style={styles.returnCardBtn}
-                  onPress={async () => {
-                    await returnCard(selectedVisitor.card_number);
-                    setSelectedVisitor(prev => prev ? { ...prev, card_number: '' } : null);
-                    setAssigningCard('');
-                    Alert.alert('Card Returned', `Card ${selectedVisitor.card_number} is now available for reuse.`);
-                  }}
+                  onPress={handleReturnSelectedCard}
                 >
                   <Ionicons name="arrow-undo" size={16} color="#DC2626" />
                   <Text style={styles.returnCardText}>RETURN</Text>
                 </TouchableOpacity>
               </View>
-            ) : null}
-          </View>
+            </View>
+          ) : null}
 
           {/* Done / Upload Button */}
-          {!expired && (
+          {!expired && detailMode === 'checkin' && (
             <TouchableOpacity
               style={[styles.doneBtn, uploading && { opacity: 0.6 }]}
               onPress={handleDone}
@@ -397,6 +524,12 @@ export default function VisitorsScreen() {
                   <Text style={styles.doneBtnText}>DONE</Text>
                 </>
               )}
+            </TouchableOpacity>
+          )}
+          {detailMode === 'return' && !!selectedVisitor.card_number && (
+            <TouchableOpacity style={styles.returnActionBtn} onPress={handleReturnSelectedCard}>
+              <Ionicons name="arrow-undo" size={24} color="#FFFFFF" />
+              <Text style={styles.doneBtnText}>RETURN</Text>
             </TouchableOpacity>
           )}
           {expired && (
@@ -453,97 +586,158 @@ export default function VisitorsScreen() {
       <View style={styles.titleBar}>
         <HamburgerMenu />
         <Text style={styles.titleText}>VISITORS</Text>
-        <View style={{ width: 36 }} />
+        <TouchableOpacity style={styles.insideIconBtn} onPress={openInsideVisitors}>
+          <Ionicons name="people" size={20} color="#FFFBEB" />
+        </TouchableOpacity>
       </View>
 
-      {/* Flat Number Input */}
-      <View style={styles.searchSection}>
-        <Text style={styles.searchLabel}>ENTER FLAT NUMBER</Text>
-        <View style={styles.searchRow}>
-          <TextInput
-            style={styles.searchInput}
-            value={flatNumber}
-            onChangeText={setFlatNumber}
-            placeholder="e.g. 5162"
-            placeholderTextColor="#94A3B8"
-            keyboardType="numeric"
-            autoCorrect={false}
-            returnKeyType="search"
-            onSubmitEditing={handleSearch}
-          />
-          <TouchableOpacity style={styles.searchBtn} onPress={handleSearch} disabled={loading}>
-            {loading ? <ActivityIndicator color="#FFFFFF" size="small" /> : (
-              <Ionicons name="search" size={22} color="#FFFFFF" />
-            )}
-          </TouchableOpacity>
-        </View>
-      </View>
-
-      {/* Card Number Input */}
-      <View style={styles.cardSearchSection}>
-        <Text style={styles.searchLabel}>OR ENTER CARD NUMBER</Text>
-        <View style={styles.searchRow}>
-          <TextInput
-            style={[styles.searchInput, { borderColor: '#7C3AED' }]}
-            value={cardNumber}
-            onChangeText={setCardNumber}
-            placeholder="e.g. 101"
-            placeholderTextColor="#94A3B8"
-            keyboardType="numeric"
-            autoCorrect={false}
-            returnKeyType="search"
-            onSubmitEditing={handleCardLookup}
-          />
-          <TouchableOpacity style={[styles.searchBtn, { backgroundColor: '#7C3AED', borderColor: '#7C3AED' }]} onPress={handleCardLookup} disabled={loading}>
-            {loading ? <ActivityIndicator color="#FFFFFF" size="small" /> : (
-              <Ionicons name="card" size={22} color="#FFFFFF" />
-            )}
-          </TouchableOpacity>
-        </View>
-      </View>
-
-      {/* Results */}
-      {searched && !loading && visitors.length === 0 && (
-        <View style={styles.emptyState}>
-          <Ionicons name="people-outline" size={48} color="#CBD5E1" />
-          <Text style={styles.emptyText}>No approved visitors for flat {flatNumber}</Text>
-        </View>
-      )}
-
-      {visitors.length > 0 && (
-        <FlatList
-          data={visitors}
-          keyExtractor={item => item.id}
-          contentContainerStyle={{ paddingHorizontal: 16, paddingBottom: 24 }}
-          renderItem={({ item }) => {
-            const expired = !isValidTill(item);
-            return (
-              <TouchableOpacity
-                style={[styles.visitorCard, expired && styles.visitorCardExpired]}
-                onPress={() => handleSelectVisitor(item)}
-              >
-                <View style={styles.visitorAvatar}>
-                  {item.local_photo ? (
-                    <Image source={{ uri: item.local_photo }} style={styles.avatarImg} />
-                  ) : (
-                    <Text style={styles.avatarInitial}>{item.name.charAt(0).toUpperCase()}</Text>
-                  )}
-                </View>
-                <View style={styles.visitorInfo}>
-                  <Text style={styles.visitorName}>{item.name}</Text>
-                  <Text style={styles.visitorPurpose}>{item.nature || 'Visitor'}</Text>
-                  {item.visit_date ? (
-                    <Text style={[styles.visitorValidity, expired && { color: '#DC2626' }]}>
-                      {expired ? 'PAST VISIT' : `Visit: ${item.visit_date}`}
-                    </Text>
-                  ) : null}
-                </View>
-                <Ionicons name="chevron-forward" size={20} color="#94A3B8" />
-              </TouchableOpacity>
-            );
+      {/* Entry / Return Mode */}
+      <View style={styles.modeSection}>
+        <TouchableOpacity
+          style={[styles.modeBtn, mainMode === 'entry' && styles.modeBtnActive]}
+          onPress={() => setMainMode('entry')}
+        >
+          <Ionicons name="log-in" size={18} color={mainMode === 'entry' ? '#FFFFFF' : '#78350F'} />
+          <Text style={[styles.modeBtnText, mainMode === 'entry' && styles.modeBtnTextActive]}>ENTRY</Text>
+        </TouchableOpacity>
+        <TouchableOpacity
+          style={[styles.modeBtn, mainMode === 'return' && styles.modeBtnActiveReturn]}
+          onPress={() => {
+            setMainMode('return');
+            openCardScanner('return');
           }}
-        />
+        >
+          <Ionicons name="log-out" size={18} color={mainMode === 'return' ? '#FFFFFF' : '#7C3AED'} />
+          <Text style={[styles.modeBtnText, mainMode === 'return' && styles.modeBtnTextActive]}>RETURN</Text>
+        </TouchableOpacity>
+      </View>
+
+      {mainMode === 'entry' ? (
+        <>
+          <View style={styles.searchSection}>
+            <Text style={styles.searchLabel}>ENTER FLAT NUMBER</Text>
+            <View style={styles.searchRow}>
+              <TextInput
+                style={styles.searchInput}
+                value={flatNumber}
+                onChangeText={setFlatNumber}
+                placeholder="e.g. 5162"
+                placeholderTextColor="#94A3B8"
+                keyboardType="numeric"
+                autoCorrect={false}
+                returnKeyType="search"
+                onSubmitEditing={handleSearch}
+              />
+              <TouchableOpacity style={styles.searchBtn} onPress={handleSearch} disabled={loading}>
+                {loading ? <ActivityIndicator color="#FFFFFF" size="small" /> : (
+                  <Ionicons name="search" size={22} color="#FFFFFF" />
+                )}
+              </TouchableOpacity>
+            </View>
+          </View>
+
+          {searched && !loading && visitors.length === 0 && (
+            <View style={styles.emptyState}>
+              <Ionicons name="people-outline" size={48} color="#CBD5E1" />
+              <Text style={styles.emptyText}>No approved visitors for flat {flatNumber}</Text>
+            </View>
+          )}
+
+          {visitors.length > 0 && (
+            <FlatList
+              data={visitors}
+              keyExtractor={item => item.id}
+              contentContainerStyle={{ paddingHorizontal: 16, paddingBottom: 24 }}
+              renderItem={({ item }) => {
+                const expired = !isValidTill(item);
+                return (
+                  <TouchableOpacity
+                    style={[styles.visitorCard, expired && styles.visitorCardExpired]}
+                    onPress={() => handleSelectVisitor(item)}
+                  >
+                    <View style={styles.visitorAvatar}>
+                      {item.local_photo ? (
+                        <Image source={{ uri: item.local_photo }} style={styles.avatarImg} />
+                      ) : (
+                        <Text style={styles.avatarInitial}>{item.name.charAt(0).toUpperCase()}</Text>
+                      )}
+                    </View>
+                    <View style={styles.visitorInfo}>
+                      <Text style={styles.visitorName}>{item.name}</Text>
+                      <Text style={styles.visitorPurpose}>{item.nature || 'Visitor'}</Text>
+                      {item.visit_date ? (
+                        <Text style={[styles.visitorValidity, expired && { color: '#DC2626' }]}>
+                          {expired ? 'PAST VISIT' : `Visit: ${item.visit_date}`}
+                        </Text>
+                      ) : null}
+                    </View>
+                    <Ionicons name="chevron-forward" size={20} color="#94A3B8" />
+                  </TouchableOpacity>
+                );
+              }}
+            />
+          )}
+        </>
+      ) : (
+        <View style={styles.returnHelpBox}>
+          <Ionicons name="barcode-outline" size={34} color="#7C3AED" />
+          <Text style={styles.returnHelpTitle}>Return Flow</Text>
+          <Text style={styles.returnHelpText}>Tap RETURN again to scan card barcode and fetch visitor details.</Text>
+          <TouchableOpacity style={styles.scanCardBtn} onPress={() => openCardScanner('return')}>
+            <Ionicons name="scan" size={22} color="#FFFFFF" />
+            <Text style={styles.scanCardBtnText}>SCAN CARD</Text>
+          </TouchableOpacity>
+        </View>
       )}
+
+      <Modal visible={showInsideModal} transparent animationType="slide" onRequestClose={() => setShowInsideModal(false)}>
+        <View style={styles.insideModalOverlay}>
+          <View style={styles.insideModalCard}>
+            <View style={styles.insideModalHeader}>
+              <Text style={styles.insideModalTitle}>Visitors inside campus</Text>
+              <TouchableOpacity onPress={() => setShowInsideModal(false)}>
+                <Ionicons name="close" size={24} color="#0F172A" />
+              </TouchableOpacity>
+            </View>
+            {insideVisitors.length === 0 ? (
+              <View style={styles.insideEmpty}>
+                <Text style={styles.insideEmptyText}>No visitors currently inside</Text>
+              </View>
+            ) : (
+              <FlatList
+                data={insideVisitors}
+                keyExtractor={item => item.id}
+                contentContainerStyle={{ paddingBottom: 8 }}
+                renderItem={({ item }) => (
+                  <TouchableOpacity
+                    style={styles.insideCard}
+                    onPress={() => {
+                      setShowInsideModal(false);
+                      handleSelectVisitor(item);
+                    }}
+                  >
+                    <View style={[styles.visitorAvatar, { backgroundColor: '#7C3AED20' }]}>
+                      {item.local_photo ? (
+                        <Image source={{ uri: item.local_photo }} style={styles.avatarImg} />
+                      ) : (
+                        <Text style={[styles.avatarInitial, { color: '#7C3AED' }]}>{item.name.charAt(0).toUpperCase()}</Text>
+                      )}
+                    </View>
+                    <View style={styles.visitorInfo}>
+                      <Text style={styles.visitorName}>{item.name}</Text>
+                      <Text style={styles.visitorPurpose}>Flat {item.flat} • Card #{item.card_number}</Text>
+                      <Text style={styles.visitorValidity}>
+                        {item.check_out ? `Expected out: ${item.check_out}` : 'No check-out time'}
+                      </Text>
+                    </View>
+                    <Ionicons name="chevron-forward" size={20} color="#7C3AED" />
+                  </TouchableOpacity>
+                )}
+              />
+            )}
+          </View>
+        </View>
+      </Modal>
     </SafeAreaView>
   );
 }
@@ -568,8 +762,53 @@ const styles = StyleSheet.create({
     justifyContent: 'space-between',
   },
   titleText: { fontSize: fs(20), fontWeight: '900', color: '#FFFBEB', letterSpacing: 2 },
+  insideIconBtn: {
+    width: 36,
+    height: 36,
+    borderRadius: 18,
+    borderWidth: 1,
+    borderColor: 'rgba(255,255,255,0.5)',
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
 
   // Search
+  modeSection: {
+    flexDirection: 'row',
+    gap: 12,
+    paddingHorizontal: 16,
+    paddingVertical: 12,
+    borderBottomWidth: 1,
+    borderBottomColor: '#E2E8F0',
+  },
+  modeBtn: {
+    flex: 1,
+    borderWidth: 2,
+    borderColor: '#78350F',
+    backgroundColor: '#FFFBEB',
+    borderRadius: 10,
+    paddingVertical: 12,
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: 8,
+  },
+  modeBtnActive: {
+    backgroundColor: '#78350F',
+  },
+  modeBtnActiveReturn: {
+    backgroundColor: '#7C3AED',
+    borderColor: '#7C3AED',
+  },
+  modeBtnText: {
+    color: '#334155',
+    fontSize: fs(14),
+    fontWeight: '900',
+    letterSpacing: 1,
+  },
+  modeBtnTextActive: {
+    color: '#FFFFFF',
+  },
   searchSection: { padding: 16, borderBottomWidth: 1, borderBottomColor: '#E2E8F0' },
   cardSearchSection: { paddingHorizontal: 16, paddingTop: 8, paddingBottom: 16, borderBottomWidth: 1, borderBottomColor: '#E2E8F0' },
   searchLabel: { fontSize: fs(11), fontWeight: '700', color: '#64748B', letterSpacing: 2, marginBottom: 8 },
@@ -597,6 +836,18 @@ const styles = StyleSheet.create({
   // Empty state
   emptyState: { flex: 1, justifyContent: 'center', alignItems: 'center', padding: 32 },
   emptyText: { fontSize: fs(14), color: '#94A3B8', marginTop: 12, textAlign: 'center' },
+  returnHelpBox: {
+    margin: 16,
+    padding: 16,
+    borderWidth: 2,
+    borderColor: '#DDD6FE',
+    backgroundColor: '#F5F3FF',
+    borderRadius: 14,
+    alignItems: 'center',
+    gap: 10,
+  },
+  returnHelpTitle: { fontSize: fs(18), fontWeight: '900', color: '#5B21B6' },
+  returnHelpText: { fontSize: fs(13), color: '#6D28D9', textAlign: 'center' },
 
   // Visitor card
   visitorCard: {
@@ -684,6 +935,19 @@ const styles = StyleSheet.create({
     letterSpacing: 1,
   },
   cardAssignSection: { marginBottom: 20 },
+  scanCardBtn: {
+    marginTop: 10,
+    backgroundColor: '#7C3AED',
+    borderRadius: 8,
+    paddingVertical: 12,
+    paddingHorizontal: 16,
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: 8,
+  },
+  scanCardBtnText: { color: '#FFFFFF', fontWeight: '700', fontSize: fs(14), letterSpacing: 0.5 },
+  scanCardHint: { marginTop: 8, color: '#475569', fontSize: fs(12), lineHeight: fs(16) },
   currentCardRow: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', marginTop: 8 },
   currentCardText: { fontSize: fs(12), fontWeight: '700', color: '#7C3AED', marginLeft: 4 },
   returnCardBtn: { flexDirection: 'row', alignItems: 'center', gap: 4, backgroundColor: '#FEF2F2', paddingHorizontal: 12, paddingVertical: 6, borderRadius: 6, borderWidth: 1, borderColor: '#FECACA' },
@@ -700,6 +964,17 @@ const styles = StyleSheet.create({
     marginTop: 8,
   },
   doneBtnText: { fontSize: fs(18), fontWeight: '900', color: '#FFFFFF', letterSpacing: 2 },
+  returnActionBtn: {
+    height: 60,
+    backgroundColor: '#DC2626',
+    justifyContent: 'center',
+    alignItems: 'center',
+    flexDirection: 'row',
+    gap: 10,
+    borderWidth: 2,
+    borderColor: '#7F1D1D',
+    marginTop: 8,
+  },
   photoSectionLabel: {
     fontSize: fs(11),
     fontWeight: '700',
@@ -835,5 +1110,48 @@ const styles = StyleSheet.create({
     fontWeight: '600',
     color: '#0F172A',
     paddingVertical: 4,
+  },
+
+  // Inside campus modal
+  insideModalOverlay: {
+    flex: 1,
+    backgroundColor: 'rgba(15, 23, 42, 0.5)',
+    justifyContent: 'flex-end',
+  },
+  insideModalCard: {
+    maxHeight: '75%',
+    backgroundColor: '#FFFFFF',
+    borderTopLeftRadius: 16,
+    borderTopRightRadius: 16,
+    paddingHorizontal: 16,
+    paddingTop: 12,
+    paddingBottom: 8,
+  },
+  insideModalHeader: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    marginBottom: 8,
+  },
+  insideModalTitle: { fontSize: fs(16), fontWeight: '900', color: '#0F172A' },
+  insideEmpty: {
+    alignItems: 'center',
+    paddingVertical: 20,
+  },
+  insideEmptyText: {
+    fontSize: fs(13),
+    color: '#94A3B8',
+    fontWeight: '600',
+  },
+  insideCard: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    padding: 14,
+    borderRadius: 14,
+    borderWidth: 2,
+    borderColor: '#7C3AED30',
+    backgroundColor: '#F5F3FF',
+    marginTop: 10,
+    gap: 12,
   },
 });

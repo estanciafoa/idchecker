@@ -4,6 +4,7 @@ import {
   ActivityIndicator, Image, Alert, ScrollView, KeyboardAvoidingView, Platform,
 } from 'react-native';
 import { CameraView, useCameraPermissions } from 'expo-camera';
+import { Audio } from 'expo-av';
 import { Ionicons } from '@expo/vector-icons';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { readAsStringAsync, EncodingType, documentDirectory, copyAsync } from 'expo-file-system/legacy';
@@ -21,6 +22,8 @@ import {
   type VehicleType,
 } from '../src/services/storage';
 import { pushAllUnpushed } from '../src/services/autoPush';
+
+const SUCCESS_SOUND = require('../assets/sounds/success.mp3');
 
 const VEHICLE_TYPES: { type: VehicleType; label: string; icon?: keyof typeof Ionicons.glyphMap }[] = [
   { type: 'auto', label: 'AUTO' },
@@ -179,6 +182,13 @@ export default function TaxiScreen() {
       });
 
       void pushAllUnpushed();
+      // Play success sound
+      try {
+        const { sound } = await Audio.Sound.createAsync(SUCCESS_SOUND, { shouldPlay: true, volume: 1.0 });
+        sound.setOnPlaybackStatusUpdate((status) => {
+          if ('didJustFinish' in status && status.didJustFinish) sound.unloadAsync();
+        });
+      } catch {}
       Alert.alert('Saved', 'Taxi/cab entry logged.');
 
       // Reset

@@ -19,6 +19,7 @@ import { useRouter } from 'expo-router';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import HamburgerMenu from '../src/components/HamburgerMenu';
 import { fs } from '../src/utils/scale';
+import { parseValidityDate } from '../src/utils/dateUtils';
 
 const SUCCESS_SOUND = require('../assets/sounds/success.mp3');
 const FAILURE_SOUND = require('../assets/sounds/failure.mp3');
@@ -28,7 +29,10 @@ import {
   getLocalResidents,
   addAccessLog,
   preloadResidents,
+  getLocalAccessLogs,
+  getVisitorByCard,
   type Resident,
+  type Visitor,
   type AccessLogEntry,
   getDeviceLocation,
 } from '../src/services/storage';
@@ -39,13 +43,23 @@ export default function ScannerScreen() {
   const router = useRouter();
   const [permission, requestPermission] = useCameraPermissions();
   const [scanned, setScanned] = useState(false);
+  const [cameraActive, setCameraActive] = useState(false);
   const [resident, setResident] = useState<Resident | null>(null);
+  const [visitor, setVisitor] = useState<Visitor | null>(null);
+  const [visitorExpired, setVisitorExpired] = useState(false);
   const [showResult, setShowResult] = useState(false);
   const [notFound, setNotFound] = useState(false);
   const [manualId, setManualId] = useState('');
+  const [wedgeInput, setWedgeInput] = useState('');
   const [loading, setLoading] = useState(false);
+  const [manualFocused, setManualFocused] = useState(false);
   const [residentCount, setResidentCount] = useState(0);
+  const [todayStats, setTodayStats] = useState({ total: 0, verified: 0, denied: 0 });
+  const autoDismissTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const cameraIdleTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const cameraRef = useRef<any>(null);
+  const wedgeInputRef = useRef<TextInput>(null);
+  const manualInputRef = useRef<TextInput>(null);
   const successSoundRef = useRef<Audio.Sound | null>(null);
   const failureSoundRef = useRef<Audio.Sound | null>(null);
 
@@ -62,32 +76,80 @@ export default function ScannerScreen() {
     Audio.Sound.createAsync(FAILURE_SOUND).then(({ sound }) => { failureSoundRef.current = sound; }).catch(() => {});
     // Pre-warm cache on mount for instant lookups
     preloadResidents().then(setResidentCount);
+    loadTodayStats();
     const sub = AppState.addEventListener('change', (state) => {
-      if (state === 'active') preloadResidents().then(setResidentCount);
+      if (state === 'active') { preloadResidents().then(setResidentCount); loadTodayStats(); }
     });
     return () => {
       sub.remove();
       successSoundRef.current?.unloadAsync();
       failureSoundRef.current?.unloadAsync();
+      if (autoDismissTimer.current) clearTimeout(autoDismissTimer.current);
     };
   }, []);
 
+  // Auto-dismiss camera after 15s idle
   useEffect(() => {
-    if (!showResult) preloadResidents().then(setResidentCount);
+    if (cameraActive && !scanned) {
+      cameraIdleTimer.current = setTimeout(() => setCameraActive(false), 15000);
+    }
+    return () => { if (cameraIdleTimer.current) { clearTimeout(cameraIdleTimer.current); cameraIdleTimer.current = null; } };
+  }, [cameraActive, scanned]);
+
+  useEffect(() => {
+    if (!showResult) { preloadResidents().then(setResidentCount); loadTodayStats(); }
   }, [showResult]);
+
+  // Keep a hidden input focused so keyboard-wedge barcode scanners work even
+  // when the visible textbox is not focused.
+  useEffect(() => {
+    if (showResult || manualFocused) return;
+    const t = setTimeout(() => wedgeInputRef.current?.focus(), 100);
+    return () => clearTimeout(t);
+  }, [showResult, manualFocused]);
 
   const loadResidentCount = async () => {
     const count = await preloadResidents();
     setResidentCount(count);
   };
 
-  const handleManualLookup = async () => {
-    if (!manualId.trim()) return;
+  const loadTodayStats = async () => {
+    const logs = await getLocalAccessLogs();
+    const todayStr = new Date().toISOString().slice(0, 10);
+    const todayLogs = logs.filter(l => l.timestamp.slice(0, 10) === todayStr);
+    setTodayStats({
+      total: todayLogs.length,
+      verified: todayLogs.filter(l => l.status === 'verified').length,
+      denied: todayLogs.filter(l => l.status !== 'verified').length,
+    });
+  };
+
+  const runLookup = async (rawCode: string) => {
+    const trimmed = rawCode.trim();
+    if (!trimmed) return;
     setLoading(true);
     await loadResidentCount();
-    await lookupResident(manualId.trim());
+    if (trimmed.startsWith('EST-V-')) {
+      await lookupVisitorCard(trimmed);
+    } else {
+      await lookupResident(trimmed);
+    }
     setLoading(false);
+  };
+
+  const handleManualLookup = async () => {
+    if (!manualId.trim()) return;
+    await runLookup(manualId.trim());
     setManualId('');
+  };
+
+  const handleWedgeLookup = async () => {
+    if (!wedgeInput.trim() || showResult || loading) {
+      setWedgeInput('');
+      return;
+    }
+    await runLookup(wedgeInput);
+    setWedgeInput('');
   };
 
   const handleManualIdChange = (value: string) => {
@@ -113,47 +175,9 @@ export default function ScannerScreen() {
   const handleBarCodeScanned = useCallback(async ({ data }: { data: string }) => {
     if (scanned) return;
     setScanned(true);
-    setLoading(true);
-    await lookupResident(data.trim());
-    setLoading(false);
+    const trimmed = data.trim();
+    await runLookup(trimmed);
   }, [scanned]);
-
-  const parseValidityDate = (validity: string): Date | null => {
-    const text = validity.trim();
-
-    let match = text.match(/^(\d{1,2})[./-](\d{1,2})[./-](\d{4})$/);
-    if (match) {
-      const [, day, month, year] = match;
-      const parsed = new Date(Number(year), Number(month) - 1, Number(day));
-      return isNaN(parsed.getTime()) ? null : parsed;
-    }
-
-    const monthMap: Record<string, number> = {
-      january: 0,
-      february: 1,
-      march: 2,
-      april: 3,
-      may: 4,
-      june: 5,
-      july: 6,
-      august: 7,
-      september: 8,
-      october: 9,
-      november: 10,
-      december: 11,
-    };
-
-    match = text.match(/^(\d{1,2})(?:st|nd|rd|th)?\s+([A-Za-z]+)\s+(\d{4})$/i);
-    if (match) {
-      const [, day, monthName, year] = match;
-      const month = monthMap[monthName.toLowerCase()];
-      if (month === undefined) return null;
-      const parsed = new Date(Number(year), month, Number(day));
-      return isNaN(parsed.getTime()) ? null : parsed;
-    }
-
-    return null;
-  };
 
   const isExpired = (resident: Resident): boolean => {
     if (!resident.validity) return false;
@@ -222,12 +246,59 @@ export default function ScannerScreen() {
       void playSound(FAILURE_SOUND);
     }
     setShowResult(true);
+    // Keep verified scan details on screen longer for easier review
+    if (autoDismissTimer.current) clearTimeout(autoDismissTimer.current);
+    const shouldAutoDismiss = found && found.status === 'active' && !isExpired(found) && !isBlackListed(found);
+    if (shouldAutoDismiss) {
+      autoDismissTimer.current = setTimeout(() => resetScan(), 30000);
+    }
+  };
+
+  const isVisitorExpired = (v: Visitor): boolean => {
+    const text = (v.check_out || '').trim();
+    if (!text) return false;
+    const parseDate = (s: string): Date | null => {
+      let m = s.match(/^(\d{1,2})[./-](\d{1,2})[./-](\d{4})$/);
+      if (m) return new Date(Number(m[3]), Number(m[2]) - 1, Number(m[1]));
+      m = s.match(/^(\d{4})-(\d{1,2})-(\d{1,2})$/);
+      if (m) return new Date(Number(m[1]), Number(m[2]) - 1, Number(m[3]));
+      return null;
+    };
+    const endDate = parseDate(text);
+    if (!endDate) return false;
+    const today = new Date(); today.setHours(0, 0, 0, 0);
+    return today > endDate;
+  };
+
+  const lookupVisitorCard = async (card: string) => {
+    const found = await getVisitorByCard(card);
+    if (found) {
+      setVisitor(found);
+      setNotFound(false);
+      const expired = isVisitorExpired(found);
+      setVisitorExpired(expired);
+      void playSound(expired ? FAILURE_SOUND : SUCCESS_SOUND);
+    } else {
+      setVisitor(null);
+      setNotFound(true);
+      void playSound(FAILURE_SOUND);
+    }
+    setShowResult(true);
+    // Keep valid visitor scan details on screen longer for easier review
+    if (autoDismissTimer.current) clearTimeout(autoDismissTimer.current);
+    if (found && !isVisitorExpired(found)) {
+      autoDismissTimer.current = setTimeout(() => resetScan(), 30000);
+    }
   };
 
   const resetScan = () => {
+    if (autoDismissTimer.current) { clearTimeout(autoDismissTimer.current); autoDismissTimer.current = null; }
     setScanned(false);
+    setCameraActive(false);
     setShowResult(false);
     setResident(null);
+    setVisitor(null);
+    setVisitorExpired(false);
     setNotFound(false);
     loadResidentCount();
   };
@@ -252,6 +323,73 @@ export default function ScannerScreen() {
               <Text style={styles.invalidIdSubtext}>This ID does not exist in the system.</Text>
             </View>
             <TouchableOpacity testID="close-result-btn" style={styles.scanNextBtn} onPress={resetScan}>
+              <Text style={styles.scanNextText}>SCAN NEXT</Text>
+            </TouchableOpacity>
+          </View>
+        ) : visitor ? (
+          <View style={styles.resultFull}>
+            {/* Visitor Status Banner */}
+            <View style={[styles.statusBanner, visitorExpired ? styles.deniedBanner : styles.verifiedBanner]}>
+              <Ionicons name={visitorExpired ? 'ban' : 'checkmark-circle'} size={28} color="#FFFFFF" />
+              <Text style={styles.bannerText}>{visitorExpired ? 'EXPIRED' : 'VALID VISITOR'}</Text>
+            </View>
+
+            {/* Visitor Photo */}
+            <View style={styles.photoFull}>
+              {visitor.local_photo ? (
+                <>
+                  <Image
+                    source={{ uri: visitor.local_photo }}
+                    style={styles.photoImage}
+                    resizeMode="cover"
+                  />
+                  {visitorExpired && (
+                    <View style={styles.photoOverlay}>
+                      <Text style={styles.overlayText}>EXPIRED</Text>
+                    </View>
+                  )}
+                </>
+              ) : (
+                <>
+                  <Text style={styles.photoFullInitial}>{visitor.name.charAt(0).toUpperCase()}</Text>
+                  <Text style={styles.photoName}>{visitor.name}</Text>
+                  {visitorExpired && (
+                    <View style={styles.photoOverlay}>
+                      <Text style={styles.overlayText}>EXPIRED</Text>
+                    </View>
+                  )}
+                </>
+              )}
+            </View>
+
+            {/* Visitor Name */}
+            <View style={styles.nameBar}>
+              <Text style={styles.nameText}>{visitor.name}</Text>
+              <Text style={styles.validityText}>
+                {visitor.check_out ? `Valid till: ${visitor.check_out}` : 'No expiry set'}
+              </Text>
+            </View>
+
+            {/* Visitor Info */}
+            <View style={styles.infoBar}>
+              <View style={styles.infoItem}>
+                <Text style={styles.infoLabel}>CARD</Text>
+                <Text style={styles.infoValue}>{visitor.card_number || 'N/A'}</Text>
+              </View>
+              <View style={styles.infoSep} />
+              <View style={styles.infoItem}>
+                <Text style={styles.infoLabel}>FLAT</Text>
+                <Text style={styles.infoValue}>{visitor.flat}</Text>
+              </View>
+              <View style={styles.infoSep} />
+              <View style={styles.infoItem}>
+                <Text style={styles.infoLabel}>NATURE</Text>
+                <Text style={styles.infoValue}>{visitor.nature || 'N/A'}</Text>
+              </View>
+            </View>
+
+            <TouchableOpacity testID="close-result-btn" style={styles.scanNextBtn} onPress={resetScan}>
+              <Ionicons name="scan" size={20} color="#FFFFFF" />
               <Text style={styles.scanNextText}>SCAN NEXT</Text>
             </TouchableOpacity>
           </View>
@@ -376,12 +514,32 @@ export default function ScannerScreen() {
             <Text style={styles.titleText}>STUDENTS</Text>
             <View style={{ width: 36 }} />
           </View>
+          <TextInput
+            ref={wedgeInputRef}
+            value={wedgeInput}
+            onChangeText={setWedgeInput}
+            onSubmitEditing={handleWedgeLookup}
+            autoFocus
+            blurOnSubmit={false}
+            showSoftInputOnFocus={false}
+            style={styles.hiddenWedgeInput}
+            caretHidden
+            onBlur={() => {
+              if (!manualFocused && !showResult) {
+                setTimeout(() => wedgeInputRef.current?.focus(), 50);
+              }
+            }}
+          />
           <View style={styles.statusBar}>
             <View style={[styles.statusDot, residentCount > 0 ? styles.dotOnline : styles.dotOffline]} />
-            <Text style={styles.statusText}>{residentCount} RESIDENTS IN LOCAL DB</Text>
+            <Text style={styles.statusText}>{residentCount} RESIDENTS</Text>
+            <View style={styles.todayStats}>
+              <Text style={styles.todayStatsText}>{todayStats.total} TODAY</Text>
+              {todayStats.denied > 0 && <Text style={[styles.todayStatsText, { color: '#FF3B30' }]}>{todayStats.denied} DENIED</Text>}
+            </View>
             <TouchableOpacity testID="pull-refresh-btn-no-camera" style={styles.pullRefreshBtn} onPress={openSyncForPullRefresh}>
               <Ionicons name="cloud-download" size={14} color="#D97706" />
-              <Text style={styles.pullRefreshText}>PULL & REFRESH</Text>
+              <Text style={styles.pullRefreshText}>SYNC</Text>
             </TouchableOpacity>
           </View>
           <View style={styles.permissionBox}>
@@ -400,6 +558,8 @@ export default function ScannerScreen() {
                 style={styles.manualInput}
                 value={manualId}
                 onChangeText={handleManualIdChange}
+                onFocus={() => setManualFocused(true)}
+                onBlur={() => setManualFocused(false)}
                 placeholder="e.g. 5124"
                 placeholderTextColor="#94A3B8"
                 keyboardType="number-pad"
@@ -430,15 +590,46 @@ export default function ScannerScreen() {
           <Text style={styles.titleText}>STUDENTS</Text>
           <View style={{ width: 36 }} />
         </View>
+        <TextInput
+          ref={wedgeInputRef}
+          value={wedgeInput}
+          onChangeText={setWedgeInput}
+          onSubmitEditing={handleWedgeLookup}
+          autoFocus
+          blurOnSubmit={false}
+          showSoftInputOnFocus={false}
+          style={styles.hiddenWedgeInput}
+          caretHidden
+          onBlur={() => {
+            if (!manualFocused && !showResult) {
+              setTimeout(() => wedgeInputRef.current?.focus(), 50);
+            }
+          }}
+        />
         <View style={styles.statusBar}>
           <View style={[styles.statusDot, residentCount > 0 ? styles.dotOnline : styles.dotOffline]} />
-          <Text style={styles.statusText}>{residentCount} RESIDENTS IN LOCAL DB</Text>
+          <Text style={styles.statusText}>{residentCount} RESIDENTS</Text>
+          <View style={styles.todayStats}>
+            <Text style={styles.todayStatsText}>{todayStats.total} TODAY</Text>
+            {todayStats.denied > 0 && <Text style={[styles.todayStatsText, { color: '#FF3B30' }]}>{todayStats.denied} DENIED</Text>}
+          </View>
           <TouchableOpacity testID="pull-refresh-btn" style={styles.pullRefreshBtn} onPress={openSyncForPullRefresh}>
             <Ionicons name="cloud-download" size={14} color="#0055FF" />
-            <Text style={styles.pullRefreshText}>PULL & REFRESH</Text>
+            <Text style={styles.pullRefreshText}>SYNC</Text>
           </TouchableOpacity>
         </View>
-        {!scanned && (
+        {!scanned && !cameraActive && (
+          <TouchableOpacity
+            style={styles.placeholderContainer}
+            onPress={() => setCameraActive(true)}
+            activeOpacity={0.7}
+          >
+            <Ionicons name="scan-outline" size={80} color="#78350F" />
+            <Text style={styles.placeholderTitle}>TAP TO SCAN ID</Text>
+            <Text style={styles.placeholderSubtext}>Camera will open for barcode scanning</Text>
+          </TouchableOpacity>
+        )}
+        {!scanned && cameraActive && (
           <View style={styles.cameraContainer}>
             <CameraView
               ref={cameraRef}
@@ -473,11 +664,14 @@ export default function ScannerScreen() {
           <Text style={styles.manualLabel}>MANUAL ID ENTRY</Text>
           <View style={styles.manualRow}>
             <TextInput
+              ref={manualInputRef}
               testID="manual-id-input-scanner"
               style={styles.manualInput}
               value={manualId}
               onChangeText={handleManualIdChange}
-              placeholder="Enter Resident ID"
+              onFocus={() => setManualFocused(true)}
+              onBlur={() => setManualFocused(false)}
+              placeholder="Scan or type ID"
               placeholderTextColor="#94A3B8"
               keyboardType="number-pad"
               maxLength={6}
@@ -496,6 +690,14 @@ export default function ScannerScreen() {
 
 const styles = StyleSheet.create({
   container: { flex: 1, backgroundColor: '#FFFFFF' },
+  hiddenWedgeInput: {
+    position: 'absolute',
+    width: 1,
+    height: 1,
+    opacity: 0.01,
+    left: -100,
+    top: -100,
+  },
   titleBar: { backgroundColor: '#78350F', paddingVertical: 14, paddingHorizontal: 16, flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between' },
   titleText: { fontSize: fs(20), fontWeight: '900', color: '#FFFBEB', letterSpacing: 2 },
   statusBar: { flexDirection: 'row', alignItems: 'center', padding: 12, paddingHorizontal: 24, backgroundColor: '#F8FAFC', borderBottomWidth: 1, borderBottomColor: '#E2E8F0' },
@@ -503,6 +705,8 @@ const styles = StyleSheet.create({
   dotOnline: { backgroundColor: '#00C853' },
   dotOffline: { backgroundColor: '#FFB300' },
   statusText: { fontSize: fs(12), fontWeight: '700', color: '#475569', letterSpacing: 1 },
+  todayStats: { flexDirection: 'row', gap: 8, marginLeft: 8 },
+  todayStatsText: { fontSize: fs(11), fontWeight: '800', color: '#00C853', letterSpacing: 0.5 },
   pullRefreshBtn: {
     marginLeft: 'auto',
     flexDirection: 'row',
@@ -520,6 +724,9 @@ const styles = StyleSheet.create({
     color: '#D97706',
     letterSpacing: 0.6,
   },
+  placeholderContainer: { flex: 1, justifyContent: 'center', alignItems: 'center', backgroundColor: '#FFFBEB' },
+  placeholderTitle: { fontSize: fs(24), fontWeight: '900', color: '#78350F', marginTop: 16, letterSpacing: 2 },
+  placeholderSubtext: { fontSize: fs(13), fontWeight: '600', color: '#92400E', marginTop: 8 },
   cameraContainer: { flex: 1, position: 'relative' },
   camera: { flex: 1 },
   overlay: { ...StyleSheet.absoluteFillObject, justifyContent: 'center', alignItems: 'center', backgroundColor: 'rgba(0,0,0,0.4)' },

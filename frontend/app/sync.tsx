@@ -1,7 +1,7 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import {
   View, Text, StyleSheet, TouchableOpacity, ActivityIndicator,
-  ScrollView, Alert, TextInput, Modal,
+  ScrollView, Alert, TextInput, Modal, Platform,
 } from 'react-native';
 import PasswordLock from '../src/components/PasswordLock';
 import { Ionicons } from '@expo/vector-icons';
@@ -13,7 +13,7 @@ import {
   getLocalResidents, saveLocalResidents, getLastSyncTime, setLastSyncTime,
   getLocalMaidsCooks, saveLocalMaidsCooks, setMaidCookLastSyncTime,
   getLocalVisitors, saveLocalVisitors, setVisitorLastSyncTime,
-  clearSyncData,
+  clearSyncData, getSyncToken, setSyncToken,
 } from '../src/services/storage';
 import {
   downloadAllPhotos,
@@ -71,7 +71,7 @@ function resolvePhotoUrl(id: string, row: Record<string, string>): string {
 }
 
 export default function SyncScreen() {
-  const [syncing, setSyncing] = useState(false);
+  const [syncing, setSyncing] = useState<string | null>(null); // null | 'all' | 'students' | 'maidcooks' | 'visitors'
   const [lastSync, setLastSync] = useState<string | null>(null);
   const [localCount, setLocalCount] = useState(0);
   const [localCountMC, setLocalCountMC] = useState(0);
@@ -81,10 +81,20 @@ export default function SyncScreen() {
   const [clearing, setClearing] = useState(false);
   const [showClearPassword, setShowClearPassword] = useState(false);
 
-  const [syncToken, setSyncToken] = useState('');
+  const [tokenInput, setTokenInput] = useState('');
+  const tokenRef = useRef('');
   const [showPassword, setShowPassword] = useState(false);
+  const [showTokenModal, setShowTokenModal] = useState(false);
+  const [tokenModalInput, setTokenModalInput] = useState('');
+  const tokenResolveRef = useRef<((val: string | null) => void) | null>(null);
 
-  useEffect(() => { loadStatus(); }, []);
+  // Keep ref in sync with state
+  useEffect(() => { tokenRef.current = tokenInput; }, [tokenInput]);
+
+  useEffect(() => {
+    loadStatus();
+    getSyncToken().then(t => { if (t) { setTokenInput(t); tokenRef.current = t; } });
+  }, []);
 
   const loadStatus = async () => {
     const residents = await getLocalResidents();
@@ -106,14 +116,20 @@ export default function SyncScreen() {
     const res = await fetch(APPS_SCRIPT_URL, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ action: 'get_csv', ...opts, token: syncToken.trim() }),
+      body: JSON.stringify({ action: 'get_csv', ...opts, token: tokenRef.current }),
       redirect: 'follow',
     });
     if (!res.ok) throw new Error('Fetch failed: ' + res.status);
     const raw = await res.text();
     if (raw.trimStart().startsWith('{')) {
       const err = JSON.parse(raw);
-      if (!err.ok) throw new Error(err.error || 'Access denied');
+      if (!err.ok) {
+        const msg = err.error || 'Access denied';
+        if (/denied|invalid.*token|unauthorized/i.test(msg)) {
+          const e = new Error(msg); (e as any).isTokenError = true; throw e;
+        }
+        throw new Error(msg);
+      }
     }
     return parseCSV(raw);
   };
@@ -156,187 +172,275 @@ export default function SyncScreen() {
     return { items: Array.from(all.values()), added, updated, photoOnly, dataOnly, deleted, skipped };
   };
 
-  const handleSync = async () => {
-    if (!syncToken.trim()) { setSyncError('Enter password first'); return; }
-    setSyncing(true);
+  // Shared ZIP cache so we only download once per sync-all
+  let cachedZipBase64: string | null = null;
+
+  const fetchZipOnce = async (): Promise<string> => {
+    if (cachedZipBase64) return cachedZipBase64;
+    setSyncResult('Downloading photos ZIP...');
+    const zipRes = await fetch(zipUrl(tokenRef.current), { redirect: 'follow' });
+    if (!zipRes.ok) throw new Error('Failed to download ZIP: ' + zipRes.status);
+    const zipBase64 = await zipRes.text();
+    if (zipBase64.trimStart().startsWith('{')) {
+      const errObj = JSON.parse(zipBase64);
+      if (!errObj.ok) {
+        const msg = errObj.error || 'ZIP access denied';
+        if (/denied|invalid.*token|unauthorized/i.test(msg)) {
+          const e = new Error(msg); (e as any).isTokenError = true; throw e;
+        }
+        throw new Error(msg);
+      }
+    }
+    setSyncResult('Extracting photos...');
+    await importPhotosFromBase64(zipBase64, (done, total) => {
+      setSyncResult(`Extracting photos: ${done}/${total}`);
+    });
+    cachedZipBase64 = zipBase64;
+    return zipBase64;
+  };
+
+  const sortNewFirst = (items: Resident[]) =>
+    [...items].sort((a, b) => (b.is_new ? 1 : 0) - (a.is_new ? 1 : 0));
+
+  const syncStudents = async () => {
+    setSyncResult('Fetching students...');
+    const studentRows = await fetchCsv({ gid: sheetGids.students });
+    setSyncResult(`Processing ${studentRows.length} students...`);
+    const existingResidents = await getLocalResidents();
+    const existingIds = new Set(existingResidents.map(r => r.id.toLowerCase()));
+    const sResult = processRows<Resident>(studentRows, existingResidents, (id, row, ex) => {
+      const mobile = getCol(row, 'Mobile', 'mobile', 'MOBILE', 'Phone', 'phone');
+      const incoming = {
+        name: getCol(row, 'Name', 'name', 'NAME'),
+        unit: getCol(row, 'flat number', 'Flat', 'flat', 'FLAT', 'Unit', 'unit'),
+        aadhar_masked: getCol(row, 'Aadhar/SRMID', 'Aadhar', 'aadhar', 'AADHAR'),
+        phone_last4: mobile ? mobile.replace(/\D/g, '').slice(-4) : '',
+        photo_url: resolvePhotoUrl(id, row),
+        validity: getCol(row, 'ValidTill', 'Validity', 'validity', 'VALIDITY'),
+        vehicle_plate: getCol(row, 'Vehicle', 'vehicle', 'Vehicle Plate', 'vehicle_plate'),
+      };
+      const flag = getCol(row, 'update', 'Update', 'UPDATE').toLowerCase();
+      const isNew = !existingIds.has(id.toLowerCase());
+      if (flag === 'ud' && ex) {
+        return { ...ex, ...incoming, photo_url: ex.photo_url, local_photo: ex.local_photo, is_new: false, updated_at: new Date().toISOString() };
+      }
+      const base = ex || { id, photo_base64: '', status: 'active', created_at: new Date().toISOString() } as any;
+      return { ...base, ...incoming, local_photo: flag === 'n' ? '' : (ex ? '' : ''), photo_base64: base.photo_base64 || '', is_new: isNew, updated_at: new Date().toISOString(), id, status: base.status || 'active', created_at: base.created_at || new Date().toISOString() };
+    });
+
+    const needsPhoto = sResult.added > 0 || sResult.updated > 0 || sResult.photoOnly > 0;
+    if (needsPhoto) {
+      await fetchZipOnce();
+    }
+
+    const studentsAttached = await attachLocalPhotosById(sResult.items);
+    if (needsPhoto) {
+      setSyncResult('Downloading fallback URL photos...');
+      const withPhotos = await downloadAllPhotos(studentsAttached, (done, total) => {
+        setSyncResult(`Photos: ${done}/${total}`);
+      });
+      const cleaned = await cleanupExpiredPhotos(withPhotos);
+      await saveLocalResidents(cleaned);
+      setLocalCount(cleaned.length);
+    } else {
+      await saveLocalResidents(studentsAttached);
+      setLocalCount(studentsAttached.length);
+    }
+    await setLastSyncTime(new Date().toISOString());
+    return `Students: N${sResult.added} U${sResult.updated} D${sResult.deleted}`;
+  };
+
+  const syncMaidsCooks = async () => {
+    setSyncResult('Fetching maids & cooks...');
+    const maidRows = await fetchCsv({ gid: sheetGids.maidsCooks });
+    setSyncResult(`Processing ${maidRows.length} maids/cooks...`);
+    const existingMC = await getLocalMaidsCooks();
+    const mResult = processRows<MaidCook>(maidRows, existingMC, (id, row, ex) => {
+      const mobile = getCol(row, 'Mobile', 'mobile', 'MOBILE', 'Phone', 'phone');
+      const incoming = {
+        name: getCol(row, 'Name', 'name', 'NAME'),
+        flats: getCol(row, 'flat number', 'Flat', 'flat', 'FLAT', 'Flats', 'flats'),
+        aadhar_masked: getCol(row, 'Aadhar/SRMID', 'Aadhar', 'aadhar', 'AADHAR'),
+        phone_last4: mobile ? mobile.replace(/\D/g, '').slice(-4) : '',
+        photo_url: resolvePhotoUrl(id, row),
+        validity: getCol(row, 'ValidTill', 'Validity', 'validity', 'VALIDITY'),
+        vehicle_plate: getCol(row, 'Vehicle', 'vehicle', 'Vehicle Plate', 'vehicle_plate'),
+      };
+      const flag = getCol(row, 'update', 'Update', 'UPDATE').toLowerCase();
+      if (flag === 'ud' && ex) {
+        return { ...ex, ...incoming, photo_url: ex.photo_url, local_photo: ex.local_photo, updated_at: new Date().toISOString() };
+      }
+      const base = ex || { id, photo_base64: '', status: 'active', created_at: new Date().toISOString() } as any;
+      return { ...base, ...incoming, local_photo: flag === 'n' ? '' : (ex ? '' : ''), photo_base64: base.photo_base64 || '', updated_at: new Date().toISOString(), id, status: base.status || 'active', created_at: base.created_at || new Date().toISOString() };
+    });
+
+    const mcNeedsPhoto = mResult.added > 0 || mResult.updated > 0 || mResult.photoOnly > 0;
+    if (mcNeedsPhoto) {
+      await fetchZipOnce();
+    }
+
+    const maidsAttached = await attachLocalPhotosById(mResult.items, MAIDCOOK_PHOTOS_DIR_NAME);
+    if (mcNeedsPhoto) {
+      setSyncResult('Downloading maid/cook photos...');
+      const mcWithPhotos = await downloadAllPhotos(maidsAttached, (done, total) => {
+        setSyncResult(`Maid/cook photos: ${done}/${total}`);
+      }, MAIDCOOK_PHOTOS_DIR_NAME);
+      await saveLocalMaidsCooks(mcWithPhotos);
+      setLocalCountMC(mcWithPhotos.length);
+    } else {
+      await saveLocalMaidsCooks(maidsAttached);
+      setLocalCountMC(maidsAttached.length);
+    }
+    await setMaidCookLastSyncTime(new Date().toISOString());
+    return `Maids/Cooks: N${mResult.added} U${mResult.updated} D${mResult.deleted}`;
+  };
+
+  const syncVisitors = async () => {
+    setSyncResult('Fetching visitors...');
+    const visitorRows = await fetchCsv({ gid: sheetGids.visitors });
+    if (visitorRows.length === 0) return 'Visitors: no data';
+
+    setSyncResult(`Processing ${visitorRows.length} visitors...`);
+    const existingV = await getLocalVisitors();
+    const existingPhotoMap = new Map<string, string>();
+    const existingIdPhotoMap = new Map<string, string>();
+    const existingCardMap = new Map<string, string>();
+    for (const v of existingV) {
+      if (v.local_photo) existingPhotoMap.set(v.id.toLowerCase(), v.local_photo);
+      if (v.local_photo_id) existingIdPhotoMap.set(v.id.toLowerCase(), v.local_photo_id);
+      if (v.card_number) existingCardMap.set(v.id.toLowerCase(), v.card_number);
+    }
+
+    const visitors: Visitor[] = [];
+    for (const row of visitorRows) {
+      const name = getCol(row, 'Visitor Name', 'visitor name', 'Name', 'name');
+      const flat = getCol(row, 'Flat', 'flat', 'FLAT', 'flat number');
+      if (!name || !flat) continue;
+      const visitDate = getCol(row, 'Visit Date', 'visit date', 'Visit date');
+      const id = (flat + '_' + name + '_' + visitDate).replace(/[^A-Za-z0-9]/g, '_').toLowerCase();
+      const existingPhoto = existingPhotoMap.get(id) || '';
+      visitors.push({
+        id,
+        name,
+        flat,
+        aadhar_last4: getCol(row, 'Last 4 digits of Adhaar', 'last 4 digits of adhaar', 'Adhaar', 'Aadhar'),
+        nature: getCol(row, 'Nature of Visitor', 'nature of visitor', 'Nature', 'nature'),
+        visit_date: visitDate,
+        requested_by: getCol(row, 'Request raised by', 'request raised by'),
+        check_in: getCol(row, 'Check In', 'check in', 'Check in'),
+        check_out: getCol(row, 'Check out', 'check out', 'Check Out'),
+        night_stay: getCol(row, 'Night Stay', 'night stay', 'Nights'),
+        office_status: getCol(row, 'EFOA Office Status', 'efoa office status', 'Status', 'status'),
+        local_photo: existingPhoto,
+        local_photo_id: existingIdPhotoMap.get(id) || '',
+        card_number: existingCardMap.get(id) || '',
+        status: 'active',
+        created_at: new Date().toISOString(),
+        updated_at: new Date().toISOString(),
+      });
+    }
+    await saveLocalVisitors(visitors);
+    setLocalCountV(visitors.length);
+    await setVisitorLastSyncTime(new Date().toISOString());
+    return `Visitors: ${visitors.length}`;
+  };
+
+  const handleSyncCategory = async (category: 'students' | 'maidcooks' | 'visitors') => {
+    const token = await ensureToken();
+    if (!token) return;
+    setSyncing(category);
     setSyncResult(null);
     setSyncError(null);
     try {
-      // ── 1. Fetch students ──
-      setSyncResult('Fetching students...');
-      const studentRows = await fetchCsv({ gid: sheetGids.students });
-
-      // ── 2. Fetch maids/cooks ──
-      setSyncResult('Fetching maids & cooks...');
-      const maidRows = await fetchCsv({ gid: sheetGids.maidsCooks });
-
-      // ── 3. Fetch visitors (optional – sheet may not exist yet) ──
-      let visitorRows: Record<string, string>[] = [];
-      try {
-        setSyncResult('Fetching visitors...');
-        visitorRows = await fetchCsv({ gid: sheetGids.visitors });
-      } catch (_) { /* visitors sheet may not exist yet */ }
-
-      // ── 4. Process students ──
-      setSyncResult(`Processing ${studentRows.length} students...`);
-      const existingResidents = await getLocalResidents();
-      const sResult = processRows<Resident>(studentRows, existingResidents, (id, row, ex) => {
-        const mobile = getCol(row, 'Mobile', 'mobile', 'MOBILE', 'Phone', 'phone');
-        const incoming = {
-          name: getCol(row, 'Name', 'name', 'NAME'),
-          unit: getCol(row, 'flat number', 'Flat', 'flat', 'FLAT', 'Unit', 'unit'),
-          aadhar_masked: getCol(row, 'Aadhar/SRMID', 'Aadhar', 'aadhar', 'AADHAR'),
-          phone_last4: mobile ? mobile.replace(/\D/g, '').slice(-4) : '',
-          photo_url: resolvePhotoUrl(id, row),
-          validity: getCol(row, 'ValidTill', 'Validity', 'validity', 'VALIDITY'),
-          vehicle_plate: getCol(row, 'Vehicle', 'vehicle', 'Vehicle Plate', 'vehicle_plate'),
-        };
-        const flag = getCol(row, 'update', 'Update', 'UPDATE').toLowerCase();
-        if (flag === 'ud' && ex) {
-          return { ...ex, ...incoming, photo_url: ex.photo_url, local_photo: ex.local_photo, updated_at: new Date().toISOString() };
-        }
-        const base = ex || { id, photo_base64: '', status: 'active', created_at: new Date().toISOString() } as any;
-        return { ...base, ...incoming, local_photo: flag === 'n' ? '' : (ex ? '' : ''), photo_base64: base.photo_base64 || '', updated_at: new Date().toISOString(), id, status: base.status || 'active', created_at: base.created_at || new Date().toISOString() };
-      });
-
-      // ── 5. Process maids/cooks ──
-      setSyncResult(`Processing ${maidRows.length} maids/cooks...`);
-      const existingMC = await getLocalMaidsCooks();
-      const mResult = processRows<MaidCook>(maidRows, existingMC, (id, row, ex) => {
-        const mobile = getCol(row, 'Mobile', 'mobile', 'MOBILE', 'Phone', 'phone');
-        const incoming = {
-          name: getCol(row, 'Name', 'name', 'NAME'),
-          flats: getCol(row, 'flat number', 'Flat', 'flat', 'FLAT', 'Flats', 'flats'),
-          aadhar_masked: getCol(row, 'Aadhar/SRMID', 'Aadhar', 'aadhar', 'AADHAR'),
-          phone_last4: mobile ? mobile.replace(/\D/g, '').slice(-4) : '',
-          photo_url: resolvePhotoUrl(id, row),
-          validity: getCol(row, 'ValidTill', 'Validity', 'validity', 'VALIDITY'),
-          vehicle_plate: getCol(row, 'Vehicle', 'vehicle', 'Vehicle Plate', 'vehicle_plate'),
-        };
-        const flag = getCol(row, 'update', 'Update', 'UPDATE').toLowerCase();
-        if (flag === 'ud' && ex) {
-          return { ...ex, ...incoming, photo_url: ex.photo_url, local_photo: ex.local_photo, updated_at: new Date().toISOString() };
-        }
-        const base = ex || { id, photo_base64: '', status: 'active', created_at: new Date().toISOString() } as any;
-        return { ...base, ...incoming, local_photo: flag === 'n' ? '' : (ex ? '' : ''), photo_base64: base.photo_base64 || '', updated_at: new Date().toISOString(), id, status: base.status || 'active', created_at: base.created_at || new Date().toISOString() };
-      });
-
-      // ── 6. Process visitors (no ID/update column – full replace) ──
-      let visitorCount = 0;
-      if (visitorRows.length > 0) {
-        setSyncResult(`Processing ${visitorRows.length} visitors...`);
-        const existingV = await getLocalVisitors();
-        // Build map of existing photos by id so we preserve them
-        const existingPhotoMap = new Map<string, string>();
-        const existingIdPhotoMap = new Map<string, string>();
-        const existingCardMap = new Map<string, string>();
-        for (const v of existingV) {
-          if (v.local_photo) existingPhotoMap.set(v.id.toLowerCase(), v.local_photo);
-          if (v.local_photo_id) existingIdPhotoMap.set(v.id.toLowerCase(), v.local_photo_id);
-          if (v.card_number) existingCardMap.set(v.id.toLowerCase(), v.card_number);
-        }
-
-        const visitors: Visitor[] = [];
-        for (const row of visitorRows) {
-          const name = getCol(row, 'Visitor Name', 'visitor name', 'Name', 'name');
-          const flat = getCol(row, 'Flat', 'flat', 'FLAT', 'flat number');
-          if (!name || !flat) continue;
-          const visitDate = getCol(row, 'Visit Date', 'visit date', 'Visit date');
-          // Generate stable ID from flat + name + visit date
-          const id = (flat + '_' + name + '_' + visitDate).replace(/[^A-Za-z0-9]/g, '_').toLowerCase();
-          const existingPhoto = existingPhotoMap.get(id) || '';
-          visitors.push({
-            id,
-            name,
-            flat,
-            aadhar_last4: getCol(row, 'Last 4 digits of Adhaar', 'last 4 digits of adhaar', 'Adhaar', 'Aadhar'),
-            nature: getCol(row, 'Nature of Visitor', 'nature of visitor', 'Nature', 'nature'),
-            visit_date: visitDate,
-            requested_by: getCol(row, 'Request raised by', 'request raised by'),
-            check_in: getCol(row, 'Check In', 'check in', 'Check in'),
-            check_out: getCol(row, 'Check out', 'check out', 'Check Out'),
-            night_stay: getCol(row, 'Night Stay', 'night stay', 'Nights'),
-            office_status: getCol(row, 'EFOA Office Status', 'efoa office status', 'Status', 'status'),
-            local_photo: existingPhoto,
-            local_photo_id: existingIdPhotoMap.get(id) || '',
-            card_number: existingCardMap.get(id) || '',
-            status: 'active',
-            created_at: new Date().toISOString(),
-            updated_at: new Date().toISOString(),
-          });
-        }
-        visitorCount = visitors.length;
-        await saveLocalVisitors(visitors);
-        setLocalCountV(visitors.length);
-        await setVisitorLastSyncTime(new Date().toISOString());
+      let result = '';
+      if (category === 'students') result = await syncStudents();
+      else if (category === 'maidcooks') result = await syncMaidsCooks();
+      else if (category === 'visitors') result = await syncVisitors();
+      const now = new Date().toISOString();
+      setLastSync(now);
+      await setSyncToken(tokenRef.current);
+      setSyncResult('Done! ' + result);
+    } catch (error: any) {
+      if (error?.isTokenError) {
+        setTokenInput(''); tokenRef.current = ''; await setSyncToken('');
+        setSyncError('Wrong token. Enter the correct token.');
+        setSyncing(null);
+        const newToken = await ensureToken();
+        if (newToken) handleSyncCategory(category);
+        return;
       }
+      setSyncError(`SYNC FAILED: ${error?.message || 'Check connection'}`);
+    } finally {
+      setSyncing(null);
+    }
+  };
 
-      // ── 7. Download & extract photos ZIP ──
-      const needsPhoto = sResult.added > 0 || sResult.updated > 0 || sResult.photoOnly > 0 ||
-                          mResult.added > 0 || mResult.updated > 0 || mResult.photoOnly > 0;
-
-      if (needsPhoto) {
-        setSyncResult('Downloading photos ZIP...');
-        const zipRes = await fetch(zipUrl(syncToken.trim()), { redirect: 'follow' });
-        if (!zipRes.ok) throw new Error('Failed to download ZIP: ' + zipRes.status);
-        const zipBase64 = await zipRes.text();
-        if (zipBase64.trimStart().startsWith('{')) {
-          const errObj = JSON.parse(zipBase64);
-          if (!errObj.ok) throw new Error(errObj.error || 'ZIP access denied');
-        }
-        setSyncResult('Extracting photos...');
-        await importPhotosFromBase64(zipBase64, (done, total) => {
-          setSyncResult(`Extracting photos: ${done}/${total}`);
-        });
-      }
-
-      // ── 8. Attach local photos ──
-      const studentsAttached = await attachLocalPhotosById(sResult.items);
-      const maidsAttached = await attachLocalPhotosById(mResult.items, MAIDCOOK_PHOTOS_DIR_NAME);
-
-      // ── 9. Save students ──
-      if (needsPhoto) {
-        setSyncResult('Downloading fallback URL photos...');
-        const withPhotos = await downloadAllPhotos(studentsAttached, (done, total) => {
-          setSyncResult(`Photos: ${done}/${total}`);
-        });
-        const cleaned = await cleanupExpiredPhotos(withPhotos);
-        await saveLocalResidents(cleaned);
-        setLocalCount(cleaned.length);
-      } else {
-        await saveLocalResidents(studentsAttached);
-        setLocalCount(studentsAttached.length);
-      }
-
-      // ── 10. Save maids/cooks (download photos from photo_url to separate dir) ──
-      const mcNeedsPhoto = mResult.added > 0 || mResult.updated > 0 || mResult.photoOnly > 0;
-      if (mcNeedsPhoto) {
-        setSyncResult('Downloading maid/cook photos...');
-        const mcWithPhotos = await downloadAllPhotos(maidsAttached, (done, total) => {
-          setSyncResult(`Maid/cook photos: ${done}/${total}`);
-        }, MAIDCOOK_PHOTOS_DIR_NAME);
-        await saveLocalMaidsCooks(mcWithPhotos);
-        setLocalCountMC(mcWithPhotos.length);
-      } else {
-        await saveLocalMaidsCooks(maidsAttached);
-        setLocalCountMC(maidsAttached.length);
-      }
+  const handleSync = async () => {
+    const token = await ensureToken();
+    if (!token) return;
+    setSyncing('all');
+    setSyncResult(null);
+    setSyncError(null);
+    try {
+      const parts: string[] = [];
+      parts.push(await syncStudents());
+      parts.push(await syncMaidsCooks());
+      try { parts.push(await syncVisitors()); } catch (_) { /* visitors sheet may not exist yet */ }
 
       const now = new Date().toISOString();
       await setLastSyncTime(now);
-      await setMaidCookLastSyncTime(now);
       setLastSync(now);
-
-      const parts: string[] = [];
-      if (studentRows.length > 0) parts.push(`Students: N${sResult.added} U${sResult.updated} D${sResult.deleted}`);
-      if (maidRows.length > 0) parts.push(`Maids: N${mResult.added} U${mResult.updated} D${mResult.deleted}`);
-      if (visitorRows.length > 0) parts.push(`Visitors: ${visitorCount}`);
+      await setSyncToken(tokenRef.current);
       setSyncResult('Done! ' + parts.join(' | '));
     } catch (error: any) {
+      if (error?.isTokenError) {
+        setTokenInput(''); tokenRef.current = ''; await setSyncToken('');
+        setSyncError('Wrong token. Enter the correct token.');
+        cachedZipBase64 = null;
+        setSyncing(null);
+        const newToken = await ensureToken();
+        if (newToken) handleSync();
+        return;
+      }
       setSyncError(`SYNC FAILED: ${error?.message || 'Check connection'}`);
     } finally {
-      setSyncing(false);
+      cachedZipBase64 = null;
+      setSyncing(null);
     }
+  };
+
+  const promptForToken = (): Promise<string | null> => {
+    return new Promise((resolve) => {
+      Alert.prompt(
+        'Sync Token',
+        'Enter sync token to connect to Google Sheets',
+        [
+          { text: 'Cancel', style: 'cancel', onPress: () => resolve(null) },
+          { text: 'Save', onPress: (val: string | undefined) => resolve(val?.trim() || null) },
+        ],
+        'secure-text',
+        '',
+        'default',
+      );
+    });
+  };
+
+  const ensureToken = async (): Promise<string | null> => {
+    if (tokenRef.current) return tokenRef.current;
+    // Try stored token
+    const stored = await getSyncToken();
+    if (stored) { setTokenInput(stored); tokenRef.current = stored; return stored; }
+    // Prompt user
+    if (Platform.OS === 'ios') {
+      const val = await promptForToken();
+      if (val) { setTokenInput(val); tokenRef.current = val; await setSyncToken(val); return val; }
+      return null;
+    }
+    // Android: Alert.prompt not available, use a state-based modal
+    return new Promise((resolve) => {
+      setShowTokenModal(true);
+      tokenResolveRef.current = resolve;
+    });
   };
 
   return (
@@ -347,61 +451,70 @@ export default function SyncScreen() {
         <View style={{ width: 36 }} />
       </View>
       <ScrollView contentContainerStyle={styles.scrollContent}>
-        {/* ── Password ── */}
-        <View style={styles.passwordRow}>
-          <Ionicons name="lock-closed" size={20} color="#78350F" />
-          <TextInput
-            style={styles.passwordInput}
-            value={syncToken}
-            onChangeText={setSyncToken}
-            placeholder="Enter sync password"
-            placeholderTextColor="#94A3B8"
-            secureTextEntry={!showPassword}
-            autoCapitalize="none"
-            autoCorrect={false}
-          />
-          <TouchableOpacity onPress={() => setShowPassword(!showPassword)} style={{ padding: 6 }}>
-            <Ionicons name={showPassword ? 'eye-off' : 'eye'} size={20} color="#475569" />
+
+        {/* ── Category Sync Cards ── */}
+        <View style={styles.categoryRow}>
+          <TouchableOpacity
+            style={[styles.categoryCard, syncing === 'students' && styles.categoryCardActive]}
+            onPress={() => handleSyncCategory('students')}
+            disabled={!!syncing}
+          >
+            {syncing === 'students' ? (
+              <ActivityIndicator color="#78350F" size="small" />
+            ) : (
+              <Ionicons name="school" size={32} color="#78350F" />
+            )}
+            <Text style={styles.categoryCount}>{localCount}</Text>
+            <Text style={styles.categoryLabel}>STUDENTS</Text>
+            <Ionicons name="sync-circle" size={18} color={syncing ? '#CBD5E1' : '#0055FF'} style={styles.categorySyncIcon} />
+          </TouchableOpacity>
+
+          <TouchableOpacity
+            style={[styles.categoryCard, syncing === 'maidcooks' && styles.categoryCardActive]}
+            onPress={() => handleSyncCategory('maidcooks')}
+            disabled={!!syncing}
+          >
+            {syncing === 'maidcooks' ? (
+              <ActivityIndicator color="#78350F" size="small" />
+            ) : (
+              <Ionicons name="restaurant" size={32} color="#78350F" />
+            )}
+            <Text style={styles.categoryCount}>{localCountMC}</Text>
+            <Text style={styles.categoryLabel}>MAIDS/COOKS</Text>
+            <Ionicons name="sync-circle" size={18} color={syncing ? '#CBD5E1' : '#0055FF'} style={styles.categorySyncIcon} />
+          </TouchableOpacity>
+
+          <TouchableOpacity
+            style={[styles.categoryCard, syncing === 'visitors' && styles.categoryCardActive]}
+            onPress={() => handleSyncCategory('visitors')}
+            disabled={!!syncing}
+          >
+            {syncing === 'visitors' ? (
+              <ActivityIndicator color="#78350F" size="small" />
+            ) : (
+              <Ionicons name="person-add" size={32} color="#78350F" />
+            )}
+            <Text style={styles.categoryCount}>{localCountV}</Text>
+            <Text style={styles.categoryLabel}>VISITORS</Text>
+            <Ionicons name="sync-circle" size={18} color={syncing ? '#CBD5E1' : '#0055FF'} style={styles.categorySyncIcon} />
           </TouchableOpacity>
         </View>
 
-        {/* ── Status Card ── */}
-        <View style={styles.statusCard}>
-          <View style={styles.statusRow}>
-            <Ionicons name="school" size={22} color="#78350F" />
-            <View style={styles.statusInfo}>
-              <Text style={styles.statusLabel}>STUDENTS</Text>
-              <Text style={styles.statusValue}>{localCount}</Text>
-            </View>
-            <Ionicons name="restaurant" size={22} color="#78350F" />
-            <View style={styles.statusInfo}>
-              <Text style={styles.statusLabel}>MAIDS/COOKS</Text>
-              <Text style={styles.statusValue}>{localCountMC}</Text>
-            </View>
-            <Ionicons name="person-add" size={22} color="#78350F" />
-            <View style={styles.statusInfo}>
-              <Text style={styles.statusLabel}>VISITORS</Text>
-              <Text style={styles.statusValue}>{localCountV}</Text>
-            </View>
-          </View>
-          <View style={styles.divider} />
-          <View style={styles.statusRow}>
-            <Ionicons name="time" size={24} color="#78350F" />
-            <View style={styles.statusInfo}>
-              <Text style={styles.statusLabel}>LAST SYNCED</Text>
-              <Text style={styles.statusValue}>{lastSync ? formatSyncTime(lastSync) : 'NEVER'}</Text>
-            </View>
-          </View>
+        {/* ── Last Synced ── */}
+        <View style={styles.lastSyncRow}>
+          <Ionicons name="time" size={18} color="#78350F" />
+          <Text style={styles.lastSyncLabel}>LAST SYNCED:</Text>
+          <Text style={styles.lastSyncValue}>{lastSync ? formatSyncTime(lastSync) : 'NEVER'}</Text>
         </View>
 
-        {/* ── Sync Button ── */}
+        {/* ── Sync All Button ── */}
         <TouchableOpacity
           testID="import-sheet-btn"
-          style={[styles.importBtn, syncing && styles.btnDisabled]}
+          style={[styles.importBtn, !!syncing && styles.btnDisabled]}
           onPress={handleSync}
-          disabled={syncing}
+          disabled={!!syncing}
         >
-          {syncing ? <ActivityIndicator color="#FFFFFF" /> : (
+          {syncing === 'all' ? <ActivityIndicator color="#FFFFFF" /> : (
             <>
               <Ionicons name="cloud-download" size={24} color="#FFFFFF" />
               <Text style={styles.importBtnText}>SYNC ALL DATA</Text>
@@ -430,9 +543,9 @@ export default function SyncScreen() {
         {/* ── Clear All Data ── */}
         <View style={{ marginTop: 32, borderTopWidth: 1, borderTopColor: '#E2E8F0', paddingTop: 24 }}>
           <TouchableOpacity
-            style={[styles.clearBtn, (clearing || syncing) && styles.btnDisabled]}
+            style={[styles.clearBtn, (clearing || !!syncing) && styles.btnDisabled]}
             onPress={() => setShowClearPassword(true)}
-            disabled={clearing || syncing}
+            disabled={clearing || !!syncing}
           >
             {clearing ? <ActivityIndicator color="#FFFFFF" /> : (
               <>
@@ -487,6 +600,57 @@ export default function SyncScreen() {
           <Ionicons name="close" size={24} color="#FFFFFF" />
         </TouchableOpacity>
       </Modal>
+
+      {/* Token input modal for Android (Alert.prompt not available) */}
+      <Modal visible={showTokenModal} transparent animationType="fade" onRequestClose={() => {
+        setShowTokenModal(false);
+        tokenResolveRef.current?.(null);
+        tokenResolveRef.current = null;
+      }}>
+        <View style={styles.tokenModalOverlay}>
+          <View style={styles.tokenModalBox}>
+            <Text style={styles.tokenModalTitle}>Sync Token</Text>
+            <Text style={styles.tokenModalSubtitle}>Enter token to connect to Google Sheets</Text>
+            <TextInput
+              style={styles.tokenModalInput}
+              value={tokenModalInput}
+              onChangeText={setTokenModalInput}
+              placeholder="Token"
+              placeholderTextColor="#94A3B8"
+              secureTextEntry
+              autoCapitalize="none"
+              autoCorrect={false}
+              autoFocus
+            />
+            <View style={styles.tokenModalBtns}>
+              <TouchableOpacity style={styles.tokenModalCancelBtn} onPress={() => {
+                setShowTokenModal(false);
+                setTokenModalInput('');
+                tokenResolveRef.current?.(null);
+                tokenResolveRef.current = null;
+              }}>
+                <Text style={styles.tokenModalCancelText}>Cancel</Text>
+              </TouchableOpacity>
+              <TouchableOpacity style={styles.tokenModalSaveBtn} onPress={async () => {
+                const val = tokenModalInput.trim();
+                setShowTokenModal(false);
+                setTokenModalInput('');
+                if (val) {
+                  setTokenInput(val);
+                  tokenRef.current = val;
+                  await setSyncToken(val);
+                  tokenResolveRef.current?.(val);
+                } else {
+                  tokenResolveRef.current?.(null);
+                }
+                tokenResolveRef.current = null;
+              }}>
+                <Text style={styles.tokenModalSaveText}>Save</Text>
+              </TouchableOpacity>
+            </View>
+          </View>
+        </View>
+      </Modal>
     </SafeAreaView>
   );
 }
@@ -498,12 +662,15 @@ const styles = StyleSheet.create({
   scrollContent: { padding: 20 },
   passwordRow: { flexDirection: 'row', alignItems: 'center', borderWidth: 2, borderColor: '#78350F', backgroundColor: '#FFFBEB', paddingHorizontal: 12, paddingVertical: 4, marginBottom: 20, gap: 8 },
   passwordInput: { flex: 1, fontSize: fs(14), color: '#0F172A', paddingVertical: 10 },
-  statusCard: { borderWidth: 2, borderColor: '#000000', padding: 16, backgroundColor: '#F8FAFC', marginBottom: 24, elevation: 4 },
-  statusRow: { flexDirection: 'row', alignItems: 'center', gap: 12 },
-  statusInfo: { flex: 1 },
-  statusLabel: { fontSize: fs(10), fontWeight: '700', color: '#64748B', letterSpacing: 2 },
-  statusValue: { fontSize: fs(18), fontWeight: '900', color: '#000000', marginTop: 2 },
-  divider: { height: 1, backgroundColor: '#E2E8F0', marginVertical: 12 },
+  categoryRow: { flexDirection: 'row', gap: 10, marginBottom: 16 },
+  categoryCard: { flex: 1, borderWidth: 2, borderColor: '#000000', backgroundColor: '#F8FAFC', alignItems: 'center', paddingVertical: 16, paddingHorizontal: 4, elevation: 4 },
+  categoryCardActive: { borderColor: '#0055FF', backgroundColor: '#EFF6FF' },
+  categoryCount: { fontSize: fs(22), fontWeight: '900', color: '#000000', marginTop: 6 },
+  categoryLabel: { fontSize: fs(9), fontWeight: '800', color: '#64748B', letterSpacing: 1, marginTop: 2 },
+  categorySyncIcon: { marginTop: 8 },
+  lastSyncRow: { flexDirection: 'row', alignItems: 'center', gap: 8, marginBottom: 16, paddingHorizontal: 4 },
+  lastSyncLabel: { fontSize: fs(10), fontWeight: '700', color: '#64748B', letterSpacing: 1 },
+  lastSyncValue: { fontSize: fs(13), fontWeight: '900', color: '#000000' },
   sectionHeader: { flexDirection: 'row', alignItems: 'center', gap: 8, marginBottom: 10 },
   sectionTitle: { fontSize: fs(12), fontWeight: '900', color: '#D97706', letterSpacing: 1 },
   sheetConfig: { borderWidth: 1, borderColor: '#E2E8F0', padding: 14, backgroundColor: '#F8FAFC', marginBottom: 16 },
@@ -523,4 +690,14 @@ const styles = StyleSheet.create({
   offlineText: { fontSize: fs(11), fontWeight: '700', color: '#FFB300', letterSpacing: 1 },
   clearBtn: { height: 56, backgroundColor: '#DC2626', justifyContent: 'center', alignItems: 'center', flexDirection: 'row', gap: 10, borderWidth: 2, borderColor: '#991B1B' },
   clearBtnText: { color: '#FFFFFF', fontSize: fs(15), fontWeight: '900', letterSpacing: 1 },
+  tokenModalOverlay: { flex: 1, backgroundColor: 'rgba(0,0,0,0.5)', justifyContent: 'center', alignItems: 'center', padding: 24 },
+  tokenModalBox: { backgroundColor: '#FFFFFF', borderRadius: 16, padding: 24, width: '100%', maxWidth: 340 },
+  tokenModalTitle: { fontSize: fs(18), fontWeight: '900', color: '#0F172A', marginBottom: 4 },
+  tokenModalSubtitle: { fontSize: fs(12), color: '#64748B', marginBottom: 16 },
+  tokenModalInput: { borderWidth: 2, borderColor: '#78350F', borderRadius: 8, paddingHorizontal: 12, paddingVertical: 10, fontSize: fs(14), color: '#0F172A', marginBottom: 16 },
+  tokenModalBtns: { flexDirection: 'row', justifyContent: 'flex-end', gap: 12 },
+  tokenModalCancelBtn: { paddingVertical: 10, paddingHorizontal: 16 },
+  tokenModalCancelText: { fontSize: fs(14), color: '#64748B', fontWeight: '700' },
+  tokenModalSaveBtn: { backgroundColor: '#78350F', paddingVertical: 10, paddingHorizontal: 20, borderRadius: 8 },
+  tokenModalSaveText: { fontSize: fs(14), color: '#FFFFFF', fontWeight: '900' },
 });
