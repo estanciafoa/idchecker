@@ -47,6 +47,7 @@ export async function pushAllUnpushed(): Promise<void> {
       try {
         const photoBase64 = await loadLogPhoto(checkin.compositeBase64);
         await uploadVisitorCheckin({
+          checkinId: checkin.id,
           visitor: checkin.visitor,
           photoBase64,
           timestamp: checkin.timestamp,

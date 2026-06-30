@@ -494,7 +494,7 @@ export default function SyncScreen() {
     try {
       const parts: string[] = [];
       parts.push(await syncStudents());
-      parts.push(await syncMaidsCooks());
+      // Maid/cook sync disabled for now — not updated.
       try { parts.push(await syncVisitors()); } catch (_) { /* visitors sheet may not exist yet */ }
 
       const now = new Date().toISOString();
@@ -579,20 +579,13 @@ export default function SyncScreen() {
             <Ionicons name="sync-circle" size={18} color={syncing ? '#CBD5E1' : '#0055FF'} style={styles.categorySyncIcon} />
           </TouchableOpacity>
 
-          <TouchableOpacity
-            style={[styles.categoryCard, syncing === 'maidcooks' && styles.categoryCardActive]}
-            onPress={() => handleSyncCategory('maidcooks')}
-            disabled={!!syncing}
-          >
-            {syncing === 'maidcooks' ? (
-              <ActivityIndicator color="#78350F" size="small" />
-            ) : (
-              <Ionicons name="restaurant" size={32} color="#78350F" />
-            )}
+          {/* Maid/cook sync disabled for now — data is not updated. */}
+          <View style={[styles.categoryCard, { opacity: 0.45 }]}>
+            <Ionicons name="restaurant" size={32} color="#94A3B8" />
             <Text style={styles.categoryCount}>{localCountMC}</Text>
             <Text style={styles.categoryLabel}>MAIDS/COOKS</Text>
-            <Ionicons name="sync-circle" size={18} color={syncing ? '#CBD5E1' : '#0055FF'} style={styles.categorySyncIcon} />
-          </TouchableOpacity>
+            <Text style={{ fontSize: fs(8), fontWeight: '800', color: '#94A3B8', letterSpacing: 1, marginTop: 6 }}>DISABLED</Text>
+          </View>
 
           <TouchableOpacity
             style={[styles.categoryCard, syncing === 'visitors' && styles.categoryCardActive]}

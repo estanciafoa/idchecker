@@ -867,57 +867,69 @@ function uploadVisitorCheckin_(payload) {
   }
   var timestamp = payload.timestamp || new Date().toISOString();
   var istTimestamp = toIstTimestamp_(timestamp);
+  var checkinId = String(payload.checkinId || '').trim();
 
-  var folder = DriveApp.getFolderById(FOLDER_VISITORS);
+  var CHECKIN_ID_COL = 10; // column J — unique per check-in event, for dedup
 
-  var photoFileName = '';
-  // Save photo to Drive
-  if (payload.photoBase64) {
-    var safeName = 'visitor_' + String(visitor.id).replace(/[^A-Za-z0-9_-]/g, '') +
-      '_' + timestamp.replace(/[:.]/g, '-') + '.jpg';
-    var bytes = Utilities.base64Decode(payload.photoBase64);
-    var blob = Utilities.newBlob(bytes, 'image/jpeg', safeName);
-    folder.createFile(blob);
-    photoFileName = safeName;
+  // Serialize the dedup-check + append so two concurrent pushes of the same
+  // check-in (e.g. retry + a second pusher) can't both slip through.
+  var lock = LockService.getScriptLock();
+  try { lock.waitLock(30000); } catch (e) { /* proceed without lock if unavailable */ }
+
+  try {
+    var ss = SpreadsheetApp.openById(DEFAULT_SPREADSHEET_ID);
+    var sheet = ss.getSheetByName('visitor_log');
+    if (!sheet) {
+      sheet = ss.insertSheet('visitor_log');
+      sheet.getRange(1, 1, 1, 10).setValues([
+        ['Timestamp', 'Visitor ID', 'Name', 'Flat', 'Phone', 'Aadhar', 'Purpose', 'Photo File', 'Location', 'Checkin ID']
+      ]);
+    }
+    // Make sure the Checkin ID header exists (older sheets had only 9 columns).
+    if (String(sheet.getRange(1, CHECKIN_ID_COL).getValue()).trim() !== 'Checkin ID') {
+      sheet.getRange(1, CHECKIN_ID_COL).setValue('Checkin ID');
+    }
+
+    // Idempotency: if this check-in id was already recorded, skip entirely
+    // (no duplicate row, no orphan photo).
+    if (checkinId) {
+      var lastRow = sheet.getLastRow();
+      if (lastRow > 1) {
+        var ids = sheet.getRange(2, CHECKIN_ID_COL, lastRow - 1, 1).getValues();
+        for (var i = 0; i < ids.length; i++) {
+          if (String(ids[i][0]).trim() === checkinId) {
+            return { uploaded: false, duplicate: true, fileName: '' };
+          }
+        }
+      }
+    }
+
+    var folder = DriveApp.getFolderById(FOLDER_VISITORS);
+    var photoFileName = '';
+    if (payload.photoBase64) {
+      var safeName = 'visitor_' + String(visitor.id).replace(/[^A-Za-z0-9_-]/g, '') +
+        '_' + timestamp.replace(/[:.]/g, '-') + '.jpg';
+      var bytes = Utilities.base64Decode(payload.photoBase64);
+      var blob = Utilities.newBlob(bytes, 'image/jpeg', safeName);
+      folder.createFile(blob);
+      photoFileName = safeName;
+    }
+
+    var rowValues = [
+      istTimestamp, visitor.id || '', visitor.name || '', visitor.flat || '',
+      visitor.phone || '', visitor.aadhar || '', visitor.purpose || '',
+      photoFileName || '', payload.location || '', checkinId
+    ];
+    sheet.appendRow(rowValues);
+
+    // Append to persistent CSV (dedup by the Checkin ID column, index 9).
+    var csvHeaders = ['Timestamp', 'Visitor ID', 'Name', 'Flat', 'Phone', 'Aadhar', 'Purpose', 'Photo File', 'Location', 'Checkin ID'];
+    appendToCsvFile_(FOLDER_VISITORS, 'visitor_logs.csv', csvHeaders, [rowValues], 9);
+
+    return { uploaded: true, fileName: photoFileName };
+  } finally {
+    try { lock.releaseLock(); } catch (e) {}
   }
-
-  // Append to visitor_log sheet
-  var ss = SpreadsheetApp.openById(DEFAULT_SPREADSHEET_ID);
-  var sheet = ss.getSheetByName('visitor_log');
-  if (!sheet) {
-    sheet = ss.insertSheet('visitor_log');
-    sheet.getRange(1, 1, 1, 9).setValues([
-      ['Timestamp', 'Visitor ID', 'Name', 'Flat', 'Phone', 'Aadhar', 'Purpose', 'Photo File', 'Location']
-    ]);
-  }
-  sheet.appendRow([
-    istTimestamp,
-    visitor.id || '',
-    visitor.name || '',
-    visitor.flat || '',
-    visitor.phone || '',
-    visitor.aadhar || '',
-    visitor.purpose || '',
-    photoFileName || '',
-    payload.location || ''
-  ]);
-
-  // Append to persistent CSV
-  var csvHeaders = ['Timestamp', 'Visitor ID', 'Name', 'Flat', 'Phone', 'Aadhar', 'Purpose', 'Photo File', 'Location'];
-  var csvRow = [[
-    istTimestamp,
-    visitor.id || '',
-    visitor.name || '',
-    visitor.flat || '',
-    visitor.phone || '',
-    visitor.aadhar || '',
-    visitor.purpose || '',
-    photoFileName,
-    payload.location || ''
-  ]];
-  appendToCsvFile_(FOLDER_VISITORS, 'visitor_logs.csv', csvHeaders, csvRow, -1);
-
-  return { uploaded: true, fileName: photoFileName };
 }
 
 // ---- MAID/COOK ATTENDANCE LOG ----

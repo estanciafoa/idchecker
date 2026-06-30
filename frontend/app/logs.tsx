@@ -18,8 +18,8 @@ import { useFocusEffect } from 'expo-router';
 import HamburgerMenu from '../src/components/HamburgerMenu';
 import { AutoRickshawIcon, TruckIcon } from '../src/components/VehicleIcons';
 import { fs } from '../src/utils/scale';
-import { getLocalAccessLogs, getUnpushedAccessLogs, markAccessLogsPushed, getPendingVisitorCheckins, removePendingVisitorCheckin, getUnpushedAttendance, markAttendancePushed, getUnpushedTaxiLogs, markTaxiLogsPushed, getMaidCookAttendance, getTaxiLogs, getCurrentlyInMaidsCooks, loadLogPhoto, type AccessLogEntry, type MaidCookAttendanceEntry, type TaxiLogEntry, type PendingVisitorCheckin } from '../src/services/storage';
-import { pushLogsToGoogleDrive, uploadVisitorCheckin, pushMaidCookAttendance, pushTaxiLogs } from '../src/services/api';
+import { getDeviceLocation, getLocalAccessLogs, getUnpushedAccessLogs, markAccessLogsPushed, getPendingVisitorCheckins, removePendingVisitorCheckin, getUnpushedAttendance, markAttendancePushed, getUnpushedTaxiLogs, markTaxiLogsPushed, getMaidCookAttendance, getTaxiLogs, getCurrentlyInMaidsCooks, loadLogPhoto, getSyncToken, getGlobalLogsCache, saveGlobalLogsCache, type AccessLogEntry, type MaidCookAttendanceEntry, type TaxiLogEntry, type PendingVisitorCheckin } from '../src/services/storage';
+import { pushLogsToGoogleDrive, uploadVisitorCheckin, pushMaidCookAttendance, pushTaxiLogs, fetchGlobalLogs } from '../src/services/api';
 
 type UnifiedLogEntry = {
   id: string;
@@ -34,6 +34,125 @@ type UnifiedLogEntry = {
   rawData?: any;
 };
 
+function parseLogTimestamp(value: string): number {
+  const text = String(value || '').trim();
+  if (!text) return 0;
+  const istMatch = text.match(/^(\d{4})-(\d{2})-(\d{2})[ T](\d{2}):(\d{2}):(\d{2})\s+IST$/i);
+  if (istMatch) {
+    return Date.UTC(
+      Number(istMatch[1]),
+      Number(istMatch[2]) - 1,
+      Number(istMatch[3]),
+      Number(istMatch[4]),
+      Number(istMatch[5]),
+      Number(istMatch[6]),
+    ) - (5.5 * 60 * 60 * 1000);
+  }
+  const parsed = new Date(text).getTime();
+  return Number.isNaN(parsed) ? 0 : parsed;
+}
+
+function formatTimestampInIst(value: string, options: Intl.DateTimeFormatOptions = {}) {
+  const parsed = parseLogTimestamp(value);
+  if (!parsed) return value;
+  return new Date(parsed).toLocaleString('en-IN', {
+    timeZone: 'Asia/Kolkata',
+    day: '2-digit',
+    month: 'short',
+    year: 'numeric',
+    hour: '2-digit',
+    minute: '2-digit',
+    ...options,
+  });
+}
+
+function mergeUniqueById<T extends { id: string }>(primary: T[], fallback: T[]): T[] {
+  const seen = new Set<string>();
+  const merged: T[] = [];
+  for (const item of [...primary, ...fallback]) {
+    const key = String(item.id || '').trim();
+    if (!key || seen.has(key)) continue;
+    seen.add(key);
+    merged.push(item);
+  }
+  return merged;
+}
+
+function buildGlobalLogState(cloud: any, localTaxiLogs: TaxiLogEntry[]) {
+  const unified: UnifiedLogEntry[] = [];
+
+  for (const l of cloud.accessLogs || []) {
+    unified.push({
+      id: 'a_' + (l.id || `${l.resident_id}_${l.timestamp}`),
+      type: 'access',
+      title: l.resident_name || 'Resident',
+      subtitle: `ID: ${l.resident_id || 'N/A'} • Flat: ${l.unit || 'N/A'}`,
+      timestamp: l.timestamp || '',
+      icon: 'person',
+      color: l.status === 'verified' ? '#00C853' : '#FF3B30',
+      isDenied: l.status !== 'verified',
+      rawData: l,
+    });
+  }
+
+  for (const c of cloud.visitorLogs || []) {
+    unified.push({
+      id: 'v_' + (c.id || `${c.visitor_id}_${c.timestamp}`),
+      type: 'visitor',
+      title: c.name || 'Visitor',
+      subtitle: `Visitor • Flat: ${c.flat || 'N/A'}`,
+      timestamp: c.timestamp || '',
+      icon: 'people',
+      color: '#F59E0B',
+      rawData: c,
+    });
+  }
+
+  for (const m of cloud.maidCookLogs || []) {
+    unified.push({
+      id: 'm_' + (m.id || `${m.maid_cook_id}_${m.timestamp}`),
+      type: 'maidcook',
+      title: m.name || 'Maid/Cook',
+      subtitle: `${m.direction || 'IN'} • Flat: ${m.flat || 'N/A'}`,
+      timestamp: m.timestamp || '',
+      icon: m.direction === 'IN' ? 'log-in' : 'log-out',
+      color: m.direction === 'IN' ? '#7C3AED' : '#6366F1',
+      rawData: m,
+    });
+  }
+
+  const taxiSource = mergeUniqueById(cloud.taxiLogs || [], localTaxiLogs as any[]);
+  for (const t of taxiSource) {
+    const vtype = (t.vehicle_type || 'taxi').toUpperCase();
+    unified.push({
+      id: 't_' + (t.id || `${t.vehicle_number}_${t.timestamp}`),
+      type: 'taxi',
+      title: t.vehicle_number || 'Vehicle',
+      subtitle: `${vtype} • Tower: ${t.flat || 'N/A'}`,
+      timestamp: t.timestamp || '',
+      icon: 'car',
+      color: '#0EA5E9',
+      vehicleType: t.vehicle_type || 'auto',
+      rawData: t,
+    });
+  }
+
+  unified.sort((a, b) => parseLogTimestamp(b.timestamp) - parseLogTimestamp(a.timestamp));
+
+  return {
+    unified,
+    shiftStats: {
+      scans: cloud.accessLogs?.length || 0,
+      verified: (cloud.accessLogs || []).filter((l: any) => l.status === 'verified').length,
+      denied: (cloud.accessLogs || []).filter((l: any) => l.status !== 'verified').length,
+      maidIn: (cloud.maidCookLogs || []).filter((l: any) => l.direction === 'IN').length,
+      maidOut: (cloud.maidCookLogs || []).filter((l: any) => l.direction === 'OUT').length,
+      visitors: (cloud.visitorLogs || []).length,
+      vehicles: (cloud.taxiLogs || []).length,
+    },
+  };
+}
+
 export default function LogsScreen() {
   const [allLogs, setAllLogs] = useState<UnifiedLogEntry[]>([]);
   const [activeFilter, setActiveFilter] = useState<'all' | 'access' | 'visitor' | 'maidcook' | 'taxi'>('all');
@@ -42,6 +161,12 @@ export default function LogsScreen() {
   const [pendingCount, setPendingCount] = useState(0);
   const [selectedLog, setSelectedLog] = useState<UnifiedLogEntry | null>(null);
   const [shiftStats, setShiftStats] = useState({ scans: 0, verified: 0, denied: 0, maidIn: 0, maidOut: 0, visitors: 0, vehicles: 0 });
+  const [globalMode, setGlobalMode] = useState(false);
+  const [loadedImages, setLoadedImages] = useState<Set<string>>(new Set());
+  const [imageLoading, setImageLoading] = useState(false);
+  const [driveSyncProgress, setDriveSyncProgress] = useState(0);
+  const [driveSyncStatus, setDriveSyncStatus] = useState('');
+  const [driveSyncError, setDriveSyncError] = useState<string | null>(null);
 
   const handleShiftSummary = async () => {
     const todayStr = new Date().toISOString().slice(0, 10);
@@ -81,6 +206,54 @@ export default function LogsScreen() {
     );
   };
 
+  const handleLoadVehicleImage = async () => {
+    if (!selectedLog || selectedLog.type !== 'taxi') return;
+    const logId = selectedLog.id;
+    if (loadedImages.has(logId)) return;
+    
+    setImageLoading(true);
+    try {
+      // Image is already in selectedLog.rawData.photo_url from the global logs fetch
+      // Just mark it as loaded to display it
+      setLoadedImages(prev => new Set([...prev, logId]));
+    } finally {
+
+      setImageLoading(false);
+    }
+  };
+
+  const syncDriveLogs = async () => {
+    setDriveSyncProgress(0);
+    setDriveSyncStatus('Connecting to Drive...');
+    setDriveSyncError(null);
+    try {
+      const token = (await getSyncToken()) || 'Admin2026';
+      const cloudLogs = await fetchGlobalLogs(token);
+      setDriveSyncProgress(1);
+      setDriveSyncStatus('Saving logs locally...');
+      await saveGlobalLogsCache(cloudLogs as any);
+      const counts = [
+        `access: ${(cloudLogs.accessLogs || []).length}`,
+        `visitor: ${(cloudLogs.visitorLogs || []).length}`,
+        `maid/cook: ${(cloudLogs.maidCookLogs || []).length}`,
+        `taxi: ${(cloudLogs.taxiLogs || []).length}`,
+      ];
+      setDriveSyncProgress(2);
+      await loadLogs(true);
+      setDriveSyncProgress(3);
+      setDriveSyncStatus(`Done. Updated: ${counts.join(', ')}`);
+      setTimeout(() => {
+        setDriveSyncProgress(0);
+        setDriveSyncStatus('');
+      }, 2000);
+    } catch (error: any) {
+      setDriveSyncProgress(0);
+      setDriveSyncStatus('');
+      setDriveSyncError(error?.message || 'Failed to sync logs');
+      setTimeout(() => setDriveSyncError(null), 3000);
+    }
+  };
+
   useEffect(() => {
     loadLogs();
   }, []);
@@ -92,7 +265,43 @@ export default function LogsScreen() {
     }, [])
   );
 
-  const loadLogs = async () => {
+  const loadLogs = async (forceRemote = false) => {
+    const location = await getDeviceLocation();
+    const useGlobalLogs = location.trim().toLowerCase() === 'em office';
+    setGlobalMode(useGlobalLogs);
+
+    if (useGlobalLogs) {
+      const localTaxiLogs = await getTaxiLogs();
+      const cached = await getGlobalLogsCache();
+
+      if (!forceRemote && cached) {
+        const state = buildGlobalLogState(cached, localTaxiLogs);
+        setAllLogs(state.unified);
+        setPendingCount(0);
+        setShiftStats(state.shiftStats);
+        return;
+      }
+
+      try {
+        const token = (await getSyncToken()) || 'Admin2026';
+        const cloud = await fetchGlobalLogs(token);
+        await saveGlobalLogsCache(cloud as any);
+        const state = buildGlobalLogState(cloud, localTaxiLogs);
+        setAllLogs(state.unified);
+        setPendingCount(0);
+        setShiftStats(state.shiftStats);
+        return;
+      } catch {
+        if (cached) {
+          const state = buildGlobalLogState(cached, localTaxiLogs);
+          setAllLogs(state.unified);
+          setPendingCount(0);
+          setShiftStats(state.shiftStats);
+          return;
+        }
+      }
+    }
+
     const [accessLogs, pendingCheckins, maidCookLogs, taxiLogs] = await Promise.all([
       getLocalAccessLogs(),
       getPendingVisitorCheckins(),
@@ -160,7 +369,7 @@ export default function LogsScreen() {
     }
 
     // Sort by timestamp descending (newest first)
-    unified.sort((a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime());
+    unified.sort((a, b) => parseLogTimestamp(b.timestamp) - parseLogTimestamp(a.timestamp));
     setAllLogs(unified);
 
     // Count pending uploads
@@ -199,7 +408,7 @@ export default function LogsScreen() {
 
   const onRefresh = useCallback(async () => {
     setRefreshing(true);
-    await loadLogs();
+    await loadLogs(true);
     setRefreshing(false);
   }, []);
 
@@ -232,6 +441,7 @@ export default function LogsScreen() {
         try {
           const photoBase64 = await loadLogPhoto(checkin.compositeBase64);
           await uploadVisitorCheckin({
+            checkinId: checkin.id,
             visitor: checkin.visitor,
             photoBase64,
             timestamp: checkin.timestamp,
@@ -282,15 +492,20 @@ export default function LogsScreen() {
   };
 
   const formatTime = (iso: string) => {
-    const d = new Date(iso);
-    const hours = d.getHours().toString().padStart(2, '0');
-    const mins = d.getMinutes().toString().padStart(2, '0');
-    return `${hours}:${mins}`;
+    const d = parseLogTimestamp(iso);
+    if (!d) return '';
+    return new Date(d).toLocaleTimeString('en-IN', {
+      timeZone: 'Asia/Kolkata',
+      hour: '2-digit',
+      minute: '2-digit',
+    });
   };
 
   const formatDate = (iso: string) => {
-    const d = new Date(iso);
-    return d.toLocaleDateString('en-IN', {
+    const d = parseLogTimestamp(iso);
+    if (!d) return '';
+    return new Date(d).toLocaleDateString('en-IN', {
+      timeZone: 'Asia/Kolkata',
       day: '2-digit',
       month: 'short',
       year: 'numeric',
@@ -352,6 +567,12 @@ export default function LogsScreen() {
         </TouchableOpacity>
         </View>
       </View>
+      {globalMode && (
+        <View style={styles.globalBanner}>
+          <Ionicons name="layers" size={16} color="#0F172A" />
+          <Text style={styles.globalBannerText}>GLOBAL CONSOLIDATED LOGS - EM OFFICE</Text>
+        </View>
+      )}
       {/* Push status banner */}
       <View style={[styles.pushStatusBanner, { backgroundColor: pendingCount === 0 ? '#F0FFF4' : '#FFFBEB' }]}>
         <Ionicons
@@ -389,6 +610,39 @@ export default function LogsScreen() {
           <Ionicons name="car" size={14} color="#0EA5E9" />
           <Text style={styles.shiftStatValue}>{shiftStats.vehicles}</Text>
           <Text style={styles.shiftStatLabel}>VEHICLE</Text>
+
+              {/* Fetch Drive Logs Button - Only show in global mode */}
+              {globalMode && (
+                <View style={styles.fetchLogsContainer}>
+                  <TouchableOpacity
+                    testID="fetch-logs-btn"
+                    style={[styles.fetchLogsBtn, driveSyncProgress > 0 && styles.fetchLogsBtnActive]}
+                    onPress={syncDriveLogs}
+                    disabled={driveSyncProgress > 0}
+                  >
+                    {driveSyncProgress > 0 ? (
+                      <ActivityIndicator color="#FFFFFF" size="small" />
+                    ) : (
+                      <Ionicons name="download-outline" size={18} color="#FFFFFF" />
+                    )}
+                    <Text style={styles.fetchLogsBtnText}>FETCH LATEST LOGS</Text>
+                  </TouchableOpacity>
+                  {driveSyncProgress > 0 && (
+                    <View style={styles.progressBox}>
+                      <Text style={styles.progressLabel}>{driveSyncProgress}/3 • {driveSyncStatus}</Text>
+                      <View style={styles.progressTrack}>
+                        <View style={[styles.progressFill, { width: `${Math.max(15, (driveSyncProgress / 3) * 100)}%` }]} />
+                      </View>
+                    </View>
+                  )}
+                  {driveSyncError && (
+                    <View style={styles.errorBanner}>
+                      <Ionicons name="alert-circle" size={16} color="#FF3B30" />
+                      <Text style={styles.errorBannerText}>{driveSyncError}</Text>
+                    </View>
+                  )}
+                </View>
+              )}
         </View>
       </View>
 
@@ -459,7 +713,7 @@ export default function LogsScreen() {
                     <View style={styles.detailRow}><Text style={styles.detailLabel}>NAME</Text><Text style={styles.detailValue}>{selectedLog.rawData.resident_name}</Text></View>
                     <View style={styles.detailRow}><Text style={styles.detailLabel}>FLAT</Text><Text style={styles.detailValue}>{selectedLog.rawData.unit}</Text></View>
                     <View style={styles.detailRow}><Text style={styles.detailLabel}>STATUS</Text><Text style={[styles.detailValue, { color: selectedLog.rawData.status === 'verified' ? '#00C853' : '#FF3B30' }]}>{selectedLog.rawData.status?.toUpperCase()}</Text></View>
-                    <View style={styles.detailRow}><Text style={styles.detailLabel}>TIMESTAMP</Text><Text style={styles.detailValue}>{new Date(selectedLog.rawData.timestamp).toLocaleString('en-IN')}</Text></View>
+                    <View style={styles.detailRow}><Text style={styles.detailLabel}>TIMESTAMP</Text><Text style={styles.detailValue}>{formatTimestampInIst(selectedLog.rawData.timestamp)}</Text></View>
                     {selectedLog.rawData.location ? <View style={styles.detailRow}><Text style={styles.detailLabel}>LOCATION</Text><Text style={styles.detailValue}>{selectedLog.rawData.location}</Text></View> : null}
                   </>
                 )}
@@ -470,13 +724,15 @@ export default function LogsScreen() {
                     <View style={styles.detailRow}><Text style={styles.detailLabel}>FLAT</Text><Text style={styles.detailValue}>{selectedLog.rawData.visitor?.flat}</Text></View>
                     <View style={styles.detailRow}><Text style={styles.detailLabel}>AADHAR</Text><Text style={styles.detailValue}>{selectedLog.rawData.visitor?.aadhar || 'N/A'}</Text></View>
                     <View style={styles.detailRow}><Text style={styles.detailLabel}>PURPOSE</Text><Text style={styles.detailValue}>{selectedLog.rawData.visitor?.purpose || 'N/A'}</Text></View>
-                    <View style={styles.detailRow}><Text style={styles.detailLabel}>TIMESTAMP</Text><Text style={styles.detailValue}>{new Date(selectedLog.rawData.timestamp).toLocaleString('en-IN')}</Text></View>
+                    <View style={styles.detailRow}><Text style={styles.detailLabel}>TIMESTAMP</Text><Text style={styles.detailValue}>{formatTimestampInIst(selectedLog.rawData.timestamp)}</Text></View>
                     {selectedLog.rawData.location ? <View style={styles.detailRow}><Text style={styles.detailLabel}>LOCATION</Text><Text style={styles.detailValue}>{selectedLog.rawData.location}</Text></View> : null}
                     {selectedLog.rawData.compositeBase64 ? (
                       <View style={styles.detailRow}>
                         <Text style={styles.detailLabel}>PHOTO</Text>
                         <Image source={{ uri: `data:image/jpeg;base64,${selectedLog.rawData.compositeBase64}` }} style={styles.detailPhoto} resizeMode="contain" />
                       </View>
+                    ) : selectedLog.rawData.photo_file ? (
+                      <View style={styles.detailRow}><Text style={styles.detailLabel}>PHOTO FILE</Text><Text style={styles.detailValue}>{selectedLog.rawData.photo_file}</Text></View>
                     ) : null}
                   </>
                 )}
@@ -487,7 +743,7 @@ export default function LogsScreen() {
                     <View style={styles.detailRow}><Text style={styles.detailLabel}>NAME</Text><Text style={styles.detailValue}>{selectedLog.rawData.name}</Text></View>
                     <View style={styles.detailRow}><Text style={styles.detailLabel}>FLAT</Text><Text style={styles.detailValue}>{selectedLog.rawData.flat}</Text></View>
                     <View style={styles.detailRow}><Text style={styles.detailLabel}>DIRECTION</Text><Text style={[styles.detailValue, { color: selectedLog.rawData.direction === 'IN' ? '#7C3AED' : '#6366F1' }]}>{selectedLog.rawData.direction}</Text></View>
-                    <View style={styles.detailRow}><Text style={styles.detailLabel}>TIMESTAMP</Text><Text style={styles.detailValue}>{new Date(selectedLog.rawData.timestamp).toLocaleString('en-IN')}</Text></View>
+                    <View style={styles.detailRow}><Text style={styles.detailLabel}>TIMESTAMP</Text><Text style={styles.detailValue}>{formatTimestampInIst(selectedLog.rawData.timestamp)}</Text></View>
                     {selectedLog.rawData.location ? <View style={styles.detailRow}><Text style={styles.detailLabel}>LOCATION</Text><Text style={styles.detailValue}>{selectedLog.rawData.location}</Text></View> : null}
                   </>
                 )}
@@ -497,13 +753,37 @@ export default function LogsScreen() {
                     <View style={styles.detailRow}><Text style={styles.detailLabel}>VEHICLE NUMBER</Text><Text style={styles.detailValue}>{selectedLog.rawData.vehicle_number}</Text></View>
                     <View style={styles.detailRow}><Text style={styles.detailLabel}>VEHICLE TYPE</Text><Text style={styles.detailValue}>{(selectedLog.rawData.vehicle_type || 'auto').toUpperCase()}</Text></View>
                     <View style={styles.detailRow}><Text style={styles.detailLabel}>TOWER</Text><Text style={styles.detailValue}>{selectedLog.rawData.flat}</Text></View>
-                    <View style={styles.detailRow}><Text style={styles.detailLabel}>TIMESTAMP</Text><Text style={styles.detailValue}>{new Date(selectedLog.rawData.timestamp).toLocaleString('en-IN')}</Text></View>
+                    <View style={styles.detailRow}><Text style={styles.detailLabel}>TIMESTAMP</Text><Text style={styles.detailValue}>{formatTimestampInIst(selectedLog.rawData.timestamp)}</Text></View>
                     {selectedLog.rawData.location ? <View style={styles.detailRow}><Text style={styles.detailLabel}>LOCATION</Text><Text style={styles.detailValue}>{selectedLog.rawData.location}</Text></View> : null}
                     {selectedLog.rawData.compositeBase64 ? (
                       <View style={styles.detailRow}>
                         <Text style={styles.detailLabel}>PHOTO</Text>
                         <Image source={{ uri: `data:image/jpeg;base64,${selectedLog.rawData.compositeBase64}` }} style={styles.detailPhoto} resizeMode="contain" />
                       </View>
+                    ) : selectedLog.rawData.photo_url ? (
+                      <View style={styles.detailRow}>
+                        <Text style={styles.detailLabel}>PHOTO</Text>
+                        {loadedImages.has(selectedLog.id) ? (
+                          <Image source={{ uri: selectedLog.rawData.photo_url }} style={styles.detailPhoto} resizeMode="contain" />
+                        ) : (
+                          <TouchableOpacity
+                            style={styles.loadImageButton}
+                            onPress={handleLoadVehicleImage}
+                            disabled={imageLoading}
+                          >
+                            {imageLoading ? (
+                              <ActivityIndicator size="small" color="#FFFFFF" />
+                            ) : (
+                              <>
+                                <Ionicons name="image" size={20} color="#FFFFFF" />
+                                <Text style={styles.loadImageButtonText}>Tap to view photo</Text>
+                              </>
+                            )}
+                          </TouchableOpacity>
+                        )}
+                      </View>
+                    ) : selectedLog.rawData.photo_file ? (
+                      <View style={styles.detailRow}><Text style={styles.detailLabel}>PHOTO FILE</Text><Text style={styles.detailValue}>{selectedLog.rawData.photo_file}</Text></View>
                     ) : null}
                   </>
                 )}
@@ -526,6 +806,8 @@ const styles = StyleSheet.create({
   pushButton: { width: 36, height: 36, alignItems: 'center', justifyContent: 'center' },
   pushBadge: { position: 'absolute', top: -6, right: -8, backgroundColor: '#FF3B30', borderRadius: 10, minWidth: 18, height: 18, justifyContent: 'center', alignItems: 'center', paddingHorizontal: 4 },
   pushBadgeText: { color: '#FFFFFF', fontSize: 10, fontWeight: '900' },
+  globalBanner: { flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 8, paddingVertical: 8, backgroundColor: '#E2E8F0', borderBottomWidth: 1, borderBottomColor: '#CBD5E1' },
+  globalBannerText: { fontSize: fs(11), fontWeight: '900', color: '#0F172A', letterSpacing: 1 },
   pushStatusBanner: { flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 6, paddingVertical: 6, borderBottomWidth: 1, borderBottomColor: '#E2E8F0' },
   pushStatusText: { fontSize: fs(11), fontWeight: '800', letterSpacing: 0.5 },
   header: {
@@ -687,4 +969,16 @@ const styles = StyleSheet.create({
   detailLabel: { fontSize: fs(11), fontWeight: '700', color: '#64748B', letterSpacing: 2, marginBottom: 4 },
   detailValue: { fontSize: fs(16), fontWeight: '800', color: '#000000' },
   detailPhoto: { width: '100%', height: 200, marginTop: 8, borderWidth: 1, borderColor: '#E2E8F0' },
+  loadImageButton: { width: '100%', height: 120, marginTop: 8, borderWidth: 2, borderColor: '#0EA5E9', borderRadius: 8, backgroundColor: '#0EA5E9', justifyContent: 'center', alignItems: 'center', gap: 8, flexDirection: 'row' },
+  loadImageButtonText: { fontSize: fs(14), fontWeight: '700', color: '#FFFFFF', letterSpacing: 0.5 },
+  fetchLogsContainer: { paddingHorizontal: 16, paddingVertical: 12, gap: 8 },
+  fetchLogsBtn: { flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 8, paddingVertical: 12, paddingHorizontal: 16, backgroundColor: '#0EA5E9', borderRadius: 6 },
+  fetchLogsBtnActive: { backgroundColor: '#0284C7', opacity: 0.8 },
+  fetchLogsBtnText: { fontSize: fs(13), fontWeight: '700', color: '#FFFFFF', letterSpacing: 0.5 },
+  progressBox: { paddingHorizontal: 12, paddingVertical: 8, backgroundColor: '#F0F9FF', borderRadius: 6, borderWidth: 1, borderColor: '#BAE6FD', gap: 6 },
+  progressLabel: { fontSize: fs(11), fontWeight: '700', color: '#0369A1', letterSpacing: 0.5 },
+  progressTrack: { width: '100%', height: 6, backgroundColor: '#E0F2FE', borderRadius: 3, overflow: 'hidden' },
+  progressFill: { height: '100%', backgroundColor: '#0EA5E9', borderRadius: 3 },
+  errorBanner: { flexDirection: 'row', alignItems: 'center', gap: 8, paddingHorizontal: 12, paddingVertical: 8, backgroundColor: '#FEE2E2', borderRadius: 6, borderWidth: 1, borderColor: '#FECACA' },
+  errorBannerText: { fontSize: fs(11), fontWeight: '600', color: '#DC2626', letterSpacing: 0.3, flex: 1 },
 });

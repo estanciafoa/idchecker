@@ -139,6 +139,7 @@ export async function pushLogsToGoogleDrive(logs: Array<{
 }
 
 export async function uploadVisitorCheckin(data: {
+  checkinId?: string;
   visitor: { id: string; name: string; flat: string; phone: string; aadhar: string; purpose: string };
   photoBase64: string;
   idPhotoBase64?: string;
@@ -147,6 +148,7 @@ export async function uploadVisitorCheckin(data: {
 }): Promise<{ uploaded: boolean; fileName?: string }> {
   const payload: any = {
     action: 'upload_visitor_checkin',
+    checkinId: data.checkinId || '',
     visitor: data.visitor,
     photoBase64: data.photoBase64,
     timestamp: data.timestamp,
@@ -256,6 +258,43 @@ export async function pushTaxiLogs(entries: Array<{
   } catch (error: any) {
     clearTimeout(timeoutId);
     if (error.name === 'AbortError') throw new Error('Upload timed out');
+    throw error;
+  }
+}
+
+export async function fetchGlobalLogs(syncToken: string): Promise<{
+  accessLogs: Array<Record<string, string>>;
+  visitorLogs: Array<Record<string, string>>;
+  maidCookLogs: Array<Record<string, string>>;
+  taxiLogs: Array<Record<string, string>>;
+}> {
+  const payload = {
+    action: 'get_global_logs',
+    token: syncToken,
+  };
+
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), 30000);
+
+  try {
+    const res = await fetch(APPS_SCRIPT_URL, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+      signal: controller.signal,
+      redirect: 'follow',
+    });
+    clearTimeout(timeoutId);
+
+    if (!res.ok) throw new Error('Global log fetch failed: ' + res.statusText);
+    const data = await res.json();
+    if (!data.ok) throw new Error(data.error || 'Global log fetch failed');
+    return data.result;
+  } catch (error: any) {
+    clearTimeout(timeoutId);
+    if (error.name === 'AbortError') {
+      throw new Error('Global log fetch timed out - check internet connection');
+    }
     throw error;
   }
 }
