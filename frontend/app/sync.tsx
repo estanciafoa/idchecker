@@ -159,15 +159,22 @@ export default function SyncScreen() {
     let added = 0, changed = 0, deleted = 0, skipped = 0;
     const newIds: string[] = [];
     const changedIds: string[] = [];
-    const photoRefreshIds: string[] = []; // flag 'u'/'up' — explicit face refresh
+    const photoRefreshIds: string[] = []; // flag 'u'/'up' — force re-download a face
+    const flaggedFaceIds: string[] = [];  // flag 'n'/'u'/'up' — allowed to pull a face
     const deletedIds: string[] = [];
+    // Every ID that appears in ANY sheet row (even name-less / skipped rows) so a
+    // half-edited row is never mistaken for a removed one. Used for auto-delete.
+    const seenIds = new Set<string>();
 
     for (const row of rows) {
       const id = getCol(row, 'ID', 'Id', 'id');
       if (!id) continue;
       const key = id.toLowerCase();
+      seenIds.add(key);
       const flag = getCol(row, 'update', 'Update', 'UPDATE', 'status', 'Status', 'STATUS').toLowerCase();
 
+      // 'd' still works as an immediate manual delete, but it's optional now —
+      // removing the row from the sheet auto-deletes it (see below).
       if (flag === 'd') {
         if (existingMap.has(key)) { all.delete(key); deleted++; deletedIds.push(id); }
         continue;
@@ -186,10 +193,32 @@ export default function SyncScreen() {
           changed++; changedIds.push(id);
         }
       }
-      if (flag === 'u' || flag === 'up') photoRefreshIds.push(id);
+      if (flag === 'u' || flag === 'up') {
+        photoRefreshIds.push(id);
+        // Bump updated_at even if the row data is identical, so the display
+        // cache-buster (?v=updated_at) changes and the refreshed face renders.
+        const cur = all.get(key);
+        if (cur) all.set(key, { ...cur, updated_at: new Date().toISOString() } as T);
+      }
+      if (flag === 'n' || flag === 'u' || flag === 'up') flaggedFaceIds.push(id);
     }
 
-    return { items: Array.from(all.values()), added, changed, deleted, skipped, newIds, changedIds, photoRefreshIds, deletedIds };
+    // Auto-delete: a local record whose row is gone from the sheet is removed
+    // (no flag needed). Guards against wiping the device on a bad/partial fetch:
+    //  - never delete when the sheet returned zero rows;
+    //  - skip the bulk delete if an implausibly large share went "missing".
+    let deletionSkipped = 0;
+    if (rows.length > 0) {
+      const absent = existing.filter(e => !seenIds.has(e.id.toLowerCase())).map(e => e.id);
+      const tooMany = existing.length >= 20 && absent.length > Math.ceil(existing.length * 0.25);
+      if (tooMany) {
+        deletionSkipped = absent.length; // looks like a partial fetch — refuse to mass-delete
+      } else {
+        for (const id of absent) { all.delete(id.toLowerCase()); deleted++; deletedIds.push(id); }
+      }
+    }
+
+    return { items: Array.from(all.values()), added, changed, deleted, skipped, newIds, changedIds, photoRefreshIds, flaggedFaceIds, deletedIds, deletionSkipped };
   };
 
   // Shared ZIP cache so we only download once per sync-all
@@ -284,30 +313,28 @@ export default function SyncScreen() {
       return { ...base, ...incoming, local_photo: '', photo_base64: base.photo_base64 || '', is_new: isNew, updated_at: new Date().toISOString(), id, status: base.status || 'active', created_at: base.created_at || new Date().toISOString() };
     }, studentSignature);
 
-    const needsPhoto = isBootstrap || sResult.newIds.length > 0 || sResult.changedIds.length > 0 || sResult.photoRefreshIds.length > 0;
-
     if (isBootstrap) {
-      // Fresh/cleared device: pull the bulk photos ZIP.
+      // Fresh/cleared device: pull the bulk photos ZIP, then (one time only)
+      // top up any faces missing from the ZIP straight from the folder.
       setSyncResult('Bootstrapping photos from ZIP...');
       await fetchZipOnce();
-    } else if (sResult.newIds.length > 0 || sResult.photoRefreshIds.length > 0) {
-      // Incremental: pull only new (missing) + explicitly-refreshed faces.
-      await syncPhotosFor(sResult.newIds, sResult.photoRefreshIds, undefined, 'student');
-    }
-
-    let studentsAttached = await attachLocalPhotosById(sResult.items);
-
-    // Bootstrap top-up: the ZIP may be stale (admin ZIP upload is off), so pull
-    // any still-missing faces from the live "faces" folder.
-    if (isBootstrap) {
-      const missingIds = studentsAttached.filter(r => !r.local_photo).map(r => r.id);
+      let attached = await attachLocalPhotosById(sResult.items);
+      const missingIds = attached.filter(r => !r.local_photo).map(r => r.id);
       if (missingIds.length > 0) {
         setSyncResult(`Fetching ${missingIds.length} missing faces from folder...`);
         await syncPhotosFor(missingIds, [], undefined, 'student');
-        studentsAttached = await attachLocalPhotosById(sResult.items);
       }
+    } else if (sResult.newIds.length > 0 || sResult.flaggedFaceIds.length > 0) {
+      // Incremental: pull faces ONLY for new records and rows flagged n/u/up.
+      // A resident missing a photo with a blank flag is left alone (keeps sync
+      // fast); flag it 'n'/'u' in the sheet to (re)pull that face.
+      const pullIds = Array.from(new Set([...sResult.newIds, ...sResult.flaggedFaceIds]));
+      await syncPhotosFor(pullIds, sResult.photoRefreshIds, undefined, 'student');
     }
 
+    const studentsAttached = await attachLocalPhotosById(sResult.items);
+
+    const needsPhoto = isBootstrap || sResult.newIds.length > 0 || sResult.changedIds.length > 0 || sResult.flaggedFaceIds.length > 0;
     let finalStudents: Resident[];
     if (needsPhoto) {
       setSyncResult('Downloading fallback URL photos...');
@@ -323,7 +350,8 @@ export default function SyncScreen() {
     // Remove photos for deleted students ("d") and any not tied to a current resident.
     await pruneOrphanPhotos(finalStudents);
     await setLastSyncTime(new Date().toISOString());
-    return `Students: +${sResult.added} ~${sResult.changed} ↺${sResult.photoRefreshIds.length} -${sResult.deleted}`;
+    return `Students: +${sResult.added} ~${sResult.changed} ↺${sResult.photoRefreshIds.length} -${sResult.deleted}` +
+      (sResult.deletionSkipped ? ` (⚠ skipped deleting ${sResult.deletionSkipped} — sheet looked incomplete)` : '');
   };
 
   const maidSignature = (m: MaidCook) =>
@@ -350,12 +378,16 @@ export default function SyncScreen() {
       return { ...base, ...incoming, local_photo: '', photo_base64: base.photo_base64 || '', updated_at: new Date().toISOString(), id, status: base.status || 'active', created_at: base.created_at || new Date().toISOString() };
     }, maidSignature);
 
-    const mcNeedsPhoto = mResult.newIds.length > 0 || mResult.changedIds.length > 0 || mResult.photoRefreshIds.length > 0;
-    if (mResult.newIds.length > 0 || mResult.photoRefreshIds.length > 0) {
-      await syncPhotosFor(mResult.newIds, mResult.photoRefreshIds, MAIDCOOK_PHOTOS_DIR_NAME, 'maid/cook');
+    // Pull faces ONLY for new records and rows flagged n/u/up (same rule as
+    // students — keeps sync fast; blank-flag missing photos are left alone).
+    if (mResult.newIds.length > 0 || mResult.flaggedFaceIds.length > 0) {
+      const pullIds = Array.from(new Set([...mResult.newIds, ...mResult.flaggedFaceIds]));
+      await syncPhotosFor(pullIds, mResult.photoRefreshIds, MAIDCOOK_PHOTOS_DIR_NAME, 'maid/cook');
     }
 
     const maidsAttached = await attachLocalPhotosById(mResult.items, MAIDCOOK_PHOTOS_DIR_NAME);
+
+    const mcNeedsPhoto = mResult.newIds.length > 0 || mResult.changedIds.length > 0 || mResult.flaggedFaceIds.length > 0;
     let finalMaids: MaidCook[];
     if (mcNeedsPhoto) {
       setSyncResult('Downloading maid/cook photos...');
@@ -369,7 +401,8 @@ export default function SyncScreen() {
     setLocalCountMC(finalMaids.length);
     await pruneOrphanPhotos(finalMaids, MAIDCOOK_PHOTOS_DIR_NAME);
     await setMaidCookLastSyncTime(new Date().toISOString());
-    return `Maids/Cooks: +${mResult.added} ~${mResult.changed} ↺${mResult.photoRefreshIds.length} -${mResult.deleted}`;
+    return `Maids/Cooks: +${mResult.added} ~${mResult.changed} ↺${mResult.photoRefreshIds.length} -${mResult.deleted}` +
+      (mResult.deletionSkipped ? ` (⚠ skipped deleting ${mResult.deletionSkipped} — sheet looked incomplete)` : '');
   };
 
   const syncVisitors = async () => {

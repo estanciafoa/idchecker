@@ -354,6 +354,7 @@
       </div>
       <div class="photos-actions">
         <button class="btn" id="uploadZipDriveBtn" type="button">Update Photos</button>
+        <button class="btn btn-sm" id="rebuildZipBtn" type="button">Rebuild ZIP backup</button>
         <span class="pill photos-pill" id="photosSummary">No folder selected</span>
       </div>
     </div>
@@ -381,10 +382,6 @@
       "Moblie",
       "ID"
     ];
-
-    // Set to true to also push the full-photos ZIP as a backup. Disabled for
-    // now so we can test the incremental "faces" folder sync on its own.
-    const ENABLE_ZIP_BACKUP = false;
 
     const HARDCODED_CONFIG = {
       scriptUrl: "https://script.google.com/macros/s/AKfycby2yjp7UEvBdYIDzKjOyFInegp_9CA7LVhpmbHbqwnxdPYEI5WJE8BYki-3Dwrgfm7pkw/exec",
@@ -464,16 +461,43 @@
       try {
         const handle = await loadDirHandle();
         if (!handle) return;
-        const perm = await handle.requestPermission({ mode: "read" });
-        if (perm !== "granted") {
-          els.folderName.textContent = handle.name + " (click Select Folder to re-grant)";
-          return;
-        }
+        // Always keep the handle so we can re-request permission later on a user
+        // gesture (e.g. the Update Photos click) — no need to re-pick the folder.
         selectedDirHandle = handle;
-        selectedPhotosFiles = await readImagesFromHandle(handle);
-        els.folderName.textContent = handle.name;
-        updatePhotoSummary();
+        // queryPermission needs no user gesture; only read files if already granted.
+        const perm = await handle.queryPermission({ mode: "read" });
+        if (perm === "granted") {
+          selectedPhotosFiles = await readImagesFromHandle(handle);
+          els.folderName.textContent = handle.name;
+          updatePhotoSummary();
+        } else {
+          els.folderName.textContent = handle.name + " (will ask to allow on Update Photos)";
+        }
       } catch (_) { /* first visit or denied */ }
+    }
+
+    /**
+     * Make sure we have the photo files loaded. If permission lapsed (browser
+     * dropped it between sessions), re-request it on the saved handle — this is
+     * called from a user-gesture handler (Update Photos), so the prompt works
+     * without re-picking the folder. Returns true if photos are available.
+     */
+    async function ensurePhotosLoaded() {
+      if (selectedPhotosFiles.length > 0) return true;
+      if (!selectedDirHandle) return false;
+      try {
+        let perm = await selectedDirHandle.queryPermission({ mode: "read" });
+        if (perm !== "granted") {
+          perm = await selectedDirHandle.requestPermission({ mode: "read" });
+        }
+        if (perm !== "granted") return false;
+        selectedPhotosFiles = await readImagesFromHandle(selectedDirHandle);
+        els.folderName.textContent = selectedDirHandle.name;
+        updatePhotoSummary();
+        return selectedPhotosFiles.length > 0;
+      } catch (_) {
+        return false;
+      }
     }
 
     let parsedRows = [];
@@ -736,38 +760,102 @@
       return jsonp("get_student_flags", { token: _adminToken }).then((r) => (r && r.rows) || []);
     }
 
+    // ---- Concurrency + retry helpers ----
+    const UPLOAD_CONCURRENCY = 6;
+    const MAX_RETRIES = 3;
+
+    // Run items through worker() with at most `concurrency` in flight. Workers
+    // handle their own errors; this never rejects.
+    async function runPool(items, worker, concurrency) {
+      let next = 0;
+      const n = Math.max(1, Math.min(concurrency, items.length || 1));
+      const runOne = async () => {
+        while (true) {
+          const i = next++;
+          if (i >= items.length) return;
+          await worker(items[i], i);
+        }
+      };
+      const runners = [];
+      for (let k = 0; k < n; k++) runners.push(runOne());
+      await Promise.all(runners);
+    }
+
+    // fetch with retry/backoff on network errors and 429/5xx. Returns the Response.
+    async function fetchRetry(url, opts, label) {
+      let lastErr;
+      for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
+        try {
+          const res = await fetch(url, opts);
+          if (res.ok || res.status === 204) return res;
+          const retriable = res.status === 429 || (res.status >= 500 && res.status <= 599);
+          if (!retriable || attempt === MAX_RETRIES - 1) {
+            throw new Error((label || "Request") + " failed (" + res.status + "): " + (await res.text()).slice(0, 150));
+          }
+        } catch (e) {
+          lastErr = e;
+          if (/failed \(\d+\)/.test(e.message)) throw e; // non-retriable HTTP
+          if (attempt === MAX_RETRIES - 1) throw e;
+        }
+        await new Promise((r) => setTimeout(r, 400 * Math.pow(2, attempt) + Math.random() * 300));
+      }
+      throw lastErr || new Error((label || "Request") + " failed");
+    }
+
     // ---- Direct Google Drive REST helpers (browser-initiated → CORS OK) ----
     async function driveFindFiles(token, folderId, names) {
       const namesClause = names.map((n) => "name='" + String(n).replace(/'/g, "\\'") + "'").join(" or ");
       const q = "'" + folderId + "' in parents and (" + namesClause + ") and trashed=false";
       const url = "https://www.googleapis.com/drive/v3/files?q=" + encodeURIComponent(q) +
         "&fields=files(id,name)&spaces=drive&pageSize=10";
-      const res = await fetch(url, { headers: { Authorization: "Bearer " + token } });
-      if (!res.ok) throw new Error("Drive list failed (" + res.status + ")");
+      const res = await fetchRetry(url, { headers: { Authorization: "Bearer " + token } }, "Drive find");
       const data = await res.json();
       return data.files || [];
     }
 
-    async function driveUploadFace(token, folderId, id, blob) {
-      const name = id + ".jpg";
-      const existing = await driveFindFiles(token, folderId, [name]);
-      let fileId = existing.length ? existing[0].id : null;
-      if (!fileId) {
-        const createRes = await fetch("https://www.googleapis.com/drive/v3/files?fields=id", {
-          method: "POST",
-          headers: { Authorization: "Bearer " + token, "Content-Type": "application/json" },
-          body: JSON.stringify({ name: name, parents: [folderId] })
+    // List every file in the folder once as a Map(name(lowercased) -> fileId),
+    // so per-face uploads need no extra existence lookup. Drive REST list is
+    // fast (paged) — unlike Apps Script folder iteration.
+    async function driveListFolderFiles(token, folderId) {
+      const map = new Map();
+      let pageToken = "";
+      do {
+        const q = "'" + folderId + "' in parents and trashed=false";
+        let url = "https://www.googleapis.com/drive/v3/files?q=" + encodeURIComponent(q) +
+          "&fields=nextPageToken,files(id,name)&spaces=drive&pageSize=1000";
+        if (pageToken) url += "&pageToken=" + encodeURIComponent(pageToken);
+        const res = await fetchRetry(url, { headers: { Authorization: "Bearer " + token } }, "Drive list");
+        const data = await res.json();
+        (data.files || []).forEach((f) => {
+          const stem = String(f.name || "").replace(/\.[^.]+$/, "").toLowerCase();
+          if (stem) map.set(stem, f.id); // stem -> fileId (matches any extension)
         });
-        if (!createRes.ok) throw new Error("Create failed (" + createRes.status + "): " + (await createRes.text()).slice(0, 200));
-        fileId = (await createRes.json()).id;
-      }
-      const patchRes = await fetch("https://www.googleapis.com/upload/drive/v3/files/" +
-        encodeURIComponent(fileId) + "?uploadType=media", {
+        pageToken = data.nextPageToken || "";
+      } while (pageToken);
+      return map;
+    }
+
+    // Create a new file (metadata + bytes) in ONE multipart request.
+    async function driveMultipartCreate(token, folderId, name, blob) {
+      const boundary = "idchk_" + Date.now() + "_" + Math.random().toString(16).slice(2);
+      const meta = { name: name, parents: [folderId], mimeType: "image/jpeg" };
+      const pre = "--" + boundary + "\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n" +
+        JSON.stringify(meta) + "\r\n--" + boundary + "\r\nContent-Type: image/jpeg\r\n\r\n";
+      const body = new Blob([pre, blob, "\r\n--" + boundary + "--"], { type: "multipart/related; boundary=" + boundary });
+      await fetchRetry("https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart&fields=id", {
+        method: "POST",
+        headers: { Authorization: "Bearer " + token, "Content-Type": "multipart/related; boundary=" + boundary },
+        body: body
+      }, "Create");
+    }
+
+    // Overwrite an existing file's bytes (one media PATCH).
+    async function driveUpdateMedia(token, fileId, blob) {
+      await fetchRetry("https://www.googleapis.com/upload/drive/v3/files/" + encodeURIComponent(fileId) + "?uploadType=media", {
         method: "PATCH",
         headers: { Authorization: "Bearer " + token, "Content-Type": "image/jpeg" },
         body: blob
-      });
-      if (!patchRes.ok) throw new Error("Upload failed (" + patchRes.status + "): " + (await patchRes.text()).slice(0, 200));
+      }, "Upload");
     }
 
     async function driveDeleteFace(token, folderId, id) {
@@ -775,34 +863,12 @@
       const files = await driveFindFiles(token, folderId, names);
       let removed = 0;
       for (const f of files) {
-        const delRes = await fetch("https://www.googleapis.com/drive/v3/files/" + encodeURIComponent(f.id), {
+        const delRes = await fetchRetry("https://www.googleapis.com/drive/v3/files/" + encodeURIComponent(f.id), {
           method: "DELETE", headers: { Authorization: "Bearer " + token }
-        });
+        }, "Delete");
         if (delRes.ok || delRes.status === 204) removed++;
       }
       return removed;
-    }
-
-    // List the stems (filename without extension, lower-cased) already present
-    // in a Drive folder, paging through every result.
-    async function driveListFolderStems(token, folderId) {
-      const stems = new Set();
-      let pageToken = "";
-      do {
-        const q = "'" + folderId + "' in parents and trashed=false";
-        let url = "https://www.googleapis.com/drive/v3/files?q=" + encodeURIComponent(q) +
-          "&fields=nextPageToken,files(name)&spaces=drive&pageSize=1000";
-        if (pageToken) url += "&pageToken=" + encodeURIComponent(pageToken);
-        const res = await fetch(url, { headers: { Authorization: "Bearer " + token } });
-        if (!res.ok) throw new Error("Drive folder list failed (" + res.status + ")");
-        const data = await res.json();
-        (data.files || []).forEach((f) => {
-          const stem = String(f.name || "").replace(/\.[^.]+$/, "").toLowerCase();
-          if (stem) stems.add(stem);
-        });
-        pageToken = data.nextPageToken || "";
-      } while (pageToken);
-      return stems;
     }
 
     /**
@@ -810,12 +876,12 @@
      *  - upload a face when it is MISSING from the folder (new student) or the
      *    row is explicitly flagged new/updated (n/u/up);
      *  - delete a face when the row is flagged delete (d).
-     * Faces already present and not flagged for update are left untouched, so
-     * repeat runs only push genuinely new/changed photos.
+     * Uploads run in parallel (pool) and each is a single multipart request
+     * (new) or one media PATCH (existing) — no per-face existence lookup.
      */
     async function syncFacesFolder(token, facesFolderId, flags, filesById) {
       setStatus("Checking existing faces in Drive folder...", "warn");
-      const existing = await driveListFolderStems(token, facesFolderId);
+      const existing = await driveListFolderFiles(token, facesFolderId); // stem -> fileId
 
       const toUpload = [];
       const toDelete = [];
@@ -824,33 +890,41 @@
         const id = r.id;
         if (r.flag === "d") { toDelete.push(id); continue; }
         const file = filesById.get(id.toLowerCase());
-        const present = existing.has(id.toLowerCase());
+        const existingId = existing.get(id.toLowerCase()) || null;
         const flaggedChange = ["n", "u", "up"].includes(r.flag);
-        if (!present || flaggedChange) {
-          if (file) toUpload.push({ id: id, file: file });
-          else if (!present) missing++; // needed but no local image to upload
+        if (!existingId || flaggedChange) {
+          if (file) toUpload.push({ id: id, file: file, existingId: existingId });
+          else if (!existingId) missing++; // needed but no local image to upload
         }
       }
 
-      let uploaded = 0, deleted = 0, failed = 0;
-      for (let i = 0; i < toUpload.length; i++) {
-        const id = toUpload[i].id;
-        setStatus("Faces " + (i + 1) + "/" + toUpload.length + " — uploading " + id + "...", "warn");
-        try {
-          const compressed = await compressImage(toUpload[i].file, 50);
-          await driveUploadFace(token, facesFolderId, id, compressed);
-          uploaded++;
-        } catch (e) { failed++; console.warn("Face upload failed for " + id, e); }
-      }
+      let uploaded = 0, deleted = 0, failed = 0, upDone = 0, delDone = 0;
+      const failedDetails = [];
 
-      for (let i = 0; i < toDelete.length; i++) {
-        const id = toDelete[i];
-        setStatus("Faces — removing " + id + " (" + (i + 1) + "/" + toDelete.length + ")...", "warn");
+      await runPool(toUpload, async (item) => {
+        try {
+          const compressed = await compressImage(item.file, 50);
+          if (item.existingId) await driveUpdateMedia(token, item.existingId, compressed);
+          else await driveMultipartCreate(token, facesFolderId, item.id + ".jpg", compressed);
+          uploaded++;
+        } catch (e) {
+          failed++;
+          const msg = (e && e.message) ? e.message : String(e);
+          failedDetails.push(item.id + " (" + msg + ")");
+          console.warn("Face upload failed for " + item.id + ":", e);
+        } finally {
+          upDone++;
+          setStatus("Faces — uploaded " + upDone + "/" + toUpload.length + "...", "warn");
+        }
+      }, UPLOAD_CONCURRENCY);
+
+      await runPool(toDelete, async (id) => {
         try { deleted += await driveDeleteFace(token, facesFolderId, id); }
         catch (e) { console.warn("Face delete failed for " + id, e); }
-      }
+        finally { delDone++; setStatus("Faces — removing " + delDone + "/" + toDelete.length + "...", "warn"); }
+      }, UPLOAD_CONCURRENCY);
 
-      return { uploaded, missing, deleted, failed, uploadCount: toUpload.length, deleteCount: toDelete.length };
+      return { uploaded, missing, deleted, failed, failedDetails, uploadCount: toUpload.length, deleteCount: toDelete.length };
     }
 
     // ZIP backup upload — keeps the legacy full-ZIP path working alongside the
@@ -873,23 +947,24 @@
       setStatus("ZIP backup — uploading faces.zip (" + (zipBlob.size / 1024).toFixed(0) + " KB) to Drive...", "warn");
       const driveUrl = "https://www.googleapis.com/upload/drive/v3/files/" +
         encodeURIComponent(driveZipFileId) + "?uploadType=media";
-      const uploadResp = await fetch(driveUrl, {
+      await fetchRetry(driveUrl, {
         method: "PATCH",
         body: zipBlob,
         headers: { "Authorization": "Bearer " + token, "Content-Type": "application/zip" }
-      });
-      if (!uploadResp.ok) {
-        const errText = await uploadResp.text();
-        throw new Error("ZIP upload failed (" + uploadResp.status + "): " + errText.substring(0, 300));
-      }
+      }, "ZIP upload");
       return zipBlob.size;
     }
 
-    // Button handler: incremental faces-folder sync first, then ZIP backup.
+    // Button handler: fast incremental faces-folder sync only.
+    // The full-ZIP backup is now a separate "Rebuild ZIP backup" button so the
+    // routine Update Photos stays fast.
     async function updatePhotos() {
+      // Re-grant permission on the saved folder if the browser dropped it
+      // between sessions — avoids having to click "Select Folder" again.
+      await ensurePhotosLoaded();
       const photos = getSelectedPhotos();
       if (!photos.length) {
-        setStatus("Select a photos folder first.", "bad");
+        setStatus("Select or re-allow a photos folder first.", "bad");
         return;
       }
       if (!HARDCODED_CONFIG.scriptUrl || !HARDCODED_CONFIG.driveZipFileId) {
@@ -913,22 +988,37 @@
           const r = await syncFacesFolder(token, facesFolderId, flags, filesById);
           facesSummary = "Faces folder: ↑" + r.uploaded + " uploaded, " + r.deleted + " removed" +
             (r.missing ? ", " + r.missing + " missing file(s)" : "") +
-            (r.failed ? ", " + r.failed + " failed" : "");
+            (r.failed ? ", " + r.failed + " failed" : "") +
+            (r.failedDetails && r.failedDetails.length ? "\nFailed: " + r.failedDetails.join("; ") : "");
         }
 
-        // Phase 2: ZIP backup — disabled for now while we test the faces folder.
-        // Flip ENABLE_ZIP_BACKUP back to true to resume the full-ZIP backup.
-        let zipSummary = "ZIP backup: disabled";
-        if (ENABLE_ZIP_BACKUP) {
-          const zipSize = await runZipBackup(token, photos);
-          zipSummary = "ZIP backup: " + photos.length + " photos | " + (zipSize / 1024).toFixed(0) + " KB";
-        }
-
-        setStatus("Done!\n" + facesSummary + "\n" + zipSummary, "ok");
+        setStatus("Done!\n" + facesSummary + "\n(ZIP backup is now a separate button.)", "ok");
       } catch (err) {
         setStatus("Update failed: " + (err.message || err), "bad");
       } finally {
         els.uploadZipDriveBtn.disabled = false;
+      }
+    }
+
+    // Button handler: rebuild & upload the full-photos ZIP backup (slow; run
+    // occasionally — it re-compresses every photo). Independent of the faces sync.
+    async function rebuildZipBackup() {
+      await ensurePhotosLoaded();
+      const photos = getSelectedPhotos();
+      if (!photos.length) {
+        setStatus("Select or re-allow a photos folder first.", "bad");
+        return;
+      }
+      els.rebuildZipBtn.disabled = true;
+      try {
+        setStatus("Preparing — getting Drive credentials...", "warn");
+        const token = await getAccessToken();
+        const zipSize = await runZipBackup(token, photos);
+        setStatus("Done! ZIP backup: " + photos.length + " photos | " + (zipSize / 1024).toFixed(0) + " KB", "ok");
+      } catch (err) {
+        setStatus("ZIP backup failed: " + (err.message || err), "bad");
+      } finally {
+        els.rebuildZipBtn.disabled = false;
       }
     }
 
@@ -973,8 +1063,10 @@
     }
 
     els.downloadZipBtn = document.getElementById("downloadZipBtn");
+    els.rebuildZipBtn = document.getElementById("rebuildZipBtn");
     els.downloadZipBtn.addEventListener("click", downloadZip);
     els.uploadZipDriveBtn.addEventListener("click", updatePhotos);
+    els.rebuildZipBtn.addEventListener("click", rebuildZipBackup);
     els.selectFolderBtn.addEventListener("click", pickFolder);
     restoreSavedFolder();
   </script>

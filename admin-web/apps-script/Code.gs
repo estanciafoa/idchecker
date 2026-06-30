@@ -103,6 +103,26 @@ function doGet(e) {
       return jsonResponse_(true, facesResult, null);
     }
 
+    // Serve a single face image as base64 (proxy for a private Drive file, so
+    // faces in the "faces" folder don't need to be publicly shared).
+    // Look up either by fileId, or directly by folderId + name — the by-name
+    // path uses getFilesByName (indexed, instant) so the app never has to list
+    // the whole folder to find one face.
+    if (e && e.parameter && e.parameter.action === 'get_face') {
+      var faceFile = null;
+      if (e.parameter.fileId) {
+        faceFile = DriveApp.getFileById(e.parameter.fileId);
+      } else if (e.parameter.folderId && e.parameter.name) {
+        var faceIter = DriveApp.getFolderById(e.parameter.folderId).getFilesByName(e.parameter.name);
+        if (faceIter.hasNext()) faceFile = faceIter.next();
+      } else {
+        return jsonResponse_(false, null, 'Provide fileId, or folderId + name');
+      }
+      if (!faceFile) return jsonResponse_(false, null, 'Face not found');
+      var faceB64 = Utilities.base64Encode(faceFile.getBlob().getBytes());
+      return ContentService.createTextOutput(faceB64).setMimeType(ContentService.MimeType.TEXT);
+    }
+
     // Return per-student update flags so the admin can upload/delete only the
     // faces that changed. Flag comes from an "update" or "status" column.
     if (e && e.parameter && e.parameter.action === 'get_student_flags') {

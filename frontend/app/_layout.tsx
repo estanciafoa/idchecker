@@ -1,11 +1,12 @@
 import { Tabs } from 'expo-router';
 import { Ionicons } from '@expo/vector-icons';
-import { StyleSheet, View, Text, LogBox, Alert } from 'react-native';
+import { StyleSheet, View, Text, LogBox, Alert, useWindowDimensions } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { useState, useEffect, useRef } from 'react';
 import { fs } from '../src/utils/scale';
-import { getDeviceLocation, getOverstayVisitors } from '../src/services/storage';
+import { getDeviceLocation, getOverstayVisitors, isAppDisplayRotation90, isScannerOnlyMode } from '../src/services/storage';
 import { startNetworkSync, pushAllUnpushed } from '../src/services/autoPush';
+import { startPhotoBackfill, stopPhotoBackfill, backfillMissingPhotos, runPhotoRepairOnce } from '../src/services/photoBackfill';
 import { useNetworkStatus } from '../src/utils/useNetworkStatus';
 import ErrorBoundary from '../src/components/ErrorBoundary';
 
@@ -17,7 +18,10 @@ const LAST_DAILY_PUSH_KEY = '@gate_check_last_daily_push';
 
 export default function TabLayout() {
   const insets = useSafeAreaInsets();
+  const windowSize = useWindowDimensions();
   const [location, setLocation] = useState('');
+  const [kioskMode, setKioskMode] = useState(false);
+  const [rotateDisplay90, setRotateDisplay90] = useState(false);
   const isConnected = useNetworkStatus();
   const overstayAlertShown = useRef(false);
 
@@ -41,13 +45,23 @@ export default function TabLayout() {
 
   useEffect(() => {
     getDeviceLocation().then(setLocation);
+    isScannerOnlyMode().then(setKioskMode);
+    isAppDisplayRotation90().then(setRotateDisplay90);
     // Re-check location every 2s (in case changed via hamburger menu)
     const interval = setInterval(() => {
       getDeviceLocation().then(setLocation);
+      isAppDisplayRotation90().then(setRotateDisplay90);
     }, 2000);
     // Start network-recovery sync and push any cached logs
     startNetworkSync();
     pushAllUnpushed();
+
+    // Backfill any missing faces from the Drive "faces" folder when online,
+    // both now and whenever connectivity returns. Also run the one-time repair
+    // of poisoned (HTML-saved-as-jpg) face files.
+    startPhotoBackfill();
+    backfillMissingPhotos();
+    runPhotoRepairOnce();
 
     // Daily auto-backup: push all unpushed once per day
     const checkDailyPush = async () => {
@@ -102,13 +116,15 @@ export default function TabLayout() {
       clearInterval(dailyInterval);
       clearTimeout(overstayTimeout);
       clearInterval(overstayInterval);
+      stopPhotoBackfill();
     };
   }, []);
 
-  const isGateLocation = location.toLowerCase().includes('gate');
-  
-  return (
-    <ErrorBoundary>
+  const normalizedLocation = location.trim().toLowerCase();
+  const isGateLocation = normalizedLocation.includes('gate');
+  const isEmOffice = normalizedLocation === 'em office';
+
+  const appContent = (
     <View style={{ flex: 1 }}>
     {!isConnected && (
       <View style={styles.offlineBanner}>
@@ -118,7 +134,7 @@ export default function TabLayout() {
     )}
     <Tabs
       screenOptions={{
-        tabBarStyle: [
+        tabBarStyle: kioskMode ? { display: 'none' } : [
           styles.tabBar,
           {
             paddingBottom: insets.bottom || 12,
@@ -136,7 +152,7 @@ export default function TabLayout() {
         tabBarInactiveTintColor: '#B6A69B',
         tabBarLabelStyle: { fontSize: fs(15), fontWeight: '900', textTransform: 'uppercase', letterSpacing: 1 },
         tabBarIconStyle: { marginBottom: -2 },
-      }}
+      } as any}
     >
       <Tabs.Screen
         name="index"
@@ -180,13 +196,12 @@ export default function TabLayout() {
           ),
         }}
       />
-      {/* Hidden from tab bar — accessible via hamburger menu */}
       <Tabs.Screen
         name="logs"
         options={{
           title: 'LOG',
           headerShown: false,
-          href: null,
+          href: isEmOffice ? undefined : null,
         }}
       />
       <Tabs.Screen
@@ -207,11 +222,49 @@ export default function TabLayout() {
       />
     </Tabs>
     </View>
+  );
+
+  if (rotateDisplay90) {
+    const { width, height } = windowSize;
+    return (
+      <ErrorBoundary>
+        <View style={styles.rotatedViewport}>
+          <View
+            style={[
+              styles.rotatedContent,
+              {
+                width: height,
+                height: width,
+                left: (width - height) / 2,
+                top: (height - width) / 2,
+              },
+            ]}
+          >
+            {appContent}
+          </View>
+        </View>
+      </ErrorBoundary>
+    );
+  }
+  
+  return (
+    <ErrorBoundary>
+    {appContent}
     </ErrorBoundary>
   );
 }
 
 const styles = StyleSheet.create({
+  rotatedViewport: {
+    flex: 1,
+    overflow: 'hidden',
+    backgroundColor: '#000000',
+  },
+  rotatedContent: {
+    position: 'absolute',
+    backgroundColor: '#FFFFFF',
+    transform: [{ rotate: '-90deg' }],
+  },
   offlineBanner: {
     backgroundColor: '#DC2626',
     flexDirection: 'row',

@@ -11,11 +11,14 @@ import {
   KeyboardAvoidingView,
   AppState,
   Image,
+  type NativeSyntheticEvent,
+  type TextInputSubmitEditingEventData,
 } from 'react-native';
 import { Audio } from 'expo-av';
-import { CameraView, useCameraPermissions } from 'expo-camera';
+import { CameraView, useCameraPermissions, Camera } from 'expo-camera';
 import { Ionicons } from '@expo/vector-icons';
 import { useRouter } from 'expo-router';
+import { useFocusEffect } from '@react-navigation/native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import HamburgerMenu from '../src/components/HamburgerMenu';
 import { fs } from '../src/utils/scale';
@@ -23,6 +26,20 @@ import { parseValidityDate } from '../src/utils/dateUtils';
 
 const SUCCESS_SOUND = require('../assets/sounds/success.mp3');
 const FAILURE_SOUND = require('../assets/sounds/failure.mp3');
+const WELCOME_IMAGE = require('../assets/images/estanciawelcome message.png');
+
+function normalizeScannedCode(rawCode: string): string {
+  const cleaned = String(rawCode || '').replace(/[\u0000-\u001F\u007F]/g, '').trim();
+  if (!cleaned) return '';
+
+  const compact = cleaned.replace(/\s+/g, '');
+  const visitorMatch = compact.match(/EST[-_]?V[-_]?[A-Z0-9]+/i);
+  if (visitorMatch) {
+    return visitorMatch[0].toUpperCase().replace(/^EST[-_]?V[-_]?/, 'EST-V-');
+  }
+
+  return cleaned.replace(/\D/g, '');
+}
 
 import {
   getResidentById,
@@ -35,15 +52,29 @@ import {
   type Visitor,
   type AccessLogEntry,
   getDeviceLocation,
+  getKioskResultTimeoutSeconds,
+  isScannerOnlyMode,
 } from '../src/services/storage';
 import { pushAllUnpushed } from '../src/services/autoPush';
 import { postAccessLog } from '../src/services/api';
+
+/**
+ * Append a cache-busting version to a local face URI so a refreshed photo
+ * (overwritten at the same path) actually re-renders instead of showing the
+ * cached old image. Only applied to local file URIs; remote/data URIs untouched.
+ */
+function faceUriWithVersion(uri?: string, version?: string): string {
+  if (!uri) return '';
+  if (uri.startsWith('file:')) return `${uri}?v=${encodeURIComponent(version || '')}`;
+  return uri;
+}
 
 export default function ScannerScreen() {
   const router = useRouter();
   const [permission, requestPermission] = useCameraPermissions();
   const [scanned, setScanned] = useState(false);
   const [cameraActive, setCameraActive] = useState(false);
+  const [noCameraMode, setNoCameraMode] = useState(false);
   const [resident, setResident] = useState<Resident | null>(null);
   const [visitor, setVisitor] = useState<Visitor | null>(null);
   const [visitorExpired, setVisitorExpired] = useState(false);
@@ -55,13 +86,37 @@ export default function ScannerScreen() {
   const [manualFocused, setManualFocused] = useState(false);
   const [residentCount, setResidentCount] = useState(0);
   const [todayStats, setTodayStats] = useState({ total: 0, verified: 0, denied: 0 });
+  const [kioskResultTimeoutSeconds, setKioskResultTimeoutSeconds] = useState(5);
   const autoDismissTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const cameraIdleTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const cameraRef = useRef<any>(null);
   const wedgeInputRef = useRef<TextInput>(null);
   const manualInputRef = useRef<TextInput>(null);
+  const wedgeInputBufferRef = useRef('');
+  const wedgeLookupTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const wedgeLookupInFlightRef = useRef(false);
   const successSoundRef = useRef<Audio.Sound | null>(null);
   const failureSoundRef = useRef<Audio.Sound | null>(null);
+
+  const refreshScannerMode = useCallback(async () => {
+    const scannerOnly = await isScannerOnlyMode();
+    if (scannerOnly) {
+      setNoCameraMode(true);
+      return;
+    }
+
+    try {
+      const result = await Camera.getCameraPermissionsAsync();
+      setNoCameraMode(result.status === 'undetermined' && !result.canAskAgain);
+    } catch {
+      setNoCameraMode(true);
+    }
+  }, []);
+
+  const refreshKioskResultTimeout = useCallback(async () => {
+    const seconds = await getKioskResultTimeoutSeconds();
+    setKioskResultTimeoutSeconds(seconds);
+  }, []);
 
   useEffect(() => {
     // Configure audio so sounds play even in silent mode
@@ -77,16 +132,26 @@ export default function ScannerScreen() {
     // Pre-warm cache on mount for instant lookups
     preloadResidents().then(setResidentCount);
     loadTodayStats();
+    refreshScannerMode();
+    refreshKioskResultTimeout();
     const sub = AppState.addEventListener('change', (state) => {
-      if (state === 'active') { preloadResidents().then(setResidentCount); loadTodayStats(); }
+      if (state === 'active') { preloadResidents().then(setResidentCount); loadTodayStats(); refreshScannerMode(); refreshKioskResultTimeout(); }
     });
     return () => {
       sub.remove();
       successSoundRef.current?.unloadAsync();
       failureSoundRef.current?.unloadAsync();
       if (autoDismissTimer.current) clearTimeout(autoDismissTimer.current);
+      if (wedgeLookupTimerRef.current) clearTimeout(wedgeLookupTimerRef.current);
     };
-  }, []);
+  }, [refreshScannerMode, refreshKioskResultTimeout]);
+
+  useFocusEffect(
+    useCallback(() => {
+      refreshScannerMode();
+      refreshKioskResultTimeout();
+    }, [refreshScannerMode, refreshKioskResultTimeout])
+  );
 
   // Auto-dismiss camera after 15s idle
   useEffect(() => {
@@ -103,10 +168,20 @@ export default function ScannerScreen() {
   // Keep a hidden input focused so keyboard-wedge barcode scanners work even
   // when the visible textbox is not focused.
   useEffect(() => {
-    if (showResult || manualFocused) return;
+    const manualIsFocused = manualInputRef.current?.isFocused?.() ?? false;
+    if (showResult || manualFocused || manualIsFocused) return;
     const t = setTimeout(() => wedgeInputRef.current?.focus(), 100);
     return () => clearTimeout(t);
   }, [showResult, manualFocused]);
+
+  const refocusWedgeInputIfNeeded = () => {
+    setTimeout(() => {
+      const manualIsFocused = manualInputRef.current?.isFocused?.() ?? false;
+      if (!showResult && !manualIsFocused) {
+        wedgeInputRef.current?.focus();
+      }
+    }, 80);
+  };
 
   const loadResidentCount = async () => {
     const count = await preloadResidents();
@@ -125,7 +200,7 @@ export default function ScannerScreen() {
   };
 
   const runLookup = async (rawCode: string) => {
-    const trimmed = rawCode.trim();
+    const trimmed = normalizeScannedCode(rawCode);
     if (!trimmed) return;
     setLoading(true);
     await loadResidentCount();
@@ -143,13 +218,41 @@ export default function ScannerScreen() {
     setManualId('');
   };
 
-  const handleWedgeLookup = async () => {
-    if (!wedgeInput.trim() || showResult || loading) {
-      setWedgeInput('');
-      return;
-    }
-    await runLookup(wedgeInput);
+  const clearWedgeInput = () => {
+    wedgeInputBufferRef.current = '';
     setWedgeInput('');
+  };
+
+  const handleWedgeInputChange = (value: string) => {
+    wedgeInputBufferRef.current = value;
+    setWedgeInput(value);
+  };
+
+  const handleWedgeLookup = (event?: NativeSyntheticEvent<TextInputSubmitEditingEventData>) => {
+    const submittedText = event?.nativeEvent?.text || '';
+    const candidateText = submittedText || wedgeInputBufferRef.current || wedgeInput;
+
+    if (wedgeLookupTimerRef.current) {
+      clearTimeout(wedgeLookupTimerRef.current);
+    }
+
+    wedgeLookupTimerRef.current = setTimeout(async () => {
+      const latestInput = wedgeInputBufferRef.current || candidateText;
+      const normalized = normalizeScannedCode(latestInput);
+
+      if (!normalized || showResult || loading || wedgeLookupInFlightRef.current) {
+        clearWedgeInput();
+        return;
+      }
+
+      wedgeLookupInFlightRef.current = true;
+      try {
+        await runLookup(latestInput);
+      } finally {
+        wedgeLookupInFlightRef.current = false;
+        clearWedgeInput();
+      }
+    }, 120);
   };
 
   const handleManualIdChange = (value: string) => {
@@ -212,8 +315,17 @@ export default function ScannerScreen() {
     }
   };
 
+  const scheduleResultDismiss = (shouldAutoDismiss: boolean) => {
+    if (autoDismissTimer.current) clearTimeout(autoDismissTimer.current);
+    if (!shouldAutoDismiss) return;
+    const timeoutMs = noCameraMode ? kioskResultTimeoutSeconds * 1000 : 30000;
+    autoDismissTimer.current = setTimeout(() => resetScan(), timeoutMs);
+  };
+
   const lookupResident = async (id: string) => {
     const found = await getResidentById(id);
+    setVisitor(null);
+    setVisitorExpired(false);
     if (found) {
       setResident(found);
       setNotFound(false);
@@ -246,12 +358,9 @@ export default function ScannerScreen() {
       void playSound(FAILURE_SOUND);
     }
     setShowResult(true);
-    // Keep verified scan details on screen longer for easier review
-    if (autoDismissTimer.current) clearTimeout(autoDismissTimer.current);
+    // Kiosk mode always auto-closes; normal camera mode keeps only verified scans temporary.
     const shouldAutoDismiss = found && found.status === 'active' && !isExpired(found) && !isBlackListed(found);
-    if (shouldAutoDismiss) {
-      autoDismissTimer.current = setTimeout(() => resetScan(), 30000);
-    }
+    scheduleResultDismiss(noCameraMode || !!shouldAutoDismiss);
   };
 
   const isVisitorExpired = (v: Visitor): boolean => {
@@ -272,6 +381,7 @@ export default function ScannerScreen() {
 
   const lookupVisitorCard = async (card: string) => {
     const found = await getVisitorByCard(card);
+    setResident(null);
     if (found) {
       setVisitor(found);
       setNotFound(false);
@@ -284,11 +394,8 @@ export default function ScannerScreen() {
       void playSound(FAILURE_SOUND);
     }
     setShowResult(true);
-    // Keep valid visitor scan details on screen longer for easier review
-    if (autoDismissTimer.current) clearTimeout(autoDismissTimer.current);
-    if (found && !isVisitorExpired(found)) {
-      autoDismissTimer.current = setTimeout(() => resetScan(), 30000);
-    }
+    // Kiosk mode always auto-closes; normal camera mode keeps only valid visitors temporary.
+    scheduleResultDismiss(noCameraMode || !!(found && !isVisitorExpired(found)));
   };
 
   const resetScan = () => {
@@ -306,6 +413,48 @@ export default function ScannerScreen() {
   const openSyncForPullRefresh = () => {
     router.push('/sync');
   };
+
+  const residentDenied = resident ? isBlackListed(resident) || isExpired(resident) || resident.status !== 'active' : false;
+  const kioskResultStatus = notFound
+    ? 'DENIED'
+    : visitor
+      ? (visitorExpired ? 'EXPIRED' : 'VALID VISITOR')
+      : resident
+        ? (isBlackListed(resident) ? 'BLACK LISTED' : isExpired(resident) ? 'EXPIRED ID' : resident.status === 'active' ? 'VERIFIED' : 'INACTIVE')
+        : '';
+  const kioskResultDenied = notFound || visitorExpired || residentDenied;
+  const kioskPhotoUri = visitor?.local_photo
+    || (resident?.local_photo ? faceUriWithVersion(resident.local_photo, resident.updated_at) : (resident?.photo_url || resident?.photo_base64))
+    || '';
+  const kioskInitial = (visitor?.name || resident?.name || '').charAt(0).toUpperCase();
+
+  if (showResult && noCameraMode) {
+    return (
+      <View style={[styles.kioskResultScreen, kioskResultDenied ? styles.kioskResultDenied : styles.kioskResultVerified]}>
+        <TextInput
+          ref={wedgeInputRef}
+          value={wedgeInput}
+          onChangeText={handleWedgeInputChange}
+          onSubmitEditing={handleWedgeLookup}
+          autoFocus
+          blurOnSubmit={false}
+          showSoftInputOnFocus={false}
+          style={styles.hiddenWedgeInput}
+          caretHidden
+        />
+        {kioskPhotoUri ? (
+          <Image source={{ uri: kioskPhotoUri }} style={styles.kioskResultPhoto} resizeMode="cover" />
+        ) : kioskInitial ? (
+          <View style={styles.kioskResultPhotoFallback}>
+            <Text style={styles.kioskResultPhotoInitial}>{kioskInitial}</Text>
+          </View>
+        ) : (
+          <Ionicons name="close-circle" size={150} color="#FFFFFF" />
+        )}
+        <Text style={styles.kioskResultTitle}>{kioskResultStatus}</Text>
+      </View>
+    );
+  }
 
   // RESULT SCREEN - full screen portrait photo
   if (showResult) {
@@ -420,7 +569,7 @@ export default function ScannerScreen() {
                 <>
                   <Image
                     testID="resident-photo"
-                    source={{ uri: resident.local_photo || resident.photo_url || resident.photo_base64 }}
+                    source={{ uri: (resident.local_photo ? faceUriWithVersion(resident.local_photo, resident.updated_at) : (resident.photo_url || resident.photo_base64)) }}
                     style={styles.photoImage}
                     resizeMode="cover"
                   />
@@ -492,7 +641,7 @@ export default function ScannerScreen() {
   }
 
   // Permission not ready
-  if (!permission) {
+  if (!permission && !noCameraMode) {
     return (
       <View style={styles.container}>
         <ActivityIndicator size="large" color="#0055FF" />
@@ -501,7 +650,7 @@ export default function ScannerScreen() {
   }
 
   // Permission denied - show manual entry
-  if (!permission.granted) {
+  if (permission && !permission.granted && !noCameraMode) {
     return (
       <SafeAreaView style={styles.container}>
         <KeyboardAvoidingView
@@ -517,7 +666,7 @@ export default function ScannerScreen() {
           <TextInput
             ref={wedgeInputRef}
             value={wedgeInput}
-            onChangeText={setWedgeInput}
+            onChangeText={handleWedgeInputChange}
             onSubmitEditing={handleWedgeLookup}
             autoFocus
             blurOnSubmit={false}
@@ -525,9 +674,7 @@ export default function ScannerScreen() {
             style={styles.hiddenWedgeInput}
             caretHidden
             onBlur={() => {
-              if (!manualFocused && !showResult) {
-                setTimeout(() => wedgeInputRef.current?.focus(), 50);
-              }
+              refocusWedgeInputIfNeeded();
             }}
           />
           <View style={styles.statusBar}>
@@ -554,6 +701,7 @@ export default function ScannerScreen() {
             <Text style={styles.manualLabel}>MANUAL ID ENTRY</Text>
             <View style={styles.manualRow}>
               <TextInput
+                ref={manualInputRef}
                 testID="manual-id-input"
                 style={styles.manualInput}
                 value={manualId}
@@ -577,6 +725,58 @@ export default function ScannerScreen() {
     );
   }
 
+  // No camera available - scanner-only mode (e.g., Android TV box)
+  // Full-screen kiosk mode - only shows welcome screen and results
+  if (noCameraMode) {
+    return (
+      <View style={styles.kioskContainer}>
+        {/* Hamburger menu for accessing other screens */}
+        <View style={styles.kioskMenuButton}>
+          <HamburgerMenu />
+        </View>
+        
+        {/* Hidden input for external barcode scanner */}
+        <TextInput
+          ref={wedgeInputRef}
+          value={wedgeInput}
+          onChangeText={handleWedgeInputChange}
+          onSubmitEditing={handleWedgeLookup}
+          autoFocus
+          blurOnSubmit={false}
+          showSoftInputOnFocus={false}
+          style={styles.hiddenWedgeInput}
+          caretHidden
+          onBlur={() => {
+            refocusWedgeInputIfNeeded();
+          }}
+        />
+        
+        {loading ? (
+          // Loading state
+          <View style={styles.kioskLoadingOverlay}>
+            <ActivityIndicator size="large" color="#78350F" />
+            <Text style={styles.kioskLoadingTextDark}>VERIFYING...</Text>
+          </View>
+        ) : (
+          // Welcome screen with image
+          <Image
+            source={WELCOME_IMAGE}
+            style={styles.kioskWelcomeImage}
+            resizeMode="cover"
+          />
+        )}
+        
+        {/* Status indicator at bottom */}
+        <View style={styles.kioskStatusBar}>
+          <View style={[styles.kioskStatusDot, residentCount > 0 ? styles.kioskDotReady : styles.kioskDotOffline]} />
+          <Text style={styles.kioskStatusTextDark}>
+            {residentCount > 0 ? 'READY TO SCAN' : 'SYNC REQUIRED'}
+          </Text>
+        </View>
+      </View>
+    );
+  }
+
   // Camera scanner
   return (
     <SafeAreaView style={styles.container}>
@@ -593,7 +793,7 @@ export default function ScannerScreen() {
         <TextInput
           ref={wedgeInputRef}
           value={wedgeInput}
-          onChangeText={setWedgeInput}
+          onChangeText={handleWedgeInputChange}
           onSubmitEditing={handleWedgeLookup}
           autoFocus
           blurOnSubmit={false}
@@ -601,9 +801,7 @@ export default function ScannerScreen() {
           style={styles.hiddenWedgeInput}
           caretHidden
           onBlur={() => {
-            if (!manualFocused && !showResult) {
-              setTimeout(() => wedgeInputRef.current?.focus(), 50);
-            }
+            refocusWedgeInputIfNeeded();
           }}
         />
         <View style={styles.statusBar}>
@@ -779,4 +977,23 @@ const styles = StyleSheet.create({
   vehicleText: { fontSize: fs(13), fontWeight: '700', color: '#475569' },
   scanNextBtn: { height: 100, backgroundColor: '#00C853', justifyContent: 'center', alignItems: 'center', flexDirection: 'row', gap: 10, borderWidth: 3, borderColor: '#00A844', elevation: 6 },
   scanNextText: { color: '#FFFFFF', fontSize: fs(20), fontWeight: '900', letterSpacing: 2 },
+  // Kiosk mode (full-screen scanner-only)
+  kioskContainer: { flex: 1, backgroundColor: '#FFFFFF' },
+  kioskMenuButton: { position: 'absolute', top: 40, left: 16, zIndex: 100 },
+  kioskWelcomeImage: { flex: 1, width: '100%', height: '100%' },
+  kioskLoadingOverlay: { flex: 1, justifyContent: 'center', alignItems: 'center', backgroundColor: '#FFFFFF' },
+  kioskLoadingTextDark: { fontSize: fs(28), fontWeight: '900', color: '#78350F', marginTop: 24, letterSpacing: 4 },
+  kioskStatusBar: { position: 'absolute', bottom: 20, left: 0, right: 0, flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 10 },
+  kioskStatusDot: { width: 12, height: 12, borderRadius: 6 },
+  kioskDotReady: { backgroundColor: '#00C853' },
+  kioskDotOffline: { backgroundColor: '#FF3B30' },
+  kioskStatusTextDark: { fontSize: fs(14), fontWeight: '700', color: '#475569', letterSpacing: 2 },
+  kioskResultScreen: { flex: 1, justifyContent: 'center', alignItems: 'center', padding: 32 },
+  kioskResultVerified: { backgroundColor: '#00A844' },
+  kioskResultDenied: { backgroundColor: '#7F1D1D' },
+  kioskResultPhoto: { width: 360, height: 460, backgroundColor: '#0F172A', borderWidth: 6, borderColor: '#FFFFFF' },
+  kioskResultPhotoFallback: { width: 360, height: 460, justifyContent: 'center', alignItems: 'center', backgroundColor: '#0F172A', borderWidth: 6, borderColor: '#FFFFFF' },
+  kioskResultPhotoInitial: { fontSize: fs(180), fontWeight: '900', color: '#FFFFFF' },
+  kioskResultTitle: { marginTop: 28, fontSize: fs(64), fontWeight: '900', color: '#FFFFFF', textAlign: 'center', letterSpacing: 2 },
+  kioskResultSubtitle: { marginTop: 16, fontSize: fs(28), fontWeight: '900', color: '#FECACA', textAlign: 'center', letterSpacing: 1 },
 });

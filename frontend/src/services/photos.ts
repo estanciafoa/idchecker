@@ -220,20 +220,53 @@ export async function importPhotosFromBase64(
  */
 const APPS_SCRIPT_URL = 'https://script.google.com/macros/s/AKfycby2yjp7UEvBdYIDzKjOyFInegp_9CA7LVhpmbHbqwnxdPYEI5WJE8BYki-3Dwrgfm7pkw/exec';
 
-async function listDriveFolderFiles(folderId: string): Promise<Map<string, string>> {
-  const map = new Map<string, string>();
-  const url = `${APPS_SCRIPT_URL}?action=list_photos&folderId=${encodeURIComponent(folderId)}`;
-  const res = await fetch(url, { redirect: 'follow' });
-  if (!res.ok) throw new Error(`Apps Script error: ${res.status}`);
-  const data = await res.json();
-  if (!data.ok) throw new Error(data.error || 'Failed to list photos');
-  for (const f of data.result?.files || []) {
-    if (isImageFile(f.name)) {
-      const stem = getFileStem(f.name).toLowerCase();
-      map.set(stem, `https://drive.google.com/uc?export=download&id=${f.id}`);
+/**
+ * Fetch a single face image BY NAME through the Apps Script proxy (get_face)
+ * and save it locally. The proxy resolves the file with getFilesByName (an
+ * indexed lookup) and streams the bytes server-side as base64 — so the folder
+ * stays private AND we never have to list the whole folder to find one face.
+ * Returns true on success, false if the face doesn't exist / fetch failed.
+ */
+const DOWNLOAD_CONCURRENCY = 6;
+const MAX_FACE_RETRIES = 3;
+
+/** Run items through worker() with at most `concurrency` in flight. Never rejects. */
+async function runPool<T>(items: T[], worker: (item: T, index: number) => Promise<void>, concurrency: number): Promise<void> {
+  let next = 0;
+  const n = Math.max(1, Math.min(concurrency, items.length || 1));
+  const runOne = async () => {
+    while (true) {
+      const i = next++;
+      if (i >= items.length) return;
+      await worker(items[i], i);
+    }
+  };
+  await Promise.all(Array.from({ length: n }, () => runOne()));
+}
+
+async function downloadFaceByName(folderId: string, name: string, localPath: string): Promise<boolean> {
+  const url = `${APPS_SCRIPT_URL}?action=get_face&folderId=${encodeURIComponent(folderId)}&name=${encodeURIComponent(name)}`;
+  for (let attempt = 0; attempt < MAX_FACE_RETRIES; attempt++) {
+    try {
+      const res = await fetch(url, { redirect: 'follow' });
+      if (res.ok) {
+        const base64 = await res.text();
+        // The proxy returns raw base64; a JSON body means a definitive
+        // "not found"/error — don't retry that.
+        if (!base64 || base64.trimStart().startsWith('{')) return false;
+        await writeAsStringAsync(localPath, base64, { encoding: EncodingType.Base64 });
+        return true;
+      }
+      // Retry only transient HTTP statuses.
+      if (res.status !== 429 && (res.status < 500 || res.status > 599)) return false;
+    } catch (_) {
+      // network error — fall through to backoff and retry
+    }
+    if (attempt < MAX_FACE_RETRIES - 1) {
+      await new Promise((r) => setTimeout(r, 400 * Math.pow(2, attempt) + Math.random() * 300));
     }
   }
-  return map;
+  return false;
 }
 
 /**
@@ -258,8 +291,10 @@ export async function getFacesFolderId(): Promise<string | null> {
 }
 
 /**
- * Download only the photos needed for the given IDs from a Google Drive folder.
- * Skips photos that already exist locally.
+ * Download the faces for the given IDs from the Drive "faces" folder.
+ * Each face is fetched DIRECTLY BY NAME (`<id>.jpg`) via the get_face proxy —
+ * no whole-folder listing — so this is fast even for a folder with thousands of
+ * files. Skips faces already on disk unless the ID is in refreshIds.
  */
 export async function downloadPhotosFromDriveFolder(
   folderId: string,
@@ -270,10 +305,6 @@ export async function downloadPhotosFromDriveFolder(
 ): Promise<number> {
   if (!folderId || ids.length === 0) return 0;
 
-  if (onProgress) onProgress(0, ids.length, 'Listing photos in Drive folder...');
-  const driveFiles = await listDriveFolderFiles(folderId);
-  if (onProgress) onProgress(0, ids.length, `Found ${driveFiles.size} photos in folder`);
-
   const photosDir = await ensureLegacyPhotosDir(dirName);
   const total = ids.length;
   let done = 0;
@@ -282,33 +313,62 @@ export async function downloadPhotosFromDriveFolder(
   let failed = 0;
   let notFound = 0;
 
-  for (const id of ids) {
-    const driveUrl = driveFiles.get(id.toLowerCase());
-    if (driveUrl) {
-      const localPath = `${photosDir}/${id}.jpg`;
-      const info = await getInfoAsync(localPath);
-      // Re-download when the photo changed in the sheet (refreshIds), even if a
-      // stale copy already exists locally; otherwise skip what we already have.
-      const mustRefresh = refreshIds?.has(id.toLowerCase()) ?? false;
-      if (!info.exists || mustRefresh) {
-        try {
-          await downloadAsync(driveUrl, localPath);
-          downloaded++;
-        } catch (e) {
-          console.warn(`Photo download failed for ${id}:`, e);
-          failed++;
-        }
-      } else {
-        skipped++;
+  // Download up to DOWNLOAD_CONCURRENCY faces at once (was serial → slow).
+  await runPool(ids, async (id) => {
+    const localPath = `${photosDir}/${id}.jpg`;
+    const info = await getInfoAsync(localPath);
+    // Re-download when the photo changed in the sheet (refreshIds), even if a
+    // stale copy already exists locally; otherwise skip what we already have.
+    const mustRefresh = refreshIds?.has(id.toLowerCase()) ?? false;
+    if (!info.exists || mustRefresh) {
+      try {
+        const ok = await downloadFaceByName(folderId, `${id}.jpg`, localPath);
+        if (ok) downloaded++; else notFound++;
+      } catch (e) {
+        console.warn(`Photo download failed for ${id}:`, e);
+        failed++;
       }
     } else {
-      notFound++;
+      skipped++;
     }
     done++;
     if (onProgress) onProgress(done, total, `Photos: ${done}/${total} | ↓${downloaded} ✓${skipped} ✗${failed} ?${notFound}`);
-  }
+  }, DOWNLOAD_CONCURRENCY);
 
   return downloaded;
+}
+
+// Real compressed faces are ~30–60 KB. The old broken uc?export path saved
+// Google's HTML sign-in page (~900 KB) as "<id>.jpg", which renders blank.
+// Anything this large is almost certainly a poisoned (non-image) file.
+const POISON_SIZE_BYTES = 150 * 1024;
+
+/**
+ * Self-heal poisoned face files: delete any locally-stored "image" that is
+ * implausibly large (an HTML error page saved as .jpg by the old download
+ * path), then re-fetch those IDs cleanly from the faces folder. Returns the
+ * number of faces re-downloaded. Cheap when there's nothing to repair.
+ */
+export async function repairPoisonedFaces(folderId: string, dirName?: string): Promise<number> {
+  if (!folderId) return 0;
+  const dir = await ensureLegacyPhotosDir(dirName);
+  let names: string[];
+  try {
+    names = await readDirectoryAsync(dir);
+  } catch {
+    return 0;
+  }
+  const poisonedIds: string[] = [];
+  for (const n of names) {
+    if (!isImageFile(n)) continue;
+    const info = await getInfoAsync(`${dir}/${n}`);
+    if (info.exists && (info.size || 0) > POISON_SIZE_BYTES) {
+      poisonedIds.push(getFileStem(n));
+      try { await deleteAsync(`${dir}/${n}`, { idempotent: true }); } catch (_) {}
+    }
+  }
+  if (poisonedIds.length === 0) return 0;
+  return downloadPhotosFromDriveFolder(folderId, poisonedIds, undefined, dirName);
 }
 
 /**
