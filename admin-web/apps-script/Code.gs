@@ -10,6 +10,7 @@ const REQUIRED_HEADERS = [
 
 const DEFAULT_SPREADSHEET_ID = '1EDvYjDQVIpwib5PmQ5sbSchJI_B5HNHWNomXRLOxtk4';
 const DEFAULT_ZIP_FILE_ID = '1De7JzvhoEHfsrVJzKojcQu_QgHq4tRUE';
+const CAB_ENTRIES_FILE_ID = '1OkfSR2HYh2bg6t9HYIdOB-zsnD_EB4cz';
 
 // Separate Drive folders for each log category
 const FOLDER_STUDENTS = '12U_VPBkpatzeIaqKJ4wdZHf3-2GPHQgl';
@@ -91,6 +92,29 @@ function doGet(e) {
       }
     }
 
+    // Locate a "faces" subfolder living beside the photos ZIP, so the app can
+    // download individual photos instead of the whole ZIP.
+    if (e && e.parameter && e.parameter.action === 'get_faces') {
+      var zipFileId = e.parameter.fileId || DEFAULT_ZIP_FILE_ID;
+      var facesResult = findFacesFolderBesideFile_(zipFileId);
+      if (e.parameter.callback) {
+        return jsonpResponse_(e.parameter.callback, { ok: true, result: facesResult, error: null });
+      }
+      return jsonResponse_(true, facesResult, null);
+    }
+
+    // Return per-student update flags so the admin can upload/delete only the
+    // faces that changed. Flag comes from an "update" or "status" column.
+    if (e && e.parameter && e.parameter.action === 'get_student_flags') {
+      validateToken_(e.parameter.token);
+      var flagSsId = e.parameter.ssId || DEFAULT_SPREADSHEET_ID;
+      var flagResult = getStudentFlags_(flagSsId, e.parameter.gid);
+      if (e.parameter.callback) {
+        return jsonpResponse_(e.parameter.callback, { ok: true, result: flagResult, error: null });
+      }
+      return jsonResponse_(true, flagResult, null);
+    }
+
     return jsonResponse_(true, {
       service: 'idchecker-admin-uploader',
       status: 'ok',
@@ -160,6 +184,13 @@ function doPost(e) {
       return jsonResponse_(true, taxiResult, null);
     }
 
+    // Handle consolidated global log fetch for EM Office
+    if (payload.action === 'get_global_logs') {
+      validateToken_(payload.token);
+      var logsResult = getGlobalLogs_();
+      return jsonResponse_(true, logsResult, null);
+    }
+
     validatePayload_(payload);
     validateToken_(payload.token);
 
@@ -216,6 +247,66 @@ function doPost(e) {
  * List image files in a Google Drive folder.
  * Returns { files: [ { name: "2627.jpg", id: "FILE_ID" }, ... ] }
  */
+/**
+ * Find a subfolder named "faces" inside the same parent folder as the given
+ * file (the photos ZIP). The match is case-insensitive.
+ * Returns { found: Boolean, folderId: String|null }.
+ */
+function findFacesFolderBesideFile_(fileId) {
+  var file = DriveApp.getFileById(fileId);
+  var parents = file.getParents();
+  while (parents.hasNext()) {
+    var parent = parents.next();
+    var subFolders = parent.getFolders();
+    while (subFolders.hasNext()) {
+      var sub = subFolders.next();
+      if (String(sub.getName()).trim().toLowerCase() === 'faces') {
+        return { found: true, folderId: sub.getId() };
+      }
+    }
+  }
+  return { found: false, folderId: null };
+}
+
+/**
+ * Read the student sheet and return the per-row update flag, so the admin can
+ * upload/delete only the faces that changed.
+ * Flag is read from a column named "update" or "status" (case-insensitive) and
+ * lower-cased. Returns { rows: [ { id: "2627", flag: "n" }, ... ] }.
+ */
+function getStudentFlags_(ssId, gid) {
+  var ss = SpreadsheetApp.openById(ssId || DEFAULT_SPREADSHEET_ID);
+  var sheet;
+  if (gid) {
+    var gidNum = Number(gid);
+    var sheets = ss.getSheets();
+    for (var i = 0; i < sheets.length; i++) {
+      if (sheets[i].getSheetId() === gidNum) { sheet = sheets[i]; break; }
+    }
+  }
+  if (!sheet) sheet = ss.getSheetByName('student id') || ss.getSheets()[0];
+
+  var values = sheet.getDataRange().getValues();
+  if (!values || values.length < 2) return { rows: [] };
+
+  var header = values[0].map(function (h) { return String(h || '').trim().toLowerCase(); });
+  var idCol = header.indexOf('id');
+  var flagCol = -1;
+  for (var c = 0; c < header.length; c++) {
+    if (header[c] === 'update' || header[c] === 'status') { flagCol = c; break; }
+  }
+  if (idCol < 0) return { rows: [] };
+
+  var rows = [];
+  for (var r = 1; r < values.length; r++) {
+    var id = String(values[r][idCol] || '').trim();
+    if (!id) continue;
+    var flag = flagCol >= 0 ? String(values[r][flagCol] || '').trim().toLowerCase() : '';
+    rows.push({ id: id, flag: flag });
+  }
+  return { rows: rows };
+}
+
 function listPhotosInFolder_(folderId) {
   var folder = DriveApp.getFolderById(folderId);
   var files = folder.getFiles();
@@ -488,6 +579,241 @@ function jsonResponse_(ok, result, error) {
     .setMimeType(ContentService.MimeType.JSON);
 }
 
+/**
+ * Format incoming timestamp text/date into IST for CSV output.
+ * Expected output example: 2026-06-09 17:16:33 IST
+ */
+function toIstTimestamp_(value) {
+  if (!value) {
+    return Utilities.formatDate(new Date(), 'Asia/Kolkata', 'yyyy-MM-dd HH:mm:ss') + ' IST';
+  }
+
+  var dateObj = null;
+  if (Object.prototype.toString.call(value) === '[object Date]') {
+    dateObj = value;
+  } else {
+    dateObj = new Date(String(value));
+  }
+
+  if (isNaN(dateObj.getTime())) {
+    return String(value);
+  }
+
+  return Utilities.formatDate(dateObj, 'Asia/Kolkata', 'yyyy-MM-dd HH:mm:ss') + ' IST';
+}
+
+function getGlobalLogs_() {
+  var taxiLogsFromFile = augmentTaxiLogsWithPhotoUrls_(readTaxiLogsFromCabEntriesFile_(), buildDrivePhotoUrlMap_(FOLDER_TAXIS));
+  var taxiLogsFromFolder = readLogsFromCsvFolder_(FOLDER_TAXIS, 'taxi_logs.csv', function (row) {
+    return {
+      id: row['Log ID'] || '',
+      vehicle_type: row['Vehicle Type'] || '',
+      vehicle_number: row['Vehicle Number'] || '',
+      flat: row['Flat'] || '',
+      photo_file: row['Photo File'] || '',
+      timestamp: row['Timestamp'] || '',
+      location: row['Location'] || ''
+    };
+  });
+
+  return {
+    accessLogs: readLogsFromCsvFolder_(FOLDER_STUDENTS, 'access_logs.csv', function (row) {
+      return {
+        id: row['Log ID'] || '',
+        resident_id: row['Resident ID'] || '',
+        resident_name: row['Resident Name'] || '',
+        unit: row['Unit'] || '',
+        timestamp: row['Timestamp'] || '',
+        status: row['Status'] || '',
+        location: row['Location'] || ''
+      };
+    }),
+    visitorLogs: readLogsFromCsvFolder_(FOLDER_VISITORS, 'visitor_logs.csv', function (row) {
+      return {
+        id: row['Visitor ID'] || row['Timestamp'] || '',
+        visitor_id: row['Visitor ID'] || '',
+        name: row['Name'] || '',
+        flat: row['Flat'] || '',
+        phone: row['Phone'] || '',
+        aadhar: row['Aadhar'] || '',
+        purpose: row['Purpose'] || '',
+        photo_file: row['Photo File'] || '',
+        timestamp: row['Timestamp'] || '',
+        location: row['Location'] || ''
+      };
+    }),
+    maidCookLogs: readLogsFromCsvFolder_(FOLDER_MAIDCOOK, 'maidcook_logs.csv', function (row) {
+      return {
+        id: row['Log ID'] || '',
+        maid_cook_id: row['Maid/Cook ID'] || '',
+        name: row['Name'] || '',
+        flat: row['Flat'] || '',
+        direction: row['Direction'] || '',
+        timestamp: row['Timestamp'] || '',
+        location: row['Location'] || ''
+      };
+    }),
+    taxiLogs: mergeLogLists_(taxiLogsFromFile, taxiLogsFromFolder),
+    fetchedAt: new Date().toISOString()
+  };
+}
+
+function buildDrivePhotoUrlMap_(folderId) {
+  var map = {};
+  try {
+    var folder = DriveApp.getFolderById(folderId);
+    var files = folder.getFiles();
+    while (files.hasNext()) {
+      var file = files.next();
+      var name = String(file.getName() || '').trim();
+      if (!/\.(jpg|jpeg|png|webp|gif)$/i.test(name)) continue;
+      var url = 'https://drive.google.com/uc?export=download&id=' + file.getId();
+      map[name.toLowerCase()] = url;
+      map[name.replace(/\.[^.]+$/, '').toLowerCase()] = url;
+    }
+  } catch (err) {}
+  return map;
+}
+
+function augmentTaxiLogsWithPhotoUrls_(logs, photoUrlMap) {
+  return (logs || []).map(function (log) {
+    var photoFile = String(log.photo_file || '').trim();
+    var photoUrl = '';
+    if (photoFile) {
+      var key = photoFile.toLowerCase();
+      photoUrl = photoUrlMap[key] || photoUrlMap[photoFile.replace(/\.[^.]+$/, '').toLowerCase()] || '';
+    }
+    return Object.assign({}, log, { photo_url: photoUrl });
+  });
+}
+
+function readTaxiLogsFromCabEntriesFile_() {
+  if (!CAB_ENTRIES_FILE_ID) return [];
+  try {
+    var file = DriveApp.getFileById(CAB_ENTRIES_FILE_ID);
+    var mimeType = file.getMimeType();
+
+    // Google Sheet source: export the first sheet as rows.
+    if (mimeType === MimeType.GOOGLE_SHEETS) {
+      var ss = SpreadsheetApp.openById(CAB_ENTRIES_FILE_ID);
+      var sheet = ss.getSheets()[0];
+      if (!sheet) return [];
+      var data = sheet.getDataRange().getValues();
+      if (!data || data.length < 2) return [];
+      var headers = data[0].map(function (h) { return String(h || '').trim(); });
+      var rows = [];
+      for (var i = 1; i < data.length; i++) {
+        var row = {};
+        for (var c = 0; c < headers.length; c++) {
+          row[headers[c]] = data[i][c] !== null && data[i][c] !== undefined ? String(data[i][c]) : '';
+        }
+        rows.push({
+          id: row['Log ID'] || row['ID'] || row['id'] || '',
+          vehicle_type: row['Vehicle Type'] || row['vehicle_type'] || row['Type'] || 'taxi',
+          vehicle_number: row['Vehicle Number'] || row['vehicle_number'] || row['Number'] || '',
+          flat: row['Flat'] || row['flat'] || '',
+          photo_file: row['Photo File'] || row['photo_file'] || '',
+          timestamp: row['Timestamp'] || row['timestamp'] || '',
+          location: row['Location'] || row['location'] || ''
+        });
+      }
+      return rows;
+    }
+
+    // Text/CSV source: parse the blob content.
+    var content = file.getBlob().getDataAsString();
+    if (!content) return [];
+    var lines = content.split('\n');
+    if (lines.length < 2) return [];
+    var headersCsv = parseCsvLine_(lines[0]).map(function (h) { return h.replace(/^"|"$/g, ''); });
+    var items = [];
+    for (var li = 1; li < lines.length; li++) {
+      var line = lines[li].trim();
+      if (!line) continue;
+      var cols = parseCsvLine_(line);
+      var row = {};
+      for (var c = 0; c < headersCsv.length; c++) {
+        row[headersCsv[c]] = (cols[c] || '').replace(/^"|"$/g, '');
+      }
+      items.push({
+        id: row['Log ID'] || row['ID'] || '',
+        vehicle_type: row['Vehicle Type'] || 'taxi',
+        vehicle_number: row['Vehicle Number'] || '',
+        flat: row['Flat'] || '',
+        photo_file: row['Photo File'] || '',
+        timestamp: row['Timestamp'] || '',
+        location: row['Location'] || ''
+      });
+    }
+    return items;
+  } catch (err) {
+    return [];
+  }
+}
+
+function mergeLogLists_(primary, fallback) {
+  var seen = {};
+  var merged = [];
+  var lists = [primary || [], fallback || []];
+  for (var i = 0; i < lists.length; i++) {
+    for (var j = 0; j < lists[i].length; j++) {
+      var item = lists[i][j];
+      var key = String(item.id || item.timestamp || item.vehicle_number || '').trim();
+      if (!key || seen[key]) continue;
+      seen[key] = true;
+      merged.push(item);
+    }
+  }
+  return merged;
+}
+
+function readLogsFromCsvFolder_(folderId, fileName, mapRow) {
+  var folder = DriveApp.getFolderById(folderId);
+  var files = getOrderedCsvFiles_(folder, fileName);
+  var items = [];
+
+  for (var i = 0; i < files.length; i++) {
+    var content = files[i].file.getBlob().getDataAsString();
+    if (!content) continue;
+    var lines = content.split('\n');
+    if (lines.length <= 1) continue;
+
+    var headers = parseCsvLine_(lines[0]).map(function (h) { return h.replace(/^"|"$/g, ''); });
+    for (var li = 1; li < lines.length; li++) {
+      var line = lines[li].trim();
+      if (!line) continue;
+      var cols = parseCsvLine_(line);
+      var row = {};
+      for (var c = 0; c < headers.length; c++) {
+        row[headers[c]] = (cols[c] || '').replace(/^"|"$/g, '');
+      }
+      items.push(mapRow(row));
+    }
+  }
+
+  return items;
+}
+
+function getOrderedCsvFiles_(folder, fileName) {
+  var dotIdx = fileName.lastIndexOf('.');
+  var baseName = dotIdx > 0 ? fileName.substring(0, dotIdx) : fileName;
+  var ext = dotIdx > 0 ? fileName.substring(dotIdx) : '.csv';
+  var allFiles = [];
+  var iter = folder.getFiles();
+  while (iter.hasNext()) {
+    var f = iter.next();
+    var fname = f.getName();
+    if (fname === baseName + ext || fname.match(new RegExp('^' + baseName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '_(\\d+)' + ext.replace(/[.]/g, '\\.') + '$'))) {
+      var num = 1;
+      var m = fname.match(new RegExp('_(\\d+)' + ext.replace(/[.]/g, '\\.') + '$'));
+      if (m) num = parseInt(m[1], 10);
+      allFiles.push({ file: f, num: num, name: fname });
+    }
+  }
+  allFiles.sort(function(a, b) { return a.num - b.num; });
+  return allFiles;
+}
+
 // ---- LOG UPLOAD (Access / Student logs) ----
 function uploadLogsToDrive_(payload) {
   if (!payload.logs || !Array.isArray(payload.logs) || payload.logs.length === 0) {
@@ -497,7 +823,7 @@ function uploadLogsToDrive_(payload) {
   var headers = ['Timestamp', 'Resident ID', 'Resident Name', 'Unit', 'Status', 'Location', 'Log ID'];
   var rows = payload.logs.map(function(log) {
     return [
-      log.timestamp || '',
+      toIstTimestamp_(log.timestamp),
       log.resident_id || '',
       log.resident_name || '',
       log.unit || '',
@@ -520,6 +846,7 @@ function uploadVisitorCheckin_(payload) {
     throw new Error('visitor object with id is required');
   }
   var timestamp = payload.timestamp || new Date().toISOString();
+  var istTimestamp = toIstTimestamp_(timestamp);
 
   var folder = DriveApp.getFolderById(FOLDER_VISITORS);
 
@@ -544,7 +871,7 @@ function uploadVisitorCheckin_(payload) {
     ]);
   }
   sheet.appendRow([
-    timestamp,
+    istTimestamp,
     visitor.id || '',
     visitor.name || '',
     visitor.flat || '',
@@ -558,7 +885,7 @@ function uploadVisitorCheckin_(payload) {
   // Append to persistent CSV
   var csvHeaders = ['Timestamp', 'Visitor ID', 'Name', 'Flat', 'Phone', 'Aadhar', 'Purpose', 'Photo File', 'Location'];
   var csvRow = [[
-    timestamp,
+    istTimestamp,
     visitor.id || '',
     visitor.name || '',
     visitor.flat || '',
@@ -606,8 +933,9 @@ function uploadMaidCookAttendance_(payload) {
     var e = entries[j];
     var logId = e.id || '';
     if (logId && existingIds[String(logId)]) continue; // skip duplicate
+    var entryTimestamp = toIstTimestamp_(e.timestamp || new Date().toISOString());
     sheet.appendRow([
-      e.timestamp || new Date().toISOString(),
+      entryTimestamp,
       e.maid_cook_id || '',
       e.name || '',
       e.flat || '',
@@ -616,7 +944,7 @@ function uploadMaidCookAttendance_(payload) {
       e.location || ''
     ]);
     csvRows.push([
-      e.timestamp || new Date().toISOString(),
+      entryTimestamp,
       e.maid_cook_id || '',
       e.name || '',
       e.flat || '',
@@ -671,7 +999,7 @@ function uploadTaxiLog_(payload) {
     }
 
     csvRows.push([
-      e.timestamp || new Date().toISOString(),
+      toIstTimestamp_(e.timestamp || new Date().toISOString()),
       e.vehicle_type || '',
       e.vehicle_number || '',
       e.flat || '',

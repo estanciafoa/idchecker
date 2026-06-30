@@ -237,13 +237,36 @@ async function listDriveFolderFiles(folderId: string): Promise<Map<string, strin
 }
 
 /**
+ * Locate a "faces" folder living beside the photos ZIP in Google Drive.
+ * Returns the folder id, or null if there is no such folder (caller should
+ * then fall back to the ZIP).
+ */
+export async function getFacesFolderId(): Promise<string | null> {
+  try {
+    const url = `${APPS_SCRIPT_URL}?action=get_faces`;
+    const res = await fetch(url, { redirect: 'follow' });
+    if (!res.ok) return null;
+    const data = await res.json();
+    if (data?.ok && data.result?.found && data.result.folderId) {
+      return data.result.folderId as string;
+    }
+    return null;
+  } catch (e) {
+    console.warn('getFacesFolderId failed:', e);
+    return null;
+  }
+}
+
+/**
  * Download only the photos needed for the given IDs from a Google Drive folder.
  * Skips photos that already exist locally.
  */
 export async function downloadPhotosFromDriveFolder(
   folderId: string,
   ids: string[],
-  onProgress?: (done: number, total: number, status: string) => void
+  onProgress?: (done: number, total: number, status: string) => void,
+  dirName?: string,
+  refreshIds?: Set<string>
 ): Promise<number> {
   if (!folderId || ids.length === 0) return 0;
 
@@ -251,7 +274,7 @@ export async function downloadPhotosFromDriveFolder(
   const driveFiles = await listDriveFolderFiles(folderId);
   if (onProgress) onProgress(0, ids.length, `Found ${driveFiles.size} photos in folder`);
 
-  const photosDir = await ensureLegacyPhotosDir();
+  const photosDir = await ensureLegacyPhotosDir(dirName);
   const total = ids.length;
   let done = 0;
   let downloaded = 0;
@@ -264,7 +287,10 @@ export async function downloadPhotosFromDriveFolder(
     if (driveUrl) {
       const localPath = `${photosDir}/${id}.jpg`;
       const info = await getInfoAsync(localPath);
-      if (!info.exists) {
+      // Re-download when the photo changed in the sheet (refreshIds), even if a
+      // stale copy already exists locally; otherwise skip what we already have.
+      const mustRefresh = refreshIds?.has(id.toLowerCase()) ?? false;
+      if (!info.exists || mustRefresh) {
         try {
           await downloadAsync(driveUrl, localPath);
           downloaded++;
@@ -331,9 +357,9 @@ export async function attachLocalPhotosById<T extends { id: string; local_photo:
 /**
  * Delete a resident's photo from local file system.
  */
-export async function deleteLocalPhoto(residentId: string): Promise<void> {
+export async function deleteLocalPhoto(residentId: string, dirName?: string): Promise<void> {
   try {
-    const dir = await getPhotosDir();
+    const dir = await getPhotosDir(dirName);
     // Try common extensions
     for (const ext of ['.jpg', '.jpeg', '.png', '.webp']) {
       const file = new File(dir, `${residentId}${ext}`);
@@ -343,6 +369,47 @@ export async function deleteLocalPhoto(residentId: string): Promise<void> {
       }
     }
   } catch (_) {}
+}
+
+/**
+ * Remove local photos that no longer belong to any current item, so the app
+ * never keeps "extra" photos (e.g. for residents deleted via the sheet's
+ * update/status "D" flag). A file is kept only when its name matches a current
+ * id, or it is the file a current item already points at.
+ */
+export async function pruneOrphanPhotos(
+  items: { id: string; local_photo: string }[],
+  dirName?: string
+): Promise<number> {
+  const dir = await ensureLegacyPhotosDir(dirName);
+  let names: string[];
+  try {
+    names = await readDirectoryAsync(dir);
+  } catch {
+    return 0;
+  }
+
+  const validIds = new Set(items.map(i => i.id.toLowerCase()));
+  const usedNames = new Set(
+    items
+      .map(i => (i.local_photo || '').split('/').pop() || '')
+      .filter(Boolean)
+      .map(n => n.toLowerCase())
+  );
+
+  let removed = 0;
+  for (const name of names) {
+    if (!isImageFile(name)) continue;
+    const stem = getFileStem(name).toLowerCase();
+    const keep = validIds.has(stem) || usedNames.has(name.toLowerCase());
+    if (!keep) {
+      try {
+        await deleteAsync(`${dir}/${name}`, { idempotent: true });
+        removed++;
+      } catch (_) {}
+    }
+  }
+  return removed;
 }
 
 /**

@@ -382,6 +382,10 @@
       "ID"
     ];
 
+    // Set to true to also push the full-photos ZIP as a backup. Disabled for
+    // now so we can test the incremental "faces" folder sync on its own.
+    const ENABLE_ZIP_BACKUP = false;
+
     const HARDCODED_CONFIG = {
       scriptUrl: "https://script.google.com/macros/s/AKfycby2yjp7UEvBdYIDzKjOyFInegp_9CA7LVhpmbHbqwnxdPYEI5WJE8BYki-3Dwrgfm7pkw/exec",
       spreadsheetId: "1EDvYjDQVIpwib5PmQ5sbSchJI_B5HNHWNomXRLOxtk4",
@@ -694,91 +698,235 @@
       });
     }
 
-    async function uploadZipToDrive() {
+    // ---- JSONP helper for Apps Script GET actions (avoids CORS) ----
+    function jsonp(action, params) {
+      return new Promise((resolve, reject) => {
+        const cbName = "_jsonpCb_" + action + "_" + Date.now() + "_" + Math.floor(Math.random() * 1e6);
+        const qs = Object.keys(params || {})
+          .map((k) => k + "=" + encodeURIComponent(params[k]))
+          .join("&");
+        const url = HARDCODED_CONFIG.scriptUrl + "?action=" + action +
+          (qs ? "&" + qs : "") + "&callback=" + encodeURIComponent(cbName);
+        const script = document.createElement("script");
+        let done = false;
+        const cleanup = () => { if (script.parentNode) script.parentNode.removeChild(script); try { delete window[cbName]; } catch (_) {} };
+        const timeout = setTimeout(() => { if (done) return; done = true; cleanup(); reject(new Error("Timed out: " + action)); }, 25000);
+        window[cbName] = (resp) => {
+          if (done) return; done = true; clearTimeout(timeout); cleanup();
+          if (resp && resp.ok) resolve(resp.result);
+          else reject(new Error((resp && resp.error) || ("Failed: " + action)));
+        };
+        script.onerror = () => { if (done) return; done = true; clearTimeout(timeout); cleanup(); reject(new Error("Script load failed: " + action)); };
+        script.src = url;
+        document.head.appendChild(script);
+      });
+    }
+
+    function getAccessToken() {
+      return jsonp("get_upload_url", { token: _adminToken, fileId: HARDCODED_CONFIG.driveZipFileId })
+        .then((r) => { if (!r || !r.accessToken) throw new Error("No access token returned"); return r.accessToken; });
+    }
+
+    function getFacesFolderId() {
+      return jsonp("get_faces", { fileId: HARDCODED_CONFIG.driveZipFileId })
+        .then((r) => (r && r.found ? r.folderId : null));
+    }
+
+    function getStudentFlags() {
+      return jsonp("get_student_flags", { token: _adminToken }).then((r) => (r && r.rows) || []);
+    }
+
+    // ---- Direct Google Drive REST helpers (browser-initiated → CORS OK) ----
+    async function driveFindFiles(token, folderId, names) {
+      const namesClause = names.map((n) => "name='" + String(n).replace(/'/g, "\\'") + "'").join(" or ");
+      const q = "'" + folderId + "' in parents and (" + namesClause + ") and trashed=false";
+      const url = "https://www.googleapis.com/drive/v3/files?q=" + encodeURIComponent(q) +
+        "&fields=files(id,name)&spaces=drive&pageSize=10";
+      const res = await fetch(url, { headers: { Authorization: "Bearer " + token } });
+      if (!res.ok) throw new Error("Drive list failed (" + res.status + ")");
+      const data = await res.json();
+      return data.files || [];
+    }
+
+    async function driveUploadFace(token, folderId, id, blob) {
+      const name = id + ".jpg";
+      const existing = await driveFindFiles(token, folderId, [name]);
+      let fileId = existing.length ? existing[0].id : null;
+      if (!fileId) {
+        const createRes = await fetch("https://www.googleapis.com/drive/v3/files?fields=id", {
+          method: "POST",
+          headers: { Authorization: "Bearer " + token, "Content-Type": "application/json" },
+          body: JSON.stringify({ name: name, parents: [folderId] })
+        });
+        if (!createRes.ok) throw new Error("Create failed (" + createRes.status + "): " + (await createRes.text()).slice(0, 200));
+        fileId = (await createRes.json()).id;
+      }
+      const patchRes = await fetch("https://www.googleapis.com/upload/drive/v3/files/" +
+        encodeURIComponent(fileId) + "?uploadType=media", {
+        method: "PATCH",
+        headers: { Authorization: "Bearer " + token, "Content-Type": "image/jpeg" },
+        body: blob
+      });
+      if (!patchRes.ok) throw new Error("Upload failed (" + patchRes.status + "): " + (await patchRes.text()).slice(0, 200));
+    }
+
+    async function driveDeleteFace(token, folderId, id) {
+      const names = [id + ".jpg", id + ".jpeg", id + ".png", id + ".webp"];
+      const files = await driveFindFiles(token, folderId, names);
+      let removed = 0;
+      for (const f of files) {
+        const delRes = await fetch("https://www.googleapis.com/drive/v3/files/" + encodeURIComponent(f.id), {
+          method: "DELETE", headers: { Authorization: "Bearer " + token }
+        });
+        if (delRes.ok || delRes.status === 204) removed++;
+      }
+      return removed;
+    }
+
+    // List the stems (filename without extension, lower-cased) already present
+    // in a Drive folder, paging through every result.
+    async function driveListFolderStems(token, folderId) {
+      const stems = new Set();
+      let pageToken = "";
+      do {
+        const q = "'" + folderId + "' in parents and trashed=false";
+        let url = "https://www.googleapis.com/drive/v3/files?q=" + encodeURIComponent(q) +
+          "&fields=nextPageToken,files(name)&spaces=drive&pageSize=1000";
+        if (pageToken) url += "&pageToken=" + encodeURIComponent(pageToken);
+        const res = await fetch(url, { headers: { Authorization: "Bearer " + token } });
+        if (!res.ok) throw new Error("Drive folder list failed (" + res.status + ")");
+        const data = await res.json();
+        (data.files || []).forEach((f) => {
+          const stem = String(f.name || "").replace(/\.[^.]+$/, "").toLowerCase();
+          if (stem) stems.add(stem);
+        });
+        pageToken = data.nextPageToken || "";
+      } while (pageToken);
+      return stems;
+    }
+
+    /**
+     * Incrementally sync the Drive "faces" folder against the sheet:
+     *  - upload a face when it is MISSING from the folder (new student) or the
+     *    row is explicitly flagged new/updated (n/u/up);
+     *  - delete a face when the row is flagged delete (d).
+     * Faces already present and not flagged for update are left untouched, so
+     * repeat runs only push genuinely new/changed photos.
+     */
+    async function syncFacesFolder(token, facesFolderId, flags, filesById) {
+      setStatus("Checking existing faces in Drive folder...", "warn");
+      const existing = await driveListFolderStems(token, facesFolderId);
+
+      const toUpload = [];
+      const toDelete = [];
+      let missing = 0;
+      for (const r of flags) {
+        const id = r.id;
+        if (r.flag === "d") { toDelete.push(id); continue; }
+        const file = filesById.get(id.toLowerCase());
+        const present = existing.has(id.toLowerCase());
+        const flaggedChange = ["n", "u", "up"].includes(r.flag);
+        if (!present || flaggedChange) {
+          if (file) toUpload.push({ id: id, file: file });
+          else if (!present) missing++; // needed but no local image to upload
+        }
+      }
+
+      let uploaded = 0, deleted = 0, failed = 0;
+      for (let i = 0; i < toUpload.length; i++) {
+        const id = toUpload[i].id;
+        setStatus("Faces " + (i + 1) + "/" + toUpload.length + " — uploading " + id + "...", "warn");
+        try {
+          const compressed = await compressImage(toUpload[i].file, 50);
+          await driveUploadFace(token, facesFolderId, id, compressed);
+          uploaded++;
+        } catch (e) { failed++; console.warn("Face upload failed for " + id, e); }
+      }
+
+      for (let i = 0; i < toDelete.length; i++) {
+        const id = toDelete[i];
+        setStatus("Faces — removing " + id + " (" + (i + 1) + "/" + toDelete.length + ")...", "warn");
+        try { deleted += await driveDeleteFace(token, facesFolderId, id); }
+        catch (e) { console.warn("Face delete failed for " + id, e); }
+      }
+
+      return { uploaded, missing, deleted, failed, uploadCount: toUpload.length, deleteCount: toDelete.length };
+    }
+
+    // ZIP backup upload — keeps the legacy full-ZIP path working alongside the
+    // incremental faces folder. Uses an already-fetched OAuth token.
+    async function runZipBackup(token, photos) {
+      const driveZipFileId = HARDCODED_CONFIG.driveZipFileId;
+      const zip = new JSZip();
+      for (let i = 0; i < photos.length; i++) {
+        const file = photos[i];
+        setStatus("ZIP backup — compressing photo " + (i + 1) + "/" + photos.length + ": " + file.name, "warn");
+        const compressed = await compressImage(file, 50);
+        const nameBase = file.name.replace(/\.[^.]+$/, "") + ".jpg";
+        zip.file(nameBase, compressed);
+      }
+      setStatus("ZIP backup — zipping " + photos.length + " photos...", "warn");
+      const zipBlob = await zip.generateAsync(
+        { type: "blob", compression: "DEFLATE", compressionOptions: { level: 6 } },
+        function (meta) { setStatus("ZIP backup — zipping: " + meta.percent.toFixed(0) + "%", "warn"); }
+      );
+      setStatus("ZIP backup — uploading faces.zip (" + (zipBlob.size / 1024).toFixed(0) + " KB) to Drive...", "warn");
+      const driveUrl = "https://www.googleapis.com/upload/drive/v3/files/" +
+        encodeURIComponent(driveZipFileId) + "?uploadType=media";
+      const uploadResp = await fetch(driveUrl, {
+        method: "PATCH",
+        body: zipBlob,
+        headers: { "Authorization": "Bearer " + token, "Content-Type": "application/zip" }
+      });
+      if (!uploadResp.ok) {
+        const errText = await uploadResp.text();
+        throw new Error("ZIP upload failed (" + uploadResp.status + "): " + errText.substring(0, 300));
+      }
+      return zipBlob.size;
+    }
+
+    // Button handler: incremental faces-folder sync first, then ZIP backup.
+    async function updatePhotos() {
       const photos = getSelectedPhotos();
       if (!photos.length) {
         setStatus("Select a photos folder first.", "bad");
         return;
       }
-
-      const scriptUrl = HARDCODED_CONFIG.scriptUrl;
-      const driveZipFileId = HARDCODED_CONFIG.driveZipFileId;
-
-      if (!scriptUrl || !driveZipFileId) {
-        setStatus("Hardcoded Drive ZIP config is missing required values.", "bad");
+      if (!HARDCODED_CONFIG.scriptUrl || !HARDCODED_CONFIG.driveZipFileId) {
+        setStatus("Hardcoded Drive config is missing required values.", "bad");
         return;
       }
 
-      const token = _adminToken;
-
       els.uploadZipDriveBtn.disabled = true;
       try {
-        const zip = new JSZip();
+        setStatus("Preparing — getting Drive credentials...", "warn");
+        const token = await getAccessToken();
 
-        // Step 1: Compress photos
-        for (let i = 0; i < photos.length; i++) {
-          const file = photos[i];
-          setStatus("Step 1/3 — Compressing photo " + (i + 1) + "/" + photos.length + ": " + file.name, "warn");
-          const compressed = await compressImage(file, 50);
-          const nameBase = file.name.replace(/\.[^.]+$/, "") + ".jpg";
-          zip.file(nameBase, compressed);
+        // Phase 1: incremental faces folder (only if a "faces" folder exists)
+        let facesSummary = "Faces folder: not found (skipped)";
+        const facesFolderId = await getFacesFolderId();
+        if (facesFolderId) {
+          setStatus("Reading sheet update flags...", "warn");
+          const flags = await getStudentFlags();
+          const filesById = new Map();
+          photos.forEach((f) => filesById.set(f.name.replace(/\.[^.]+$/, "").toLowerCase(), f));
+          const r = await syncFacesFolder(token, facesFolderId, flags, filesById);
+          facesSummary = "Faces folder: ↑" + r.uploaded + " uploaded, " + r.deleted + " removed" +
+            (r.missing ? ", " + r.missing + " missing file(s)" : "") +
+            (r.failed ? ", " + r.failed + " failed" : "");
         }
 
-        // Step 2: Create ZIP blob
-        setStatus("Step 2/3 — Zipping " + photos.length + " photos...", "warn");
-        const zipBlob = await zip.generateAsync(
-          { type: "blob", compression: "DEFLATE", compressionOptions: { level: 6 } },
-          function(meta) { setStatus("Step 2/3 — Zipping: " + meta.percent.toFixed(0) + "%", "warn"); }
-        );
-
-        // Step 3: Get OAuth token from Apps Script, then upload directly to Drive
-        setStatus("Step 3/3 — Getting upload credentials...", "warn");
-
-        // Fetch access token via JSONP (avoids CORS issues with Apps Script GET)
-        const accessToken = await new Promise((resolve, reject) => {
-          const cbName = "_uploadUrlCb_" + Date.now();
-          const url = scriptUrl + "?action=get_upload_url&token=" + encodeURIComponent(token) +
-            "&fileId=" + encodeURIComponent(driveZipFileId) +
-            "&callback=" + encodeURIComponent(cbName);
-          const script = document.createElement("script");
-          let done = false;
-          const cleanup = () => { if (script.parentNode) script.parentNode.removeChild(script); try { delete window[cbName]; } catch (_) {} };
-          const timeout = setTimeout(() => { if (done) return; done = true; cleanup(); reject(new Error("Timed out getting upload credentials")); }, 15000);
-          window[cbName] = (resp) => {
-            if (done) return; done = true; clearTimeout(timeout); cleanup();
-            if (resp && resp.ok && resp.result && resp.result.accessToken) {
-              resolve(resp.result.accessToken);
-            } else {
-              reject(new Error((resp && resp.error) || "Failed to get upload credentials"));
-            }
-          };
-          script.onerror = () => { if (done) return; done = true; clearTimeout(timeout); cleanup(); reject(new Error("Script load failed")); };
-          script.src = url;
-          document.head.appendChild(script);
-        });
-
-        setStatus("Step 3/3 — Uploading faces.zip (" + (zipBlob.size / 1024).toFixed(0) + " KB, " + photos.length + " photos) directly to Google Drive...", "warn");
-
-        // Upload raw ZIP blob directly to Drive (simple media upload, browser-initiated → CORS OK)
-        const driveUrl = "https://www.googleapis.com/upload/drive/v3/files/" +
-          encodeURIComponent(driveZipFileId) + "?uploadType=media";
-        const uploadResp = await fetch(driveUrl, {
-          method: "PATCH",
-          body: zipBlob,
-          headers: {
-            "Authorization": "Bearer " + accessToken,
-            "Content-Type": "application/zip"
-          }
-        });
-
-        if (!uploadResp.ok) {
-          const errText = await uploadResp.text();
-          throw new Error("Drive upload failed (" + uploadResp.status + "): " + errText.substring(0, 300));
+        // Phase 2: ZIP backup — disabled for now while we test the faces folder.
+        // Flip ENABLE_ZIP_BACKUP back to true to resume the full-ZIP backup.
+        let zipSummary = "ZIP backup: disabled";
+        if (ENABLE_ZIP_BACKUP) {
+          const zipSize = await runZipBackup(token, photos);
+          zipSummary = "ZIP backup: " + photos.length + " photos | " + (zipSize / 1024).toFixed(0) + " KB";
         }
 
-        setStatus("Done! ZIP replaced on Google Drive.\n" + photos.length + " photos | " + (zipBlob.size / 1024).toFixed(0) + " KB\nDrive file: " + driveZipFileId, "ok");
+        setStatus("Done!\n" + facesSummary + "\n" + zipSummary, "ok");
       } catch (err) {
-        setStatus("Drive ZIP upload failed: " + (err.message || err), "bad");
+        setStatus("Update failed: " + (err.message || err), "bad");
       } finally {
         els.uploadZipDriveBtn.disabled = false;
       }
@@ -826,7 +974,7 @@
 
     els.downloadZipBtn = document.getElementById("downloadZipBtn");
     els.downloadZipBtn.addEventListener("click", downloadZip);
-    els.uploadZipDriveBtn.addEventListener("click", uploadZipToDrive);
+    els.uploadZipDriveBtn.addEventListener("click", updatePhotos);
     els.selectFolderBtn.addEventListener("click", pickFolder);
     restoreSavedFolder();
   </script>

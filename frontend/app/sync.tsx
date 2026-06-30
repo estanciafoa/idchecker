@@ -21,6 +21,9 @@ import {
   importPhotosFromBase64,
   attachLocalPhotosById,
   clearAllPhotos,
+  downloadPhotosFromDriveFolder,
+  getFacesFolderId,
+  pruneOrphanPhotos,
   MAIDCOOK_PHOTOS_DIR_NAME,
 } from '../src/services/photos';
 const APPS_SCRIPT_URL = 'https://script.google.com/macros/s/AKfycby2yjp7UEvBdYIDzKjOyFInegp_9CA7LVhpmbHbqwnxdPYEI5WJE8BYki-3Dwrgfm7pkw/exec';
@@ -145,35 +148,73 @@ export default function SyncScreen() {
     for (const e of existing) all.set(e.id.toLowerCase(), e);
 
     let added = 0, updated = 0, photoOnly = 0, dataOnly = 0, deleted = 0, skipped = 0;
+    // IDs whose photo is brand new vs. changed — used to pull only these photos
+    // from the Drive "faces" folder instead of the whole ZIP.
+    const newIds: string[] = [];
+    const photoUpdateIds: string[] = [];
 
     for (const row of rows) {
       const id = getCol(row, 'ID', 'Id', 'id');
       if (!id) continue;
-      const flag = getCol(row, 'update', 'Update', 'UPDATE').toLowerCase() || 'n';
+      const flag = getCol(row, 'update', 'Update', 'UPDATE', 'status', 'Status', 'STATUS').toLowerCase() || 'n';
       if (flag === 'd') { all.delete(id.toLowerCase()); deleted++; continue; }
       const name = getCol(row, 'Name', 'name', 'NAME');
       if (!name) { skipped++; continue; }
 
       const ex = existingMap.get(id.toLowerCase());
-      if (flag === 'n') { all.set(id.toLowerCase(), buildEntry(id, row, undefined)); added++; }
-      else if (flag === 'u') { all.set(id.toLowerCase(), buildEntry(id, row, ex)); updated++; }
+      if (flag === 'n') { all.set(id.toLowerCase(), buildEntry(id, row, undefined)); added++; newIds.push(id); }
+      else if (flag === 'u') { all.set(id.toLowerCase(), buildEntry(id, row, ex)); updated++; photoUpdateIds.push(id); }
       else if (flag === 'up') {
         if (ex) {
-          const mobile = getCol(row, 'Mobile', 'mobile', 'MOBILE', 'Phone', 'phone');
           all.set(id.toLowerCase(), { ...ex, photo_url: resolvePhotoUrl(id, row), local_photo: '', updated_at: new Date().toISOString() } as any);
         }
         photoOnly++;
+        photoUpdateIds.push(id);
       } else if (flag === 'ud') {
         all.set(id.toLowerCase(), buildEntry(id, row, ex));
         dataOnly++;
       } else { skipped++; }
     }
 
-    return { items: Array.from(all.values()), added, updated, photoOnly, dataOnly, deleted, skipped };
+    return { items: Array.from(all.values()), added, updated, photoOnly, dataOnly, deleted, skipped, newIds, photoUpdateIds };
   };
 
   // Shared ZIP cache so we only download once per sync-all
   let cachedZipBase64: string | null = null;
+
+  // Resolve the Drive "faces" folder once per sync. undefined = not checked yet,
+  // null = checked and absent (fall back to ZIP), string = folder id.
+  let facesFolderId: string | null | undefined;
+  const resolveFacesFolder = async (): Promise<string | null> => {
+    if (facesFolderId === undefined) {
+      facesFolderId = await getFacesFolderId();
+    }
+    return facesFolderId;
+  };
+
+  /**
+   * Download photos for only the given IDs. Prefers the Drive "faces" folder
+   * (one file per ID); falls back to the full photos ZIP when there is none.
+   */
+  const syncPhotosFor = async (
+    newIds: string[],
+    photoUpdateIds: string[],
+    dirName: string | undefined,
+    label: string,
+  ): Promise<void> => {
+    const faces = await resolveFacesFolder();
+    if (faces) {
+      const ids = Array.from(new Set([...newIds, ...photoUpdateIds]));
+      if (ids.length === 0) return;
+      const refresh = new Set(photoUpdateIds.map(i => i.toLowerCase()));
+      setSyncResult(`Downloading ${label} photos from faces folder...`);
+      await downloadPhotosFromDriveFolder(faces, ids, (_done, _total, status) => {
+        setSyncResult(`${label} photos: ${status}`);
+      }, dirName, refresh);
+    } else {
+      await fetchZipOnce();
+    }
+  };
 
   const fetchZipOnce = async (): Promise<string> => {
     if (cachedZipBase64) return cachedZipBase64;
@@ -219,7 +260,7 @@ export default function SyncScreen() {
         validity: getCol(row, 'ValidTill', 'Validity', 'validity', 'VALIDITY'),
         vehicle_plate: getCol(row, 'Vehicle', 'vehicle', 'Vehicle Plate', 'vehicle_plate'),
       };
-      const flag = getCol(row, 'update', 'Update', 'UPDATE').toLowerCase();
+      const flag = getCol(row, 'update', 'Update', 'UPDATE', 'status', 'Status', 'STATUS').toLowerCase();
       const isNew = !existingIds.has(id.toLowerCase());
       if (flag === 'ud' && ex) {
         return { ...ex, ...incoming, photo_url: ex.photo_url, local_photo: ex.local_photo, is_new: false, updated_at: new Date().toISOString() };
@@ -230,22 +271,25 @@ export default function SyncScreen() {
 
     const needsPhoto = sResult.added > 0 || sResult.updated > 0 || sResult.photoOnly > 0;
     if (needsPhoto) {
-      await fetchZipOnce();
+      await syncPhotosFor(sResult.newIds, sResult.photoUpdateIds, undefined, 'student');
     }
 
     const studentsAttached = await attachLocalPhotosById(sResult.items);
+    let finalStudents: Resident[];
     if (needsPhoto) {
       setSyncResult('Downloading fallback URL photos...');
       const withPhotos = await downloadAllPhotos(studentsAttached, (done, total) => {
         setSyncResult(`Photos: ${done}/${total}`);
       });
-      const cleaned = await cleanupExpiredPhotos(withPhotos);
-      await saveLocalResidents(cleaned);
-      setLocalCount(cleaned.length);
+      finalStudents = await cleanupExpiredPhotos(withPhotos);
     } else {
-      await saveLocalResidents(studentsAttached);
-      setLocalCount(studentsAttached.length);
+      finalStudents = studentsAttached;
     }
+    await saveLocalResidents(finalStudents);
+    setLocalCount(finalStudents.length);
+    // Drop local photos for residents removed from the sheet ("D") and any
+    // other photos that no longer belong to a current resident.
+    await pruneOrphanPhotos(finalStudents);
     await setLastSyncTime(new Date().toISOString());
     return `Students: N${sResult.added} U${sResult.updated} D${sResult.deleted}`;
   };
@@ -266,7 +310,7 @@ export default function SyncScreen() {
         validity: getCol(row, 'ValidTill', 'Validity', 'validity', 'VALIDITY'),
         vehicle_plate: getCol(row, 'Vehicle', 'vehicle', 'Vehicle Plate', 'vehicle_plate'),
       };
-      const flag = getCol(row, 'update', 'Update', 'UPDATE').toLowerCase();
+      const flag = getCol(row, 'update', 'Update', 'UPDATE', 'status', 'Status', 'STATUS').toLowerCase();
       if (flag === 'ud' && ex) {
         return { ...ex, ...incoming, photo_url: ex.photo_url, local_photo: ex.local_photo, updated_at: new Date().toISOString() };
       }
@@ -276,21 +320,22 @@ export default function SyncScreen() {
 
     const mcNeedsPhoto = mResult.added > 0 || mResult.updated > 0 || mResult.photoOnly > 0;
     if (mcNeedsPhoto) {
-      await fetchZipOnce();
+      await syncPhotosFor(mResult.newIds, mResult.photoUpdateIds, MAIDCOOK_PHOTOS_DIR_NAME, 'maid/cook');
     }
 
     const maidsAttached = await attachLocalPhotosById(mResult.items, MAIDCOOK_PHOTOS_DIR_NAME);
+    let finalMaids: MaidCook[];
     if (mcNeedsPhoto) {
       setSyncResult('Downloading maid/cook photos...');
-      const mcWithPhotos = await downloadAllPhotos(maidsAttached, (done, total) => {
+      finalMaids = await downloadAllPhotos(maidsAttached, (done, total) => {
         setSyncResult(`Maid/cook photos: ${done}/${total}`);
       }, MAIDCOOK_PHOTOS_DIR_NAME);
-      await saveLocalMaidsCooks(mcWithPhotos);
-      setLocalCountMC(mcWithPhotos.length);
     } else {
-      await saveLocalMaidsCooks(maidsAttached);
-      setLocalCountMC(maidsAttached.length);
+      finalMaids = maidsAttached;
     }
+    await saveLocalMaidsCooks(finalMaids);
+    setLocalCountMC(finalMaids.length);
+    await pruneOrphanPhotos(finalMaids, MAIDCOOK_PHOTOS_DIR_NAME);
     await setMaidCookLastSyncTime(new Date().toISOString());
     return `Maids/Cooks: N${mResult.added} U${mResult.updated} D${mResult.deleted}`;
   };
