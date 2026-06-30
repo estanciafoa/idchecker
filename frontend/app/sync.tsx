@@ -137,46 +137,59 @@ export default function SyncScreen() {
     return parseCSV(raw);
   };
 
+  // Content-diff sync. Decides what to do per row by COMPARING the sheet row
+  // against the local copy — no reliance on a flag for data/new rows:
+  //   - id absent locally          -> new      (add + pull face)
+  //   - tracked fields differ      -> changed  (update record)
+  //   - identical                  -> skip
+  // The flag is consulted only for two things that a content diff cannot see:
+  //   - 'u'/'up' -> refresh that student's face from the faces folder
+  //   - 'd'      -> delete the record (+ photo pruned later)
   const processRows = <T extends { id: string }>(
     rows: Record<string, string>[],
     existing: T[],
     buildEntry: (id: string, row: Record<string, string>, ex: T | undefined) => T,
+    signatureOf: (entry: T) => string,
   ) => {
     const existingMap = new Map<string, T>();
     for (const e of existing) existingMap.set(e.id.toLowerCase(), e);
     const all = new Map<string, T>();
     for (const e of existing) all.set(e.id.toLowerCase(), e);
 
-    let added = 0, updated = 0, photoOnly = 0, dataOnly = 0, deleted = 0, skipped = 0;
-    // IDs whose photo is brand new vs. changed — used to pull only these photos
-    // from the Drive "faces" folder instead of the whole ZIP.
+    let added = 0, changed = 0, deleted = 0, skipped = 0;
     const newIds: string[] = [];
-    const photoUpdateIds: string[] = [];
+    const changedIds: string[] = [];
+    const photoRefreshIds: string[] = []; // flag 'u'/'up' — explicit face refresh
+    const deletedIds: string[] = [];
 
     for (const row of rows) {
       const id = getCol(row, 'ID', 'Id', 'id');
       if (!id) continue;
-      const flag = getCol(row, 'update', 'Update', 'UPDATE', 'status', 'Status', 'STATUS').toLowerCase() || 'n';
-      if (flag === 'd') { all.delete(id.toLowerCase()); deleted++; continue; }
+      const key = id.toLowerCase();
+      const flag = getCol(row, 'update', 'Update', 'UPDATE', 'status', 'Status', 'STATUS').toLowerCase();
+
+      if (flag === 'd') {
+        if (existingMap.has(key)) { all.delete(key); deleted++; deletedIds.push(id); }
+        continue;
+      }
       const name = getCol(row, 'Name', 'name', 'NAME');
       if (!name) { skipped++; continue; }
 
-      const ex = existingMap.get(id.toLowerCase());
-      if (flag === 'n') { all.set(id.toLowerCase(), buildEntry(id, row, undefined)); added++; newIds.push(id); }
-      else if (flag === 'u') { all.set(id.toLowerCase(), buildEntry(id, row, ex)); updated++; photoUpdateIds.push(id); }
-      else if (flag === 'up') {
-        if (ex) {
-          all.set(id.toLowerCase(), { ...ex, photo_url: resolvePhotoUrl(id, row), local_photo: '', updated_at: new Date().toISOString() } as any);
+      const ex = existingMap.get(key);
+      if (!ex) {
+        all.set(key, buildEntry(id, row, undefined));
+        added++; newIds.push(id);
+      } else {
+        const incoming = buildEntry(id, row, ex);
+        if (signatureOf(incoming) !== signatureOf(ex)) {
+          all.set(key, incoming);
+          changed++; changedIds.push(id);
         }
-        photoOnly++;
-        photoUpdateIds.push(id);
-      } else if (flag === 'ud') {
-        all.set(id.toLowerCase(), buildEntry(id, row, ex));
-        dataOnly++;
-      } else { skipped++; }
+      }
+      if (flag === 'u' || flag === 'up') photoRefreshIds.push(id);
     }
 
-    return { items: Array.from(all.values()), added, updated, photoOnly, dataOnly, deleted, skipped, newIds, photoUpdateIds };
+    return { items: Array.from(all.values()), added, changed, deleted, skipped, newIds, changedIds, photoRefreshIds, deletedIds };
   };
 
   // Shared ZIP cache so we only download once per sync-all
@@ -243,11 +256,16 @@ export default function SyncScreen() {
   const sortNewFirst = (items: Resident[]) =>
     [...items].sort((a, b) => (b.is_new ? 1 : 0) - (a.is_new ? 1 : 0));
 
+  const studentSignature = (r: Resident) =>
+    [r.name, r.unit, r.aadhar_masked, r.phone_last4, r.vehicle_plate, r.validity]
+      .map(x => String(x || '').trim()).join('|');
+
   const syncStudents = async () => {
     setSyncResult('Fetching students...');
     const studentRows = await fetchCsv({ gid: sheetGids.students });
     setSyncResult(`Processing ${studentRows.length} students...`);
     const existingResidents = await getLocalResidents();
+    const isBootstrap = existingResidents.length === 0;
     const existingIds = new Set(existingResidents.map(r => r.id.toLowerCase()));
     const sResult = processRows<Resident>(studentRows, existingResidents, (id, row, ex) => {
       const mobile = getCol(row, 'Mobile', 'mobile', 'MOBILE', 'Phone', 'phone');
@@ -260,21 +278,36 @@ export default function SyncScreen() {
         validity: getCol(row, 'ValidTill', 'Validity', 'validity', 'VALIDITY'),
         vehicle_plate: getCol(row, 'Vehicle', 'vehicle', 'Vehicle Plate', 'vehicle_plate'),
       };
-      const flag = getCol(row, 'update', 'Update', 'UPDATE', 'status', 'Status', 'STATUS').toLowerCase();
       const isNew = !existingIds.has(id.toLowerCase());
-      if (flag === 'ud' && ex) {
-        return { ...ex, ...incoming, photo_url: ex.photo_url, local_photo: ex.local_photo, is_new: false, updated_at: new Date().toISOString() };
-      }
       const base = ex || { id, photo_base64: '', status: 'active', created_at: new Date().toISOString() } as any;
-      return { ...base, ...incoming, local_photo: flag === 'n' ? '' : (ex ? '' : ''), photo_base64: base.photo_base64 || '', is_new: isNew, updated_at: new Date().toISOString(), id, status: base.status || 'active', created_at: base.created_at || new Date().toISOString() };
-    });
+      // local_photo cleared here; attachLocalPhotosById re-attaches from disk.
+      return { ...base, ...incoming, local_photo: '', photo_base64: base.photo_base64 || '', is_new: isNew, updated_at: new Date().toISOString(), id, status: base.status || 'active', created_at: base.created_at || new Date().toISOString() };
+    }, studentSignature);
 
-    const needsPhoto = sResult.added > 0 || sResult.updated > 0 || sResult.photoOnly > 0;
-    if (needsPhoto) {
-      await syncPhotosFor(sResult.newIds, sResult.photoUpdateIds, undefined, 'student');
+    const needsPhoto = isBootstrap || sResult.newIds.length > 0 || sResult.changedIds.length > 0 || sResult.photoRefreshIds.length > 0;
+
+    if (isBootstrap) {
+      // Fresh/cleared device: pull the bulk photos ZIP.
+      setSyncResult('Bootstrapping photos from ZIP...');
+      await fetchZipOnce();
+    } else if (sResult.newIds.length > 0 || sResult.photoRefreshIds.length > 0) {
+      // Incremental: pull only new (missing) + explicitly-refreshed faces.
+      await syncPhotosFor(sResult.newIds, sResult.photoRefreshIds, undefined, 'student');
     }
 
-    const studentsAttached = await attachLocalPhotosById(sResult.items);
+    let studentsAttached = await attachLocalPhotosById(sResult.items);
+
+    // Bootstrap top-up: the ZIP may be stale (admin ZIP upload is off), so pull
+    // any still-missing faces from the live "faces" folder.
+    if (isBootstrap) {
+      const missingIds = studentsAttached.filter(r => !r.local_photo).map(r => r.id);
+      if (missingIds.length > 0) {
+        setSyncResult(`Fetching ${missingIds.length} missing faces from folder...`);
+        await syncPhotosFor(missingIds, [], undefined, 'student');
+        studentsAttached = await attachLocalPhotosById(sResult.items);
+      }
+    }
+
     let finalStudents: Resident[];
     if (needsPhoto) {
       setSyncResult('Downloading fallback URL photos...');
@@ -287,12 +320,15 @@ export default function SyncScreen() {
     }
     await saveLocalResidents(finalStudents);
     setLocalCount(finalStudents.length);
-    // Drop local photos for residents removed from the sheet ("D") and any
-    // other photos that no longer belong to a current resident.
+    // Remove photos for deleted students ("d") and any not tied to a current resident.
     await pruneOrphanPhotos(finalStudents);
     await setLastSyncTime(new Date().toISOString());
-    return `Students: N${sResult.added} U${sResult.updated} D${sResult.deleted}`;
+    return `Students: +${sResult.added} ~${sResult.changed} ↺${sResult.photoRefreshIds.length} -${sResult.deleted}`;
   };
+
+  const maidSignature = (m: MaidCook) =>
+    [m.name, m.flats, m.aadhar_masked, m.phone_last4, m.vehicle_plate, m.validity]
+      .map(x => String(x || '').trim()).join('|');
 
   const syncMaidsCooks = async () => {
     setSyncResult('Fetching maids & cooks...');
@@ -310,17 +346,13 @@ export default function SyncScreen() {
         validity: getCol(row, 'ValidTill', 'Validity', 'validity', 'VALIDITY'),
         vehicle_plate: getCol(row, 'Vehicle', 'vehicle', 'Vehicle Plate', 'vehicle_plate'),
       };
-      const flag = getCol(row, 'update', 'Update', 'UPDATE', 'status', 'Status', 'STATUS').toLowerCase();
-      if (flag === 'ud' && ex) {
-        return { ...ex, ...incoming, photo_url: ex.photo_url, local_photo: ex.local_photo, updated_at: new Date().toISOString() };
-      }
       const base = ex || { id, photo_base64: '', status: 'active', created_at: new Date().toISOString() } as any;
-      return { ...base, ...incoming, local_photo: flag === 'n' ? '' : (ex ? '' : ''), photo_base64: base.photo_base64 || '', updated_at: new Date().toISOString(), id, status: base.status || 'active', created_at: base.created_at || new Date().toISOString() };
-    });
+      return { ...base, ...incoming, local_photo: '', photo_base64: base.photo_base64 || '', updated_at: new Date().toISOString(), id, status: base.status || 'active', created_at: base.created_at || new Date().toISOString() };
+    }, maidSignature);
 
-    const mcNeedsPhoto = mResult.added > 0 || mResult.updated > 0 || mResult.photoOnly > 0;
-    if (mcNeedsPhoto) {
-      await syncPhotosFor(mResult.newIds, mResult.photoUpdateIds, MAIDCOOK_PHOTOS_DIR_NAME, 'maid/cook');
+    const mcNeedsPhoto = mResult.newIds.length > 0 || mResult.changedIds.length > 0 || mResult.photoRefreshIds.length > 0;
+    if (mResult.newIds.length > 0 || mResult.photoRefreshIds.length > 0) {
+      await syncPhotosFor(mResult.newIds, mResult.photoRefreshIds, MAIDCOOK_PHOTOS_DIR_NAME, 'maid/cook');
     }
 
     const maidsAttached = await attachLocalPhotosById(mResult.items, MAIDCOOK_PHOTOS_DIR_NAME);
@@ -337,7 +369,7 @@ export default function SyncScreen() {
     setLocalCountMC(finalMaids.length);
     await pruneOrphanPhotos(finalMaids, MAIDCOOK_PHOTOS_DIR_NAME);
     await setMaidCookLastSyncTime(new Date().toISOString());
-    return `Maids/Cooks: N${mResult.added} U${mResult.updated} D${mResult.deleted}`;
+    return `Maids/Cooks: +${mResult.added} ~${mResult.changed} ↺${mResult.photoRefreshIds.length} -${mResult.deleted}`;
   };
 
   const syncVisitors = async () => {
