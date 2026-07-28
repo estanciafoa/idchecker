@@ -7,6 +7,7 @@ import { fs } from '../src/utils/scale';
 import { getDeviceLocation, getOverstayVisitors, isAppDisplayRotation90, isScannerOnlyMode } from '../src/services/storage';
 import { startNetworkSync, pushAllUnpushed } from '../src/services/autoPush';
 import { startPhotoBackfill, stopPhotoBackfill, backfillMissingPhotos, runPhotoRepairOnce } from '../src/services/photoBackfill';
+import { runAutoSync } from '../src/services/dataSync';
 import { useNetworkStatus } from '../src/utils/useNetworkStatus';
 import ErrorBoundary from '../src/components/ErrorBoundary';
 
@@ -111,11 +112,18 @@ export default function TabLayout() {
     const overstayTimeout = setTimeout(checkOverstay, 60 * 1000);
     const overstayInterval = setInterval(checkOverstay, 60 * 60 * 1000);
 
+    // Auto-download student & visitor data from the sheet: shortly after launch,
+    // then every hour. runAutoSync() no-ops when offline or no token is stored.
+    const autoSyncTimeout = setTimeout(runAutoSync, 15 * 1000);
+    const autoSyncInterval = setInterval(runAutoSync, 60 * 60 * 1000);
+
     return () => {
       clearInterval(interval);
       clearInterval(dailyInterval);
       clearTimeout(overstayTimeout);
       clearInterval(overstayInterval);
+      clearTimeout(autoSyncTimeout);
+      clearInterval(autoSyncInterval);
       stopPhotoBackfill();
     };
   }, []);
@@ -193,6 +201,16 @@ export default function TabLayout() {
           headerShown: false,
           tabBarIcon: ({ color }) => (
             <Ionicons name="car" size={28} color={color} />
+          ),
+        }}
+      />
+      <Tabs.Screen
+        name="zoho"
+        options={{
+          title: 'ZOHO',
+          headerShown: false,
+          tabBarIcon: ({ color }) => (
+            <Ionicons name="business" size={28} color={color} />
           ),
         }}
       />

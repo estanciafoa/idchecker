@@ -305,6 +305,37 @@
   </div>
   <script>
     var _adminToken = '';
+    var SHEET_ID = '1EDvYjDQVIpwib5PmQ5sbSchJI_B5HNHWNomXRLOxtk4';
+    var SHEET_EMBED_URL = 'https://docs.google.com/spreadsheets/d/' + SHEET_ID + '/edit?rm=minimal#gid=0';
+    var SHEET_TAB_URL = 'https://docs.google.com/spreadsheets/d/' + SHEET_ID + '/edit#gid=0';
+    var _awaitingSheetSignIn = false;
+
+    function loadSheetEmbed() {
+      var iframe = document.getElementById('sheetEmbed');
+      // Reassigning the same URL is a no-op in some browsers; bounce through
+      // about:blank so Refresh always forces a real reload.
+      iframe.src = 'about:blank';
+      iframe.src = SHEET_EMBED_URL;
+    }
+
+    /**
+     * The embed is a third-party context, so the browser withholds Google's
+     * session cookies until docs.google.com has been opened as a top-level page
+     * — an anonymous request for a private sheet comes back as 404. Opening the
+     * sheet in its own window establishes that session; reload the embed when
+     * the admin page regains focus so returning here is enough to fix it.
+     */
+    function openSheetEditor() {
+      _awaitingSheetSignIn = true;
+      window.open(SHEET_TAB_URL, 'sheetEditor', 'width=1200,height=800,menubar=no,toolbar=no');
+    }
+
+    window.addEventListener('focus', function () {
+      if (!_awaitingSheetSignIn) return;
+      _awaitingSheetSignIn = false;
+      loadSheetEmbed();
+    });
+
     function checkGatePassword() {
       var pw = document.getElementById('gatePassword').value;
       if (pw === 'Admin2026') {
@@ -313,8 +344,7 @@
         document.getElementById('gatePassword').blur();
         document.getElementById('passwordGate').style.display = 'none';
         // Load sheet iframe only after login to prevent password leaking into cells
-        var iframe = document.getElementById('sheetEmbed');
-        iframe.src = 'https://docs.google.com/spreadsheets/d/1EDvYjDQVIpwib5PmQ5sbSchJI_B5HNHWNomXRLOxtk4/edit?rm=minimal&gid=0';
+        loadSheetEmbed();
       } else {
         document.getElementById('gateError').style.display = 'block';
         document.getElementById('gatePassword').value = '';
@@ -335,8 +365,9 @@
       <div class="field" style="flex:1;min-height:0;display:flex;flex-direction:column">
         <div class="row" style="gap:10px;align-items:center;margin-bottom:6px">
           <label style="margin:0">Google Sheet — <code>student id</code></label>
-          <button class="btn btn-sm" type="button" onclick="document.getElementById('sheetEmbed').src = document.getElementById('sheetEmbed').src">Refresh</button>
-          <button class="btn btn-sm" type="button" onclick="window.open('https://docs.google.com/spreadsheets/d/1EDvYjDQVIpwib5PmQ5sbSchJI_B5HNHWNomXRLOxtk4/edit#gid=0','sheetEditor','width=1200,height=800,menubar=no,toolbar=no')">Open Editor ↗</button>
+          <button class="btn btn-sm" type="button" onclick="loadSheetEmbed()">Refresh</button>
+          <button class="btn btn-sm" type="button" onclick="openSheetEditor()">Open Editor ↗</button>
+          <span style="color:var(--muted);font-size:12px">Sheet showing 404? Click <strong>Open Editor ↗</strong> to sign in to Google — it reloads here when you come back.</span>
         </div>
         <iframe id="sheetEmbed"
           src="about:blank"
@@ -385,7 +416,7 @@
 
     const HARDCODED_CONFIG = {
       scriptUrl: "https://script.google.com/macros/s/AKfycby2yjp7UEvBdYIDzKjOyFInegp_9CA7LVhpmbHbqwnxdPYEI5WJE8BYki-3Dwrgfm7pkw/exec",
-      spreadsheetId: "1EDvYjDQVIpwib5PmQ5sbSchJI_B5HNHWNomXRLOxtk4",
+      spreadsheetId: SHEET_ID,
       sheetName: "student id",
       driveZipFileId: "1De7JzvhoEHfsrVJzKojcQu_QgHq4tRUE"
     };

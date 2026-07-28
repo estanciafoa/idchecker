@@ -9,7 +9,7 @@ import { SafeAreaView } from 'react-native-safe-area-context';
 import HamburgerMenu from '../src/components/HamburgerMenu';
 import { fs } from '../src/utils/scale';
 import { parseValidityDate } from '../src/utils/dateUtils';
-import { getLocalResidents, getLocalMaidsCooks, saveLocalResidents, getSyncToken, type Resident, type MaidCook, clearAllData, clearNewFlags, addAccessLog, type AccessLogEntry } from '../src/services/storage';
+import { getLocalResidents, getLocalMaidsCooks, saveLocalResidents, getSyncToken, type Resident, type MaidCook, clearAllData, clearNewFlags, addAccessLog, type AccessLogEntry, getKioskResultTimeoutSeconds, isAppDisplayRotation90, isScannerOnlyMode, setAppDisplayRotation90, setKioskResultTimeoutSeconds, setScannerOnlyMode } from '../src/services/storage';
 import PasswordLock from '../src/components/PasswordLock';
 
 const APPS_SCRIPT_URL = 'https://script.google.com/macros/s/AKfycby2yjp7UEvBdYIDzKjOyFInegp_9CA7LVhpmbHbqwnxdPYEI5WJE8BYki-3Dwrgfm7pkw/exec';
@@ -59,6 +59,9 @@ export default function AdminScreen() {
   const [showClearConfirm, setShowClearConfirm] = useState(false);
   const [clearing, setClearing] = useState(false);
   const [searchQuery, setSearchQuery] = useState('');
+  const [scannerModeEnabled, setScannerModeEnabled] = useState(false);
+  const [displayRotationEnabled, setDisplayRotationEnabled] = useState(false);
+  const [kioskTimeoutInput, setKioskTimeoutInput] = useState('5');
   const inactivityTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const resetInactivityTimer = useCallback(() => {
@@ -99,6 +102,19 @@ export default function AdminScreen() {
   };
 
   useEffect(() => { if (unlocked) loadData(); }, [unlocked]);
+
+  useEffect(() => {
+    isScannerOnlyMode().then(setScannerModeEnabled);
+    isAppDisplayRotation90().then(setDisplayRotationEnabled);
+    getKioskResultTimeoutSeconds().then((seconds) => setKioskTimeoutInput(String(seconds)));
+  }, []);
+
+  const saveKioskTimeout = async () => {
+    const seconds = Number(kioskTimeoutInput);
+    const safeSeconds = Number.isFinite(seconds) ? Math.min(60, Math.max(1, Math.round(seconds))) : 5;
+    setKioskTimeoutInput(String(safeSeconds));
+    await setKioskResultTimeoutSeconds(safeSeconds);
+  };
 
   useFocusEffect(
     useCallback(() => {
@@ -365,6 +381,91 @@ export default function AdminScreen() {
         )}
       </View>
 
+      {/* Scanner Mode Toggle */}
+      <View style={styles.scannerModeSection}>
+        <View style={styles.scannerModeRow}>
+          <View style={styles.scannerModeInfo}>
+            <Ionicons name="tv-outline" size={20} color="#78350F" />
+            <Text style={styles.scannerModeLabel}>KIOSK / TV BOX MODE</Text>
+          </View>
+          <TouchableOpacity
+            style={[styles.scannerModeToggle, scannerModeEnabled && styles.scannerModeToggleActive]}
+            onPress={async () => {
+              const newValue = !scannerModeEnabled;
+              setScannerModeEnabled(newValue);
+              await setScannerOnlyMode(newValue);
+              Alert.alert(
+                newValue ? 'Kiosk Mode Enabled' : 'Kiosk Mode Disabled',
+                newValue
+                  ? 'The app will show a full-screen scanner interface. Restart the app to apply.'
+                  : 'The app will use the normal camera mode. Restart the app to apply.',
+              );
+            }}
+          >
+            <Text style={[styles.scannerModeToggleText, scannerModeEnabled && styles.scannerModeToggleTextActive]}>
+              {scannerModeEnabled ? 'ON' : 'OFF'}
+            </Text>
+          </TouchableOpacity>
+        </View>
+        <Text style={styles.scannerModeDesc}>Full-screen mode for external barcode scanners (no camera needed)</Text>
+      </View>
+
+      {/* Kiosk Result Timeout */}
+      <View style={styles.kioskTimeoutSection}>
+        <View style={styles.scannerModeRow}>
+          <View style={styles.scannerModeInfo}>
+            <Ionicons name="timer-outline" size={20} color="#78350F" />
+            <Text style={styles.scannerModeLabel}>KIOSK RESULT TIMEOUT</Text>
+          </View>
+          <View style={styles.kioskTimeoutControls}>
+            <TextInput
+              style={styles.kioskTimeoutInput}
+              value={kioskTimeoutInput}
+              onChangeText={(value) => setKioskTimeoutInput(value.replace(/[^0-9]/g, '').slice(0, 2))}
+              onBlur={saveKioskTimeout}
+              onSubmitEditing={saveKioskTimeout}
+              keyboardType="number-pad"
+              returnKeyType="done"
+              maxLength={2}
+            />
+            <Text style={styles.kioskTimeoutUnit}>SEC</Text>
+            <TouchableOpacity style={styles.kioskTimeoutSaveBtn} onPress={saveKioskTimeout}>
+              <Text style={styles.kioskTimeoutSaveText}>SAVE</Text>
+            </TouchableOpacity>
+          </View>
+        </View>
+        <Text style={styles.scannerModeDesc}>Result auto-closes in kiosk mode after 1 to 60 seconds</Text>
+      </View>
+
+      {/* Display Rotation Toggle */}
+      <View style={styles.displayRotationSection}>
+        <View style={styles.scannerModeRow}>
+          <View style={styles.scannerModeInfo}>
+            <Ionicons name="phone-landscape-outline" size={20} color="#0F172A" />
+            <Text style={styles.displayRotationLabel}>ROTATE APP DISPLAY 90 DEG</Text>
+          </View>
+          <TouchableOpacity
+            style={[styles.scannerModeToggle, displayRotationEnabled && styles.displayRotationToggleActive]}
+            onPress={async () => {
+              const newValue = !displayRotationEnabled;
+              setDisplayRotationEnabled(newValue);
+              await setAppDisplayRotation90(newValue);
+              Alert.alert(
+                newValue ? 'Display Rotation Enabled' : 'Display Rotation Disabled',
+                newValue
+                  ? 'The full app will rotate 90 degrees and render with swapped width/height. It applies within a few seconds.'
+                  : 'The app will return to normal orientation within a few seconds.',
+              );
+            }}
+          >
+            <Text style={[styles.scannerModeToggleText, displayRotationEnabled && styles.scannerModeToggleTextActive]}>
+              {displayRotationEnabled ? 'ON' : 'OFF'}
+            </Text>
+          </TouchableOpacity>
+        </View>
+        <Text style={styles.displayRotationDesc}>For landscape displays, e.g. 1920x1080 showing the app as a rotated 1080x1920 canvas</Text>
+      </View>
+
       {activeTab === 'students' ? (
         filteredResidents.length === 0 ? (
           <View style={styles.emptyContainer}>
@@ -560,4 +661,24 @@ const styles = StyleSheet.create({
   cancelButtonText: { fontSize: fs(13), fontWeight: '900', color: '#475569' },
   confirmButton: { borderColor: '#FF3B30', backgroundColor: '#FF3B30' },
   confirmButtonText: { fontSize: fs(13), fontWeight: '900', color: '#FFFFFF' },
+  // Scanner mode
+  scannerModeSection: { paddingHorizontal: 16, paddingVertical: 12, backgroundColor: '#FFFBEB', borderBottomWidth: 2, borderBottomColor: '#F59E0B' },
+  scannerModeRow: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between' },
+  scannerModeInfo: { flexDirection: 'row', alignItems: 'center', gap: 8 },
+  scannerModeLabel: { fontSize: fs(12), fontWeight: '900', color: '#78350F', letterSpacing: 1 },
+  scannerModeToggle: { paddingHorizontal: 16, paddingVertical: 6, backgroundColor: '#E2E8F0', borderWidth: 2, borderColor: '#94A3B8' },
+  scannerModeToggleActive: { backgroundColor: '#00C853', borderColor: '#00A844' },
+  scannerModeToggleText: { fontSize: fs(11), fontWeight: '900', color: '#475569' },
+  scannerModeToggleTextActive: { color: '#FFFFFF' },
+  scannerModeDesc: { fontSize: fs(10), color: '#92400E', marginTop: 4 },
+  kioskTimeoutSection: { paddingHorizontal: 16, paddingVertical: 12, backgroundColor: '#FFF7ED', borderBottomWidth: 2, borderBottomColor: '#FDBA74' },
+  kioskTimeoutControls: { flexDirection: 'row', alignItems: 'center', gap: 8 },
+  kioskTimeoutInput: { width: 48, height: 36, borderWidth: 2, borderColor: '#D97706', backgroundColor: '#FFFFFF', textAlign: 'center', fontSize: fs(16), fontWeight: '900', color: '#0F172A', paddingHorizontal: 4 },
+  kioskTimeoutUnit: { fontSize: fs(11), fontWeight: '900', color: '#78350F', letterSpacing: 1 },
+  kioskTimeoutSaveBtn: { height: 36, justifyContent: 'center', paddingHorizontal: 10, backgroundColor: '#78350F', borderWidth: 2, borderColor: '#451A03' },
+  kioskTimeoutSaveText: { fontSize: fs(10), fontWeight: '900', color: '#FFFFFF', letterSpacing: 1 },
+  displayRotationSection: { paddingHorizontal: 16, paddingVertical: 12, backgroundColor: '#F8FAFC', borderBottomWidth: 2, borderBottomColor: '#CBD5E1' },
+  displayRotationLabel: { fontSize: fs(12), fontWeight: '900', color: '#0F172A', letterSpacing: 1 },
+  displayRotationToggleActive: { backgroundColor: '#0055FF', borderColor: '#003FCC' },
+  displayRotationDesc: { fontSize: fs(10), color: '#475569', marginTop: 4 },
 });

@@ -1,4 +1,49 @@
-import { parseValidityDate } from '../utils/dateUtils';
+import { parseValidityDate, parseZohoDateTime } from '../utils/dateUtils';
+
+describe('parseZohoDateTime', () => {
+  test('parses "27-Jul-2026 6:00" (dash date, H:MM time)', () => {
+    const d = parseZohoDateTime('27-Jul-2026 6:00')!;
+    expect(d.getFullYear()).toBe(2026);
+    expect(d.getMonth()).toBe(6); // July
+    expect(d.getDate()).toBe(27);
+    expect(d.getHours()).toBe(6);
+    expect(d.getMinutes()).toBe(0);
+  });
+
+  test('parses "27 Jul 2026 11:00" (space-separated date)', () => {
+    const d = parseZohoDateTime('27 Jul 2026 11:00')!;
+    expect(d.getMonth()).toBe(6);
+    expect(d.getDate()).toBe(27);
+    expect(d.getHours()).toBe(11);
+  });
+
+  test('parses "7-Aug-2026 11:00:00" (single-digit day, H:MM:SS)', () => {
+    const d = parseZohoDateTime('7-Aug-2026 11:00:00')!;
+    expect(d.getMonth()).toBe(7); // August
+    expect(d.getDate()).toBe(7);
+    expect(d.getHours()).toBe(11);
+    expect(d.getSeconds()).toBe(0);
+  });
+
+  test('parses "31-Jul-2026 23:00" and treats it as end-of-day-ish time', () => {
+    const d = parseZohoDateTime('31-Jul-2026 23:00')!;
+    expect(d.getHours()).toBe(23);
+    expect(d.getMinutes()).toBe(0);
+  });
+
+  test('bare date (no time) defaults to end of day 23:59:59', () => {
+    const d = parseZohoDateTime('31-Jul-2026')!;
+    expect(d.getHours()).toBe(23);
+    expect(d.getMinutes()).toBe(59);
+    expect(d.getSeconds()).toBe(59);
+  });
+
+  test('returns null for blank or unparseable input', () => {
+    expect(parseZohoDateTime('')).toBeNull();
+    expect(parseZohoDateTime('not a date')).toBeNull();
+    expect(parseZohoDateTime('2026/07/31')).toBeNull();
+  });
+});
 
 describe('parseValidityDate', () => {
   // DD/MM/YYYY format

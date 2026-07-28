@@ -24,10 +24,44 @@ import {
   hasCameraConsent,
   setCameraConsent,
   getDeviceLocation,
+  getSyncToken,
+  getGlobalLogsCache,
+  saveGlobalLogsCache,
   type Visitor,
   type AccessLogEntry,
 } from '../src/services/storage';
 import { pushAllUnpushed } from '../src/services/autoPush';
+import { fetchGlobalLogs } from '../src/services/api';
+
+/** A visitor currently inside, derived from the shared check-in/out logs. */
+type InsideEntry = { id: string; name: string; flat: string; since: string; location: string };
+
+/**
+ * Compute who is inside across ALL devices from the global access logs: a
+ * visitor is inside when their latest event is a check-in (no later checkout).
+ */
+function computeInsideFromLogs(accessLogs: Array<Record<string, string>>): InsideEntry[] {
+  const events = (accessLogs || [])
+    .filter((l) => l.status === 'visitor_checkin' || l.status === 'visitor_checkout')
+    .sort((a, b) => String(a.timestamp || '').localeCompare(String(b.timestamp || '')));
+  const latest = new Map<string, { status: string; name: string; flat: string; location: string; since: string }>();
+  for (const e of events) {
+    const id = e.resident_id || '';
+    if (!id) continue;
+    latest.set(id, {
+      status: e.status,
+      name: e.resident_name || '',
+      flat: e.unit || '',
+      location: e.location || '',
+      since: e.timestamp || '',
+    });
+  }
+  const inside: InsideEntry[] = [];
+  latest.forEach((e, id) => {
+    if (e.status === 'visitor_checkin') inside.push({ id, name: e.name, flat: e.flat, since: e.since, location: e.location });
+  });
+  return inside.sort((a, b) => String(b.since).localeCompare(String(a.since))); // newest first
+}
 
 export default function VisitorsScreen() {
   const [flatNumber, setFlatNumber] = useState('');
@@ -45,7 +79,7 @@ export default function VisitorsScreen() {
   const [assigningCard, setAssigningCard] = useState('');
   const [detailMode, setDetailMode] = useState<'checkin' | 'return'>('checkin');
   const [mainMode, setMainMode] = useState<'entry' | 'return'>('entry');
-  const [insideVisitors, setInsideVisitors] = useState<Visitor[]>([]);
+  const [insideVisitors, setInsideVisitors] = useState<InsideEntry[]>([]);
   const [showInsideModal, setShowInsideModal] = useState(false);
   const [showCardScanner, setShowCardScanner] = useState(false);
   const [cardScanned, setCardScanned] = useState(false);
@@ -65,13 +99,33 @@ export default function VisitorsScreen() {
       setCardScanned(false);
       setDetailMode('checkin');
       setScannerMode('assign');
-      getVisitorsInsideCampus().then(setInsideVisitors);
+      loadInsideVisitors(false); // cache/local on focus (no network)
     }, [])
   );
 
-  const loadInsideVisitors = async () => {
-    const inside = await getVisitorsInsideCampus();
-    setInsideVisitors(inside);
+  /**
+   * Load "visitors inside" from the shared global logs so every device shows the
+   * same status. fetchFresh=true pulls from the server (on demand); otherwise it
+   * uses the cached global logs, falling back to this device's local card list.
+   */
+  const loadInsideVisitors = async (fetchFresh = false) => {
+    try {
+      let logs: any = null;
+      if (fetchFresh) {
+        const token = await getSyncToken();
+        if (token) {
+          logs = await fetchGlobalLogs(token);
+          await saveGlobalLogsCache({ ...logs, fetchedAt: new Date().toISOString() } as any);
+        }
+      }
+      if (!logs) logs = await getGlobalLogsCache();
+      if (logs && logs.accessLogs) {
+        setInsideVisitors(computeInsideFromLogs(logs.accessLogs));
+        return;
+      }
+    } catch (_) { /* offline / no token — fall back to local */ }
+    const local = await getVisitorsInsideCampus();
+    setInsideVisitors(local.map(v => ({ id: v.id, name: v.name, flat: v.flat, since: '', location: '' })));
   };
 
   const handleSearch = async () => {
@@ -172,8 +226,8 @@ export default function VisitorsScreen() {
   };
 
   const openInsideVisitors = async () => {
-    await loadInsideVisitors();
     setShowInsideModal(true);
+    await loadInsideVisitors(true); // pull the latest global status on open
   };
 
   const handleReturnSelectedCard = async () => {
@@ -200,7 +254,9 @@ export default function VisitorsScreen() {
       const results = await getVisitorsByFlat(flatNumber.trim());
       setVisitors(results);
     }
-    await loadInsideVisitors();
+    // Optimistically drop the returned visitor from the inside list (the global
+    // log reflects it after the checkout push syncs).
+    setInsideVisitors(prev => prev.filter(e => e.id !== selectedVisitor.id));
   };
 
   const handleSelectVisitor = (visitor: Visitor) => {
@@ -588,6 +644,11 @@ export default function VisitorsScreen() {
         <Text style={styles.titleText}>VISITORS</Text>
         <TouchableOpacity style={styles.insideIconBtn} onPress={openInsideVisitors}>
           <Ionicons name="people" size={20} color="#FFFBEB" />
+          {insideVisitors.length > 0 && (
+            <View style={styles.insideBadge}>
+              <Text style={styles.insideBadgeText}>{insideVisitors.length > 99 ? '99+' : insideVisitors.length}</Text>
+            </View>
+          )}
         </TouchableOpacity>
       </View>
 
@@ -699,6 +760,7 @@ export default function VisitorsScreen() {
                 <Ionicons name="close" size={24} color="#0F172A" />
               </TouchableOpacity>
             </View>
+            <Text style={styles.insideSubtitle}>Across all gates • {insideVisitors.length} inside</Text>
             {insideVisitors.length === 0 ? (
               <View style={styles.insideEmpty}>
                 <Text style={styles.insideEmptyText}>No visitors currently inside</Text>
@@ -709,29 +771,16 @@ export default function VisitorsScreen() {
                 keyExtractor={item => item.id}
                 contentContainerStyle={{ paddingBottom: 8 }}
                 renderItem={({ item }) => (
-                  <TouchableOpacity
-                    style={styles.insideCard}
-                    onPress={() => {
-                      setShowInsideModal(false);
-                      handleSelectVisitor(item);
-                    }}
-                  >
+                  <View style={styles.insideCard}>
                     <View style={[styles.visitorAvatar, { backgroundColor: '#7C3AED20' }]}>
-                      {item.local_photo ? (
-                        <Image source={{ uri: item.local_photo }} style={styles.avatarImg} />
-                      ) : (
-                        <Text style={[styles.avatarInitial, { color: '#7C3AED' }]}>{item.name.charAt(0).toUpperCase()}</Text>
-                      )}
+                      <Text style={[styles.avatarInitial, { color: '#7C3AED' }]}>{(item.name || '?').charAt(0).toUpperCase()}</Text>
                     </View>
                     <View style={styles.visitorInfo}>
-                      <Text style={styles.visitorName}>{item.name}</Text>
-                      <Text style={styles.visitorPurpose}>Flat {item.flat} • Card #{item.card_number}</Text>
-                      <Text style={styles.visitorValidity}>
-                        {item.check_out ? `Expected out: ${item.check_out}` : 'No check-out time'}
-                      </Text>
+                      <Text style={styles.visitorName}>{item.name || 'Unknown'}</Text>
+                      <Text style={styles.visitorPurpose}>Flat {item.flat}{item.location ? ` • ${item.location}` : ''}</Text>
+                      {item.since ? <Text style={styles.visitorValidity}>In since {item.since}</Text> : null}
                     </View>
-                    <Ionicons name="chevron-forward" size={20} color="#7C3AED" />
-                  </TouchableOpacity>
+                  </View>
                 )}
               />
             )}
@@ -1134,6 +1183,22 @@ const styles = StyleSheet.create({
     marginBottom: 8,
   },
   insideModalTitle: { fontSize: fs(16), fontWeight: '900', color: '#0F172A' },
+  insideSubtitle: { fontSize: fs(11), fontWeight: '700', color: '#7C3AED', marginBottom: 8 },
+  insideBadge: {
+    position: 'absolute',
+    top: -4,
+    right: -4,
+    minWidth: 18,
+    height: 18,
+    borderRadius: 9,
+    backgroundColor: '#DC2626',
+    borderWidth: 1,
+    borderColor: '#FFFBEB',
+    alignItems: 'center',
+    justifyContent: 'center',
+    paddingHorizontal: 3,
+  },
+  insideBadgeText: { fontSize: fs(9), fontWeight: '900', color: '#FFFFFF' },
   insideEmpty: {
     alignItems: 'center',
     paddingVertical: 20,

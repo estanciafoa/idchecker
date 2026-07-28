@@ -49,6 +49,7 @@ const VISITORS_KEY = '@gate_check_visitors';
 const VISITORS_SYNC_KEY = '@gate_check_visitors_last_sync';
 const PENDING_VISITOR_CHECKINS_KEY = '@gate_check_pending_visitor_checkins';
 const CAMERA_CONSENT_KEY = '@gate_check_camera_consent';
+const SCANNER_ONLY_MODE_KEY = '@gate_check_scanner_only_mode';
 const MAID_COOK_ATTENDANCE_KEY = '@gate_check_maid_cook_attendance';
 const MAID_COOK_ATTENDANCE_PUSHED_KEY = '@gate_check_maid_cook_attendance_pushed';
 const DEVICE_LOCATION_KEY = '@gate_check_device_location';
@@ -56,6 +57,12 @@ const ACCESS_LOGS_PUSHED_KEY = '@gate_check_access_logs_pushed';
 const TAXI_LOG_KEY = '@gate_check_taxi_log';
 const TAXI_LOG_PUSHED_KEY = '@gate_check_taxi_log_pushed';
 const SYNC_TOKEN_KEY = '@gate_check_sync_token';
+const GLOBAL_LOGS_CACHE_KEY = '@gate_check_global_logs_cache';
+const ZOHO_GUESTS_KEY = '@gate_check_zoho_guests';
+const ZOHO_GUESTS_SYNC_KEY = '@gate_check_zoho_guests_last_sync';
+const APP_DISPLAY_ROTATION_90_KEY = '@gate_check_app_display_rotation_90';
+const KIOSK_RESULT_TIMEOUT_SECONDS_KEY = '@gate_check_kiosk_result_timeout_seconds';
+const DEFAULT_KIOSK_RESULT_TIMEOUT_SECONDS = 5;
 
 export interface PendingVisitorCheckin {
   id: string;
@@ -92,6 +99,17 @@ export interface AccessLogEntry {
   location?: string;
 }
 
+/** A ZOHO guest/visitor row synced from the public ZOHO details sheet. */
+export interface ZohoGuest {
+  zoho_id: string;
+  name: string;
+  flat: string;
+  check_in: string;   // raw text from the sheet, e.g. "27-Jul-2026 6:00"
+  check_out: string;  // raw text from the sheet, e.g. "31-Jul-2026 23:00"
+  vehicle: string;
+  remarks: string;
+}
+
 export interface MaidCook {
   id: string;
   name: string;
@@ -126,6 +144,14 @@ export interface Visitor {
   status: string;
   created_at: string;
   updated_at: string;
+}
+
+export interface GlobalLogsCache {
+  fetchedAt: string;
+  accessLogs: AccessLogEntry[];
+  visitorLogs: any[];
+  maidCookLogs: any[];
+  taxiLogs: any[];
 }
 
 // In-memory cache for O(1) lookups
@@ -251,17 +277,21 @@ export async function clearAllData(): Promise<void> {
     ACCESS_LOGS_KEY, ACCESS_LOGS_PUSHED_KEY,
     MAID_COOK_ATTENDANCE_KEY, MAID_COOK_ATTENDANCE_PUSHED_KEY,
     TAXI_LOG_KEY, TAXI_LOG_PUSHED_KEY,
+    GLOBAL_LOGS_CACHE_KEY,
+    ZOHO_GUESTS_KEY, ZOHO_GUESTS_SYNC_KEY,
   ]);
   invalidateMaidCookCache();
   invalidateVisitorCache();
+  invalidateZohoCache();
 }
 
 export async function clearSyncData(): Promise<void> {
-  await AsyncStorage.multiRemove([RESIDENTS_KEY, LAST_SYNC_KEY, MAIDS_COOKS_KEY, MAIDS_COOKS_SYNC_KEY, VISITORS_KEY, VISITORS_SYNC_KEY]);
+  await AsyncStorage.multiRemove([RESIDENTS_KEY, LAST_SYNC_KEY, MAIDS_COOKS_KEY, MAIDS_COOKS_SYNC_KEY, VISITORS_KEY, VISITORS_SYNC_KEY, ZOHO_GUESTS_KEY, ZOHO_GUESTS_SYNC_KEY, GLOBAL_LOGS_CACHE_KEY]);
   _cache = null;
   _lookupMap = null;
   invalidateMaidCookCache();
   invalidateVisitorCache();
+  invalidateZohoCache();
 }
 
 // ---- Maids & Cooks ----
@@ -482,6 +512,63 @@ export async function setVisitorLastSyncTime(time: string): Promise<void> {
   await AsyncStorage.setItem(VISITORS_SYNC_KEY, time);
 }
 
+// ---- ZOHO Guests ----
+let _zohoCache: ZohoGuest[] | null = null;
+let _zohoLookupMap: Map<string, ZohoGuest> | null = null;
+
+function invalidateZohoCache() {
+  _zohoCache = null;
+  _zohoLookupMap = null;
+}
+
+function buildZohoLookupMap(items: ZohoGuest[]): Map<string, ZohoGuest> {
+  const map = new Map<string, ZohoGuest>();
+  for (const g of items) {
+    const key = String(g.zoho_id || '').trim().toLowerCase();
+    if (key) map.set(key, g);
+  }
+  return map;
+}
+
+export async function getLocalZohoGuests(): Promise<ZohoGuest[]> {
+  if (_zohoCache) return _zohoCache;
+  const data = await AsyncStorage.getItem(ZOHO_GUESTS_KEY);
+  _zohoCache = data ? JSON.parse(data) : [];
+  _zohoLookupMap = buildZohoLookupMap(_zohoCache!);
+  return _zohoCache!;
+}
+
+export async function saveLocalZohoGuests(items: ZohoGuest[]): Promise<void> {
+  // Last row wins on duplicate ZOHO IDs.
+  const map = new Map<string, ZohoGuest>();
+  for (const g of items) {
+    const key = String(g.zoho_id || '').trim().toLowerCase();
+    if (key) map.set(key, g);
+  }
+  const deduped = Array.from(map.values());
+  await AsyncStorage.setItem(ZOHO_GUESTS_KEY, JSON.stringify(deduped));
+  _zohoCache = deduped;
+  _zohoLookupMap = buildZohoLookupMap(deduped);
+}
+
+export async function getZohoGuestById(zohoId: string): Promise<ZohoGuest | null> {
+  if (!_zohoLookupMap) await getLocalZohoGuests();
+  return _zohoLookupMap!.get(String(zohoId || '').trim().toLowerCase()) || null;
+}
+
+export async function preloadZohoGuests(): Promise<number> {
+  const items = await getLocalZohoGuests();
+  return items.length;
+}
+
+export async function getZohoLastSyncTime(): Promise<string | null> {
+  return await AsyncStorage.getItem(ZOHO_GUESTS_SYNC_KEY);
+}
+
+export async function setZohoLastSyncTime(time: string): Promise<void> {
+  await AsyncStorage.setItem(ZOHO_GUESTS_SYNC_KEY, time);
+}
+
 // ---- Pending Visitor Check-ins Queue ----
 
 export async function getPendingVisitorCheckins(): Promise<PendingVisitorCheckin[]> {
@@ -519,6 +606,40 @@ export async function hasCameraConsent(): Promise<boolean> {
 
 export async function setCameraConsent(): Promise<void> {
   await AsyncStorage.setItem(CAMERA_CONSENT_KEY, 'true');
+}
+
+// ---- Scanner-Only Mode (for devices without camera, e.g., Android TV boxes) ----
+
+export async function isScannerOnlyMode(): Promise<boolean> {
+  const val = await AsyncStorage.getItem(SCANNER_ONLY_MODE_KEY);
+  return val === 'true';
+}
+
+export async function setScannerOnlyMode(enabled: boolean): Promise<void> {
+  await AsyncStorage.setItem(SCANNER_ONLY_MODE_KEY, enabled ? 'true' : 'false');
+}
+
+export async function getKioskResultTimeoutSeconds(): Promise<number> {
+  const val = await AsyncStorage.getItem(KIOSK_RESULT_TIMEOUT_SECONDS_KEY);
+  const seconds = Number(val);
+  if (!Number.isFinite(seconds)) return DEFAULT_KIOSK_RESULT_TIMEOUT_SECONDS;
+  return Math.min(60, Math.max(1, Math.round(seconds)));
+}
+
+export async function setKioskResultTimeoutSeconds(seconds: number): Promise<void> {
+  const safeSeconds = Math.min(60, Math.max(1, Math.round(seconds)));
+  await AsyncStorage.setItem(KIOSK_RESULT_TIMEOUT_SECONDS_KEY, String(safeSeconds));
+}
+
+// ---- App Display Rotation ----
+
+export async function isAppDisplayRotation90(): Promise<boolean> {
+  const val = await AsyncStorage.getItem(APP_DISPLAY_ROTATION_90_KEY);
+  return val === 'true';
+}
+
+export async function setAppDisplayRotation90(enabled: boolean): Promise<void> {
+  await AsyncStorage.setItem(APP_DISPLAY_ROTATION_90_KEY, enabled ? 'true' : 'false');
 }
 
 // ---- Maid/Cook Attendance ----
@@ -681,4 +802,17 @@ export async function getUnpushedTaxiLogs(): Promise<TaxiLogEntry[]> {
   const all = await getTaxiLogs();
   const pushed = await getPushedTaxiLogIds();
   return all.filter(e => !pushed.has(e.id));
+}
+
+export async function getGlobalLogsCache(): Promise<GlobalLogsCache | null> {
+  const data = await AsyncStorage.getItem(GLOBAL_LOGS_CACHE_KEY);
+  return data ? JSON.parse(data) : null;
+}
+
+export async function saveGlobalLogsCache(cache: GlobalLogsCache): Promise<void> {
+  await AsyncStorage.setItem(GLOBAL_LOGS_CACHE_KEY, JSON.stringify(cache));
+}
+
+export async function clearGlobalLogsCache(): Promise<void> {
+  await AsyncStorage.removeItem(GLOBAL_LOGS_CACHE_KEY);
 }
