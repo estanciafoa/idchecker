@@ -521,11 +521,26 @@ function invalidateZohoCache() {
   _zohoLookupMap = null;
 }
 
+function normZohoId(id: string): string {
+  return String(id || '').trim().toLowerCase();
+}
+
+// Strip leading zeros from an all-digit id ("0384" -> "384"), keeping one digit.
+// Non-numeric ids (ZBS-0005, TS-540, MX32) are returned unchanged.
+function stripLeadingZeros(s: string): string {
+  return /^\d+$/.test(s) ? s.replace(/^0+(?=\d)/, '') : s;
+}
+
 function buildZohoLookupMap(items: ZohoGuest[]): Map<string, ZohoGuest> {
   const map = new Map<string, ZohoGuest>();
   for (const g of items) {
-    const key = String(g.zoho_id || '').trim().toLowerCase();
-    if (key) map.set(key, g);
+    const key = normZohoId(g.zoho_id);
+    if (!key) continue;
+    map.set(key, g);
+    // Alias without leading zeros so a pass printed "0384" still matches a cell
+    // stored as "384" (and vice-versa). Don't clobber a real distinct id.
+    const stripped = stripLeadingZeros(key);
+    if (stripped !== key && !map.has(stripped)) map.set(stripped, g);
   }
   return map;
 }
@@ -542,7 +557,7 @@ export async function saveLocalZohoGuests(items: ZohoGuest[]): Promise<void> {
   // Last row wins on duplicate ZOHO IDs.
   const map = new Map<string, ZohoGuest>();
   for (const g of items) {
-    const key = String(g.zoho_id || '').trim().toLowerCase();
+    const key = normZohoId(g.zoho_id);
     if (key) map.set(key, g);
   }
   const deduped = Array.from(map.values());
@@ -553,7 +568,10 @@ export async function saveLocalZohoGuests(items: ZohoGuest[]): Promise<void> {
 
 export async function getZohoGuestById(zohoId: string): Promise<ZohoGuest | null> {
   if (!_zohoLookupMap) await getLocalZohoGuests();
-  return _zohoLookupMap!.get(String(zohoId || '').trim().toLowerCase()) || null;
+  const q = normZohoId(zohoId);
+  if (!q) return null;
+  // Exact match first, then a leading-zero-insensitive match for numeric ids.
+  return _zohoLookupMap!.get(q) || _zohoLookupMap!.get(stripLeadingZeros(q)) || null;
 }
 
 export async function preloadZohoGuests(): Promise<number> {

@@ -38,21 +38,38 @@ export function parseZohoDateTime(value: string): Date | null {
 }
 
 export function parseValidityDate(validity: string): Date | null {
-  const text = validity.trim();
+  let text = String(validity || '').trim();
+  if (!text) return null;
+  // Ignore any trailing time component, e.g. "31-Aug-2026 23:00" or "...T09:30".
+  text = text.replace(/[ T]\d{1,2}:\d{2}(?::\d{2})?\s*$/, '').trim();
 
-  let match = text.match(/^(\d{1,2})[./-](\d{1,2})[./-](\d{4})$/);
-  if (match) {
-    const [, day, month, year] = match;
-    const parsed = new Date(Number(year), Number(month) - 1, Number(day));
+  // Day [ordinal] <sep> Month <sep> Year, where the separator is a space, '-',
+  // '/', or '.', and the month is either a number (1-12) or a name/abbreviation
+  // (Aug, August, …). This covers "25/12/2025", "15-06-2026", "25 December
+  // 2025", AND "31-Aug-2026" / "6-Sep-2026" (dash + month name), which the old
+  // parser rejected — so dates in that style no longer read as "never expires".
+  const m = text.match(/^(\d{1,2})(?:st|nd|rd|th)?[\s./-]+([A-Za-z]+|\d{1,2})[\s./-]+(\d{4})$/i);
+  if (m) {
+    const day = Number(m[1]);
+    const year = Number(m[3]);
+    const monToken = m[2];
+    let month: number | undefined;
+    if (/^\d+$/.test(monToken)) {
+      month = Number(monToken) - 1;
+    } else {
+      const key = monToken.toLowerCase();
+      month = MONTH_MAP[key];
+      if (month === undefined) month = MONTH_ABBR_MAP[key.slice(0, 3)];
+    }
+    if (month === undefined || month < 0 || month > 11) return null;
+    const parsed = new Date(year, month, day);
     return isNaN(parsed.getTime()) ? null : parsed;
   }
 
-  match = text.match(/^(\d{1,2})(?:st|nd|rd|th)?\s+([A-Za-z]+)\s+(\d{4})$/i);
-  if (match) {
-    const [, day, monthName, year] = match;
-    const month = MONTH_MAP[monthName.toLowerCase()];
-    if (month === undefined) return null;
-    const parsed = new Date(Number(year), month, Number(day));
+  // ISO YYYY-MM-DD
+  const iso = text.match(/^(\d{4})-(\d{1,2})-(\d{1,2})$/);
+  if (iso) {
+    const parsed = new Date(Number(iso[1]), Number(iso[2]) - 1, Number(iso[3]));
     return isNaN(parsed.getTime()) ? null : parsed;
   }
 

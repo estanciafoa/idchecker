@@ -102,6 +102,41 @@ describe('parseValidityDate', () => {
     expect(parseValidityDate('4th April 2026')!.getDate()).toBe(4);
   });
 
+  // Dash + month-name formats (the bug: these used to return null → never expired)
+  test('parses "31-Aug-2026" (dash + abbreviated month)', () => {
+    const d = parseValidityDate('31-Aug-2026')!;
+    expect(d.getDate()).toBe(31);
+    expect(d.getMonth()).toBe(7); // August
+    expect(d.getFullYear()).toBe(2026);
+  });
+
+  test('parses "6-Sep-2026" (single-digit day, dash + abbr month)', () => {
+    const d = parseValidityDate('6-Sep-2026')!;
+    expect(d.getDate()).toBe(6);
+    expect(d.getMonth()).toBe(8); // September
+  });
+
+  test('parses "31-August-2026" (dash + full month)', () => {
+    expect(parseValidityDate('31-August-2026')!.getMonth()).toBe(7);
+  });
+
+  test('ignores a trailing time component', () => {
+    const d = parseValidityDate('31-Aug-2026 23:00')!;
+    expect(d.getDate()).toBe(31);
+    expect(d.getMonth()).toBe(7);
+  });
+
+  test('parses ISO YYYY-MM-DD', () => {
+    const d = parseValidityDate('2026-08-31')!;
+    expect(d.getFullYear()).toBe(2026);
+    expect(d.getMonth()).toBe(7);
+    expect(d.getDate()).toBe(31);
+  });
+
+  test('returns null for an invalid abbreviated month', () => {
+    expect(parseValidityDate('31-Xyz-2026')).toBeNull();
+  });
+
   // Edge cases
   test('returns null for empty string', () => {
     expect(parseValidityDate('')).toBeNull();

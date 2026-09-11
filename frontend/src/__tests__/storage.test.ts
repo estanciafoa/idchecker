@@ -23,6 +23,8 @@ import {
   getCurrentlyInMaidsCooks,
   getOverstayMaidsCooks,
   getLocalVisitors,
+  saveLocalZohoGuests,
+  getZohoGuestById,
   saveLocalVisitors,
   getVisitorById,
   getVisitorsByFlat,
@@ -418,5 +420,40 @@ describe('Clear Data', () => {
     // Device location should still be there
     const loc = await getDeviceLocation();
     expect(loc).toBe('Front Gate');
+  });
+});
+
+// ---- ZOHO Guests ----
+describe('ZOHO guests', () => {
+  const guest = (zoho_id: string, name = 'Guest') => ({
+    zoho_id, name, flat: 'TH 1-1', check_in: '', check_out: '', vehicle: '', remarks: '',
+  });
+
+  test('round-trips and looks up by exact id (case-insensitive)', async () => {
+    await saveLocalZohoGuests([guest('15265', 'Vijay'), guest('ZBS-0005', 'Sushrut')]);
+    expect((await getZohoGuestById('15265'))!.name).toBe('Vijay');
+    expect((await getZohoGuestById('zbs-0005'))!.name).toBe('Sushrut'); // case-insensitive
+  });
+
+  test('leading-zero tolerant: stored "384" found by "0384" and vice-versa', async () => {
+    await saveLocalZohoGuests([guest('384', 'Balaji')]);
+    expect((await getZohoGuestById('0384'))!.name).toBe('Balaji');
+    expect((await getZohoGuestById('384'))!.name).toBe('Balaji');
+
+    await saveLocalZohoGuests([guest('0191', 'Senthil')]);
+    expect((await getZohoGuestById('191'))!.name).toBe('Senthil');
+    expect((await getZohoGuestById('0191'))!.name).toBe('Senthil');
+  });
+
+  test('non-numeric codes are not leading-zero-mangled', async () => {
+    await saveLocalZohoGuests([guest('TS-540', 'Jephthah'), guest('MX32', 'Jose')]);
+    expect((await getZohoGuestById('TS-540'))!.name).toBe('Jephthah');
+    expect((await getZohoGuestById('mx32'))!.name).toBe('Jose');
+  });
+
+  test('returns null for unknown or blank id', async () => {
+    await saveLocalZohoGuests([guest('15265')]);
+    expect(await getZohoGuestById('99999')).toBeNull();
+    expect(await getZohoGuestById('')).toBeNull();
   });
 });

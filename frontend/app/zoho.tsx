@@ -159,11 +159,16 @@ export default function ZohoScreen() {
               ref={inputRef}
               style={styles.input}
               value={manualId}
-              onChangeText={(v) => setManualId(v.replace(/[^0-9]/g, ''))}
+              // ZOHO IDs are usually numeric but some are codes (ZBS-0005,
+              // TS-540, MX32), so allow letters and hyphens — strip only spaces
+              // and other punctuation. Lookup is case-insensitive.
+              onChangeText={(v) => setManualId(v.replace(/[^A-Za-z0-9-]/g, ''))}
               onSubmitEditing={handleLookup}
-              placeholder="e.g. 15265"
+              placeholder="e.g. 15265 or ZBS-0005"
               placeholderTextColor="#B6A69B"
-              keyboardType="number-pad"
+              keyboardType="default"
+              autoCapitalize="characters"
+              autoCorrect={false}
               returnKeyType="search"
               autoFocus
               blurOnSubmit={false}
